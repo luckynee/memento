@@ -163,11 +163,16 @@ Errors: `{ "error": { "code": "...", "message": "..." } }` with 4xx/5xx.
 
 `memento [--url URL] <command>`; `MEMENTO_URL` default `http://127.0.0.1:7377`.
 
-- `health`, `stats`, `sessions list`, `sessions link --child S --parent P`
-- `search <query> --harness H --session S [--scope lineage] [--k 8] [--json]`
-- `digest --harness H --session S [--budget N]`
-- `forget --harness H (--session S | --lineage S | --project P) [--yes]`
-- `ingest --file turns.json` (neutral schema, for harnesses without a plugin)
+- `health`
+- `stats --harness H [--project P] [--session S]` (`{ total, by_kind }`)
+- `sessions list --harness H [--project P]`
+- `sessions link --harness H --project P --child S --parent P2 [--title T] [--retention continuation|keep]`
+- `sessions lineage --harness H --session S`
+- `search <query> --harness H --project P --session S [--scope lineage] [--k 8] [--kind KIND]...`
+- `digest --harness H --project P --session S [--budget N]`
+- `forget --harness H [--project P] (--session S | --lineage S | --whole-project) [--yes]` (`--whole-project` requires `--project`; without `--yes` it asks on a TTY and refuses otherwise)
+- `ingest --file turns.json|-` (neutral schema, for harnesses without a plugin)
+- Global: `--url`, `--token`, `--json`, `--timeout-secs`.
 
 ## OpenCode adapter
 
