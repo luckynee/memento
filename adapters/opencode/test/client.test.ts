@@ -25,6 +25,24 @@ describe("daemon client", () => {
         expect(url.searchParams.get("session")).toBe("x/y");
     });
 
+    test("sends continuation requests and reads pair-based lineage", async () => {
+        const calls: { path: string; method: string | undefined; body: unknown }[] = [];
+        const fetcher = (async (url, init) => {
+            calls.push({ path: new URL(String(url)).pathname, method: init?.method, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+            return Response.json(calls.length === 3 ? { lineage: [{ harness: "codex", session: "old" }] } : { claimed: false });
+        }) as typeof fetch;
+        const client = new MementoClient({ fetch: fetcher });
+        await client.claimContinuation({ project: "p", harness: "opencode", session: "s" });
+        await client.putContinuation({ project: "p", parent_harness: "opencode", parent_session: "s", target_harness: "codex" });
+        const lineage: { lineage: { harness: string; session: string }[] } = await client.lineage("open/code", "s/x");
+        expect(calls).toEqual([
+            { path: "/v1/continuations/claim", method: "POST", body: { project: "p", harness: "opencode", session: "s" } },
+            { path: "/v1/continuations", method: "PUT", body: { project: "p", parent_harness: "opencode", parent_session: "s", target_harness: "codex" } },
+            { path: "/v1/sessions/open%2Fcode/s%2Fx/lineage", method: "GET", body: undefined },
+        ]);
+        expect(lineage.lineage).toEqual([{ harness: "codex", session: "old" }]);
+    });
+
     test("sends the optional injected marker", async () => {
         let body: unknown;
         const fetcher = (async (_url, init) => {

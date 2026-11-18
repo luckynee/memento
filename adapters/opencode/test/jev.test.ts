@@ -96,6 +96,7 @@ test("ingest and search share the cooldown", async () => {
     });
     const ingestor = createIngestor({
         client: {
+            async claimContinuation() { return { claimed: false }; },
             async putSession() {},
             async ingest() { return { segments: 1, skipped: 0 }; },
         },
@@ -103,6 +104,7 @@ test("ingest and search share the cooldown", async () => {
         async loadContext() {
             return [{ id: "a", type: "assistant", time: { created: 0 }, content: [{ type: "text", text: "note" }] }];
         },
+        async putInstruction() {},
         decide,
         jevModel: DEFAULT_JEV_MODEL,
         harness: "h",

@@ -1,4 +1,5 @@
 import type { MementoClient } from "./client";
+import { frameContinuation } from "./commands";
 import { classifyKind, type DecisionsFn, type JevModel } from "./jev";
 import { mapMessage, selectNewMessages } from "./transcript";
 
@@ -8,9 +9,10 @@ type Storage = {
 };
 
 export function createIngestor(deps: {
-    client: Pick<MementoClient, "putSession" | "ingest">;
+    client: Pick<MementoClient, "putSession" | "ingest" | "claimContinuation">;
     storage: Storage;
     loadContext(sessionID: string): Promise<unknown[]>;
+    putInstruction(sessionID: string, key: string, value: string): Promise<unknown>;
     decide?: DecisionsFn;
     jevModel: JevModel;
     harness: string;
@@ -19,6 +21,7 @@ export function createIngestor(deps: {
 }) {
     const chains = new Map<string, Promise<void>>();
     const registered = new Set<string>();
+    const retryClaims = new Set<string>();
     const classifications = new Map<string, Map<string, { text: string; kind: string | null }>>();
 
     async function markRegistered(sessionID: string): Promise<void> {
@@ -26,7 +29,58 @@ export function createIngestor(deps: {
         registered.add(sessionID);
     }
 
+    async function registerSession(sessionID: string): Promise<void> {
+        if (registered.has(sessionID) && !retryClaims.has(sessionID)) {
+            return;
+        }
+        const persistedRegistration = await deps.storage.get(`memento/registered/${sessionID}`);
+        if (!retryClaims.has(sessionID) && persistedRegistration === true) {
+            registered.add(sessionID);
+            return;
+        }
+        if (persistedRegistration === "claim-pending") {
+            registered.add(sessionID);
+        }
+        const claimKey = `memento/claimed/${sessionID}`;
+        if (await deps.storage.get(claimKey) !== true) {
+            try {
+                const claim = await deps.client.claimContinuation({ project: deps.project, harness: deps.harness, session: sessionID });
+                if (!claim || typeof claim.claimed !== "boolean") {
+                    throw new Error("Invalid continuation claim response");
+                }
+                if (claim.claimed) {
+                    if (typeof claim.parent_harness !== "string" || typeof claim.parent !== "string" || typeof claim.digest !== "string") {
+                        throw new Error("Claimed continuation is missing its parent or digest");
+                    }
+                }
+                await deps.storage.set(claimKey, true);
+                retryClaims.delete(sessionID);
+                if (claim.claimed) {
+                    await deps.storage.set(`memento/parent/${sessionID}`, JSON.stringify({ harness: claim.parent_harness, session: claim.parent }));
+                    await deps.putInstruction(sessionID, "memento-continuation", frameContinuation(claim.parent_harness!, claim.parent!, claim.digest!));
+                }
+            } catch (error) {
+                if (await deps.storage.get(claimKey) !== true) {
+                    retryClaims.add(sessionID);
+                }
+                deps.log(`Failed to claim continuation for session ${sessionID}`, error);
+            }
+        }
+        if (!registered.has(sessionID)) {
+            await deps.client.putSession({ harness: deps.harness, project: deps.project, session: sessionID });
+            if (retryClaims.has(sessionID)) {
+                await deps.storage.set(`memento/registered/${sessionID}`, "claim-pending");
+                registered.add(sessionID);
+            } else {
+                await markRegistered(sessionID);
+            }
+        } else if (!retryClaims.has(sessionID) && persistedRegistration === "claim-pending") {
+            await markRegistered(sessionID);
+        }
+    }
+
     async function ingestSession(sessionID: string): Promise<void> {
+        await registerSession(sessionID);
         const cursorValue = await deps.storage.get(`memento/ingest/${sessionID}`);
         const cursor = typeof cursorValue === "string" ? cursorValue : undefined;
         const context = await deps.loadContext(sessionID);
@@ -55,14 +109,6 @@ export function createIngestor(deps: {
                 }
             }));
         }
-        if (!registered.has(sessionID)) {
-            if (await deps.storage.get(`memento/registered/${sessionID}`) !== true) {
-                await deps.client.putSession({ harness: deps.harness, project: deps.project, session: sessionID });
-                await markRegistered(sessionID);
-            } else {
-                registered.add(sessionID);
-            }
-        }
         if (items.length) {
             await deps.client.ingest({ harness: deps.harness, project: deps.project, session: sessionID, items });
         }
@@ -71,9 +117,9 @@ export function createIngestor(deps: {
         }
     }
 
-    function flush(sessionID: string): Promise<void> {
+    function serialize(sessionID: string, action: () => Promise<void>): Promise<void> {
         const previous = chains.get(sessionID) ?? Promise.resolve();
-        const result = previous.then(() => ingestSession(sessionID));
+        const result = previous.then(action);
         const healthy = result.catch(() => {});
         chains.set(sessionID, healthy);
         void healthy.then(() => {
@@ -82,6 +128,14 @@ export function createIngestor(deps: {
             }
         });
         return result;
+    }
+
+    function ensureRegistered(sessionID: string): Promise<void> {
+        return serialize(sessionID, () => registerSession(sessionID));
+    }
+
+    function flush(sessionID: string): Promise<void> {
+        return serialize(sessionID, () => ingestSession(sessionID));
     }
 
     function handleExecutionSucceeded(sessionID: string): Promise<void> {
@@ -96,5 +150,5 @@ export function createIngestor(deps: {
         }
     }
 
-    return { handleExecutionSucceeded, flush, idle, markRegistered };
+    return { handleExecutionSucceeded, flush, idle, markRegistered, ensureRegistered };
 }

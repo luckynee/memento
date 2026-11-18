@@ -1,6 +1,13 @@
 import { expect, test } from "bun:test";
 import type { Plugin } from "@opencode/plugin";
-import plugin from "../src/index";
+import plugin, { projectKey } from "../src/index";
+
+test("uses the canonical project path when available", () => {
+    expect(projectKey({ id: "id", canonical: "/checkout" })).toBe("/checkout");
+    expect(projectKey({ id: "id", canonical: "" })).toBe("id");
+    expect(projectKey({ id: "id", canonical: null })).toBe("id");
+    expect(projectKey({ id: "id" })).toBe("id");
+});
 
 test("step ended dispatches ingestion and cleanup stops the subscription", async () => {
     const values = new Map<string, unknown>();
@@ -8,6 +15,9 @@ test("step ended dispatches ingestion and cleanup stops the subscription", async
     let subscriptionTypes: readonly string[] = [];
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async (url, init) => {
+        if (String(url).endsWith("/v1/continuations/claim")) {
+            return Response.json({ claimed: false });
+        }
         if (String(url).endsWith("/v1/ingest")) {
             ingests.push(JSON.parse(String(init?.body)));
             return Response.json({ segments: 1, skipped: 0 });

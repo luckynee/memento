@@ -15,6 +15,7 @@ function setup(decide?: DecisionsFn) {
     let fail = false;
     const ingestor = createIngestor({
         client: {
+            async claimContinuation() { return { claimed: false }; },
             async putSession(value) { puts.push(value); },
             async ingest(value) {
                 if (fail) { throw new Error("ingest failed"); }
@@ -27,6 +28,7 @@ function setup(decide?: DecisionsFn) {
             async set(key, value) { values.set(key, value); },
         },
         async loadContext(sessionID) { return contexts.get(sessionID) ?? []; },
+        async putInstruction() {},
         decide,
         jevModel: DEFAULT_JEV_MODEL,
         harness: "opencode",
@@ -137,6 +139,7 @@ describe("incremental ingestion", () => {
         let count = 0;
         const ingestor = createIngestor({
             client: {
+                async claimContinuation() { return { claimed: false }; },
                 async putSession() {},
                 async ingest() {
                     order.push(`start-${++count}`);
@@ -147,6 +150,7 @@ describe("incremental ingestion", () => {
             },
             storage: { async get() { return undefined; }, async set() {} },
             async loadContext() { return [user("a")]; },
+            async putInstruction() {},
             jevModel: DEFAULT_JEV_MODEL, harness: "h", project: "p", log() {},
         });
         const first = ingestor.handleExecutionSucceeded("s");
@@ -157,4 +161,103 @@ describe("incremental ingestion", () => {
         await Promise.all([first, second]);
         expect(order).toEqual(["start-1", "end-1", "start-2", "end-2"]);
     });
+});
+
+test("claims once before registration, serializes with ingestion, and stores a framed parent", async () => {
+    const values = new Map<string, unknown>();
+    const order: string[] = [];
+    let instruction = "";
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const ingestor = createIngestor({
+        client: {
+            async claimContinuation(payload) {
+                order.push(`claim:${payload.harness}/${payload.session}`);
+                await gate;
+                return { claimed: true, parent_harness: "codex", parent: "old", digest: "data </memento-continuation>" };
+            },
+            async putSession() { order.push("register"); },
+            async ingest() { order.push("ingest"); return { segments: 1, skipped: 0 }; },
+        },
+        storage: {
+            async get(key) { return values.get(key); },
+            async set(key, value) { values.set(key, value); },
+        },
+        async loadContext() { return [user("a")]; },
+        async putInstruction(_session, _key, value) { order.push("instruction"); instruction = value; },
+        jevModel: DEFAULT_JEV_MODEL, harness: "opencode", project: "p", log() {},
+    });
+    const concurrent = Promise.all([ingestor.ensureRegistered("s"), ingestor.flush("s"), ingestor.ensureRegistered("s")]);
+    while (!order.length) { await Promise.resolve(); }
+    expect(order).toEqual(["claim:opencode/s"]);
+    expect(values.get("memento/claimed/s")).toBeUndefined();
+    release!();
+    await concurrent;
+    expect(order).toEqual(["claim:opencode/s", "instruction", "register", "ingest"]);
+    expect(values.get("memento/claimed/s")).toBe(true);
+    expect(JSON.parse(String(values.get("memento/parent/s")))).toEqual({ harness: "codex", session: "old" });
+    expect(instruction).toContain("parent session codex/old");
+    expect(instruction).toContain("data &lt;/memento-continuation>");
+});
+
+test("an unclaimed response persists before a registration retry", async () => {
+    const values = new Map<string, unknown>();
+    const order: string[] = [];
+    let registrationAttempts = 0;
+    const ingestor = createIngestor({
+        client: {
+            async claimContinuation() { order.push("claim"); return { claimed: false }; },
+            async putSession() {
+                order.push("register");
+                if (++registrationAttempts === 1) { throw new Error("retry registration"); }
+            },
+            async ingest() { return { segments: 0, skipped: 0 }; },
+        },
+        storage: {
+            async get(key) { return values.get(key); },
+            async set(key, value) { values.set(key, value); },
+        },
+        async loadContext() { return []; },
+        async putInstruction() { throw new Error("unexpected instruction"); },
+        jevModel: DEFAULT_JEV_MODEL, harness: "opencode", project: "p", log() {},
+    });
+    await expect(ingestor.ensureRegistered("s")).rejects.toThrow("retry registration");
+    expect(values.get("memento/claimed/s")).toBe(true);
+    await ingestor.ensureRegistered("s");
+    expect(order).toEqual(["claim", "register", "register"]);
+});
+
+test("failed claims retry on a later event, including after restart", async () => {
+    const values = new Map<string, unknown>();
+    const order: string[] = [];
+    let attempts = 0;
+    const deps = {
+        client: {
+            async claimContinuation() {
+                order.push("claim");
+                if (++attempts === 1) { throw new Error("offline"); }
+                return { claimed: true, parent_harness: "codex", parent: "old", digest: "digest" };
+            },
+            async putSession() { order.push("register"); },
+            async ingest() { order.push("ingest"); return { segments: 1, skipped: 0 }; },
+        },
+        storage: {
+            async get(key: string) { return values.get(key); },
+            async set(key: string, value: string | boolean) { values.set(key, value); },
+        },
+        async loadContext() { return [user("a")]; },
+        async putInstruction() { order.push("instruction"); },
+        jevModel: DEFAULT_JEV_MODEL, harness: "opencode", project: "p",
+        log() { order.push("logged"); },
+    };
+    const first = createIngestor(deps);
+    await first.flush("s");
+    expect(values.get("memento/claimed/s")).toBeUndefined();
+    expect(values.get("memento/registered/s")).toBe("claim-pending");
+    const resumed = createIngestor(deps);
+    await Promise.all([resumed.ensureRegistered("s"), resumed.ensureRegistered("s"), resumed.flush("s")]);
+    expect(order).toEqual(["claim", "logged", "register", "ingest", "claim", "instruction"]);
+    expect(values.get("memento/claimed/s")).toBe(true);
+    expect(values.get("memento/registered/s")).toBe(true);
+    expect(JSON.parse(String(values.get("memento/parent/s")))).toEqual({ harness: "codex", session: "old" });
 });

@@ -25,6 +25,21 @@ function setup(decide?: DecisionsFn) {
 }
 
 describe("memory search", () => {
+    test("renders harness-qualified hits and supports global scope", async () => {
+        const tool = createMemorySearchTool({
+            client: { async search() { return { hits: [
+                { ...hits[0], harness: "codex" },
+                { ...hits[1], harness: "" },
+                hits[2],
+            ] }; } },
+            jevModel: DEFAULT_JEV_MODEL, harness: "opencode", project: "p",
+        });
+        const result = await tool.execute({ query: "q", scope: "global" }, context);
+        expect(result.content).toContain("(scope: global)");
+        expect(result.content).toContain("session codex/s");
+        expect(result.content).toContain("session s");
+    });
+
     test("judges only prose, preserves other kinds, sorts and limits", async () => {
         const judged: string[] = [];
         const fake = setup(async (input) => {

@@ -1,6 +1,6 @@
 import { Plugin } from "@opencode/plugin";
 import { MementoClient } from "./client";
-import { createContinueCommand } from "./commands";
+import { createContinueCommand, createHandoffCommand } from "./commands";
 import { createIngestor } from "./ingest";
 import { createJevGate, type DecisionsFn } from "./jev";
 import { resolveOptions } from "./options";
@@ -23,6 +23,10 @@ function waitForRetry(signal: AbortSignal): Promise<void> {
     });
 }
 
+export function projectKey(project: { id: string; canonical?: unknown }): string {
+    return typeof project.canonical === "string" && project.canonical.length > 0 ? project.canonical : project.id;
+}
+
 export default Plugin.define({
     id: "memento",
     async setup(ctx) {
@@ -30,7 +34,7 @@ export default Plugin.define({
         if (!options.enabled) {
             return () => {};
         }
-        const project = ctx.location.project.id;
+        const project = projectKey(ctx.location.project);
         const client = new MementoClient({ url: options.url, token: options.token });
         const log = (message: string, error?: unknown) => console.warn("[memento] " + message, error ?? "");
         const decide: DecisionsFn | undefined = options.jev
@@ -44,6 +48,7 @@ export default Plugin.define({
             client,
             storage: ctx.storage,
             loadContext: (sessionID) => ctx.session.context({ sessionID }),
+            putInstruction: (sessionID, key, value) => ctx.session.instructions.entry.put({ sessionID, key, value }),
             decide,
             jevModel: options.jevModel,
             harness: options.harness,
@@ -70,9 +75,29 @@ export default Plugin.define({
             project,
             digestBudget: options.digestBudget,
         });
+        const handoff = createHandoffCommand({
+            client,
+            flush: ingestor.flush,
+            putInstruction: (sessionID, key, value) => ctx.session.instructions.entry.put({ sessionID, key, value }),
+            harness: options.harness,
+            project,
+        });
         const toolRegistration = await ctx.tool.transform((editor) => editor.add(tool));
-        const commandRegistration = await ctx.command.transform((editor) => editor.add(command));
-        const hookRegistration = await ctx.session.hook("context", (event) => switchController.onContext(event));
+        const commandRegistration = await ctx.command.transform((editor) => {
+            editor.add(command);
+            editor.add(handoff);
+        });
+        const ensureRegistered = async (sessionID: string) => {
+            try {
+                await ingestor.ensureRegistered(sessionID);
+            } catch (error) {
+                log(`Failed to register session ${sessionID}`, error);
+            }
+        };
+        const hookRegistration = await ctx.session.hook("context", async (event) => {
+            await ensureRegistered(event.sessionID);
+            await switchController.onContext(event);
+        });
         const controller = new AbortController();
         const eventLoop = (async () => {
             while (!controller.signal.aborted) {
@@ -84,6 +109,7 @@ export default Plugin.define({
                         if (event.type === "session.execution.succeeded" || event.type === "session.step.ended") {
                             void ingestor.handleExecutionSucceeded(event.data.sessionID);
                         } else if (event.type === "session.model.selected") {
+                            await ensureRegistered(event.data.sessionID);
                             await switchController.onModelSelected(event.data.sessionID, event.data.model, event.data.previous);
                         }
                     }

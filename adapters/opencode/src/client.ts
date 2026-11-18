@@ -14,6 +14,24 @@ export type SessionIdentity = {
     session: string;
 };
 
+export type SessionRecord = SessionIdentity & {
+    parent?: string;
+    parent_harness?: string;
+    retention?: string;
+    title?: string;
+};
+
+export type LineageResponse = {
+    lineage: { harness: string; session: string }[];
+};
+
+export type ClaimResponse = {
+    claimed: boolean;
+    parent_harness?: string;
+    parent?: string;
+    digest?: string;
+};
+
 export type SearchScope = "session" | "lineage" | "project" | "global";
 
 export type SearchHit = {
@@ -21,6 +39,7 @@ export type SearchHit = {
     score: number;
     kind: string;
     text: string;
+    harness?: string;
     session: string;
     ts: string;
     path?: string;
@@ -93,8 +112,20 @@ export class MementoClient {
         return this.request("/health", "GET");
     }
 
-    putSession(payload: SessionIdentity & { parent?: string; retention?: string; title?: string }): Promise<unknown> {
+    putSession(payload: SessionRecord): Promise<unknown> {
         return this.request("/v1/sessions", "PUT", payload);
+    }
+
+    claimContinuation(payload: SessionIdentity): Promise<ClaimResponse> {
+        return this.request("/v1/continuations/claim", "POST", payload);
+    }
+
+    putContinuation(payload: { project: string; parent_harness: string; parent_session: string; target_harness?: string }): Promise<unknown> {
+        return this.request("/v1/continuations", "PUT", payload);
+    }
+
+    lineage(harness: string, session: string): Promise<LineageResponse> {
+        return this.request(`/v1/sessions/${encodeURIComponent(harness)}/${encodeURIComponent(session)}/lineage`, "GET");
     }
 
     ingest(payload: SessionIdentity & { items: IngestItem[] }): Promise<{ segments: number; skipped: number }> {

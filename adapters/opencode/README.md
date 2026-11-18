@@ -34,7 +34,18 @@ Run `bun install` in this directory, then add the plugin to `opencode.jsonc`:
 On each completed step and execution the adapter ingests transcript messages.
 After a model switch it adds a per-model frozen digest to system instructions
 while preserving a bounded recent tail. The `memory_search` tool retrieves stored memories, and
-`/memento-continue <parentSessionID>` links a session to an earlier session.
+`/memento-continue <harness>/<session>` links a session to an earlier session,
+including one from another harness. A bare session ID means `opencode`.
+`/memento-handoff [<harness>]` flushes the current session and prepares the
+next session in the project to continue it. When a harness is specified, only
+that harness can claim the handoff. The latest handoff replaces any previous
+pending handoff and expires after 24 hours.
+
+Cross-harness project identity uses OpenCode's canonical checkout path
+(`ctx.location.project.canonical`), falling back to the project ID when the
+canonical path is unavailable or empty. Linked worktrees share the canonical
+main checkout key. Existing memories stored under project IDs are not migrated.
+Project and global searches span harnesses.
 
 ## Development
 
