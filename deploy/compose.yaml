@@ -1,0 +1,26 @@
+services:
+    qdrant:
+        image: qdrant/qdrant:v1.20.2
+        volumes:
+            - qdrant_storage:/qdrant/storage
+        healthcheck:
+            test: ["CMD", "bash", "-c", ":> /dev/tcp/127.0.0.1/6333"]
+            interval: 5s
+            timeout: 3s
+            retries: 12
+        restart: unless-stopped
+    mementod:
+        build:
+            context: ..
+            dockerfile: deploy/Dockerfile
+        environment:
+            MEMENTO_QDRANT_URL: http://qdrant:6334
+            MEMENTO_TOKEN: ${MEMENTO_TOKEN:-}
+        ports:
+            - "127.0.0.1:7377:7377"
+        depends_on:
+            qdrant:
+                condition: service_healthy
+        restart: unless-stopped
+volumes:
+    qdrant_storage:
