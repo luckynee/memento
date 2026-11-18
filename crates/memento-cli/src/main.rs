@@ -8,7 +8,7 @@ use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use memento_core::lineage::SessionKey;
 use memento_core::protocol::{
     DigestResponse, ErrorBody, ForgetRequest, ForgetResponse, ForgetScope, Health, IngestRequest,
-    IngestResponse, Kind, Retention, Scope, SearchRequest, SearchResponse, SessionRecord,
+    Kind, Retention, Scope, SearchRequest, SearchResponse, SessionRecord,
 };
 use reqwest::blocking::{Client, Request};
 use reqwest::{Method, Url};
@@ -251,6 +251,23 @@ struct IngestArgs {
 struct StatsResponse {
     total: u64,
     by_kind: std::collections::BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IngestResponse {
+    segments: usize,
+    skipped: usize,
+    duplicates: Option<usize>,
+}
+
+impl IngestResponse {
+    fn render(&self) -> String {
+        let mut output = format!("segments: {}  skipped: {}", self.segments, self.skipped);
+        if let Some(duplicates) = self.duplicates {
+            output.push_str(&format!("  duplicates: {duplicates}"));
+        }
+        output
+    }
 }
 
 #[derive(Debug)]
@@ -586,10 +603,7 @@ fn render(command: &Command, body: &str) -> Result<String, CliError> {
         }
         Command::Ingest(_) => {
             let response: IngestResponse = parse_response(body)?;
-            Ok(format!(
-                "segments: {}  skipped: {}",
-                response.segments, response.skipped
-            ))
+            Ok(response.render())
         }
         Command::Stats(_) => {
             let response: StatsResponse = parse_response(body)?;
@@ -1011,6 +1025,15 @@ mod tests {
         assert_eq!(request.url().path(), "/v1/ingest");
         assert_eq!(body(&request), input);
         assert!(serde_json::from_value::<IngestRequest>(json!({"items":[]})).is_err());
+        let command = parse(&["ingest", "--file", "-"]).command;
+        assert_eq!(
+            render(&command, r#"{"segments":2,"skipped":1}"#).unwrap(),
+            "segments: 2  skipped: 1"
+        );
+        assert_eq!(
+            render(&command, r#"{"segments":2,"skipped":1,"duplicates":3}"#).unwrap(),
+            "segments: 2  skipped: 1  duplicates: 3"
+        );
     }
 
     #[test]
