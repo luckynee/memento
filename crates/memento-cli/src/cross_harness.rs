@@ -919,10 +919,16 @@ fn save_atomic_with_mode(path: &Path, contents: &[u8], mode: Option<u32>) -> Res
 }
 
 fn jev_request(item: &IngestItem) -> Value {
-    let fallback = if item.role == Role::User {
-        "request"
+    let (instructions, choices) = if item.role == Role::User {
+        (
+            "Classify the text as a decision, constraint, or ordinary request.",
+            json!([{"value": "decision"}, {"value": "constraint"}, {"value": "request"}]),
+        )
     } else {
-        "note"
+        (
+            "Classify the text as a decision, constraint, task, or ordinary request or note.",
+            json!([{"value": "decision"}, {"value": "constraint"}, {"value": "task"}, {"value": "note"}]),
+        )
     };
     json!({
         "model": {"providerID": "opencode", "id": "jev-1.13-free"},
@@ -930,13 +936,8 @@ fn jev_request(item: &IngestItem) -> Value {
         "questions": [{
             "type": "choice",
             "name": "kind",
-            "instructions": "Classify the text as a decision, constraint, task, or ordinary request or note.",
-            "choices": [
-                {"value": "decision"},
-                {"value": "constraint"},
-                {"value": "task"},
-                {"value": fallback}
-            ]
+            "instructions": instructions,
+            "choices": choices
         }]
     })
 }
@@ -957,7 +958,7 @@ fn jev_answer(response: &Value, role: Role) -> Result<Option<Kind>, ()> {
     let kind = match choice {
         "decision" => Some(Kind::Decision),
         "constraint" => Some(Kind::Constraint),
-        "task" => Some(Kind::Task),
+        "task" if role == Role::Assistant => Some(Kind::Task),
         "request" if role == Role::User => None,
         "note" if role == Role::Assistant => None,
         _ => return Err(()),
@@ -2220,7 +2221,10 @@ mod tests {
             .collect();
         let request = jev_request(&items[0]);
         assert_eq!(request["input"][0]["text"].as_str().unwrap().len(), 4000);
-        assert_eq!(request["questions"][0]["choices"][3]["value"], "request");
+        assert_eq!(
+            request["questions"][0]["choices"],
+            json!([{"value": "decision"}, {"value": "constraint"}, {"value": "request"}])
+        );
         assert_eq!(
             jev_request(&item(
                 "a".into(),
@@ -2228,8 +2232,8 @@ mod tests {
                 Role::Assistant,
                 "x".into(),
                 false
-            ))["questions"][0]["choices"][3]["value"],
-            "note"
+            ))["questions"][0]["choices"],
+            json!([{"value": "decision"}, {"value": "constraint"}, {"value": "task"}, {"value": "note"}])
         );
         classify_items_with(&mut items, temp.path(), &executable, Duration::from_secs(1));
         assert!(items[..3].iter().all(|item| item.kind_hint.is_none()));
@@ -2245,8 +2249,11 @@ mod tests {
         fs::write(&executable, "#!/bin/sh\nexit 99\n").unwrap();
         classify_items_with(&mut items, temp.path(), &executable, Duration::from_secs(1));
         assert!(items[14].kind_hint.is_none());
-        let low = json!({"data":{"answers":[{"type":"choice","name":"kind","choice":"task","confidence":0.59}]}});
+        let low = json!({"data":{"answers":[{"type":"choice","name":"kind","choice":"decision","confidence":0.59}]}});
         assert_eq!(jev_answer(&low, Role::User), Ok(None));
+        let task = json!({"data":{"answers":[{"type":"choice","name":"kind","choice":"task","confidence":0.9}]}});
+        assert!(jev_answer(&task, Role::User).is_err());
+        assert_eq!(jev_answer(&task, Role::Assistant), Ok(Some(Kind::Task)));
         assert!(jev_answer(&json!({}), Role::User).is_err());
     }
 

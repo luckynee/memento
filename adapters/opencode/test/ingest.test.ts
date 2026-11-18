@@ -135,7 +135,7 @@ describe("incremental ingestion", () => {
         await fake.ingestor.flush("s");
         expect(fake.ingests[0].items.map((item) => item.kind_hint)).toEqual(["constraint", "constraint"]);
         expect(questions).toEqual([
-            ["decision", "constraint", "task", "request"],
+            ["decision", "constraint", "request"],
             ["decision", "constraint", "task", "note"],
         ]);
     });

@@ -21,14 +21,15 @@ test("user classification requires confidence and uses request instead of note",
         choices: [
             { value: "decision", description: "A design decision" },
             { value: "constraint", description: "A requirement or constraint" },
-            { value: "task", description: "A task or next step" },
             { value: "request", description: "Other user requests" },
         ],
     });
-    for (const kind of ["constraint", "task"] as const) {
-        choice = kind;
-        expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "user text", "user")).toBe(kind);
-    }
+    choice = "constraint";
+    expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "user text", "user")).toBe("constraint");
+    choice = "task";
+    expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "user text", "user")).toBeNull();
+    expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "assistant text")).toBe("task");
+    choice = "constraint";
     confidence = 0.599;
     expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "user text", "user")).toBeNull();
     confidence = undefined;

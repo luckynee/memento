@@ -106,7 +106,7 @@ export async function classifyKind(decide: DecisionsFn, model: JevModel, text: s
                 choices: [
                     { value: "decision", description: "A design decision" },
                     { value: "constraint", description: "A requirement or constraint" },
-                    { value: "task", description: "A task or next step" },
+                    ...(role === "assistant" ? [{ value: "task", description: "A task or next step" }] : []),
                     role === "user"
                         ? { value: "request", description: "Other user requests" }
                         : { value: "note", description: "Other information" },
@@ -116,7 +116,7 @@ export async function classifyKind(decide: DecisionsFn, model: JevModel, text: s
         const answer = result.answers.find((entry) => entry.name === "kind" && entry.type === "choice");
         if (answer?.type === "choice"
             && (role === "assistant" || (typeof answer.confidence === "number" && Number.isFinite(answer.confidence) && answer.confidence >= 0.6))
-            && (answer.choice === "decision" || answer.choice === "constraint" || answer.choice === "task")) {
+            && (answer.choice === "decision" || answer.choice === "constraint" || (role === "assistant" && answer.choice === "task"))) {
             return answer.choice;
         }
     } catch {

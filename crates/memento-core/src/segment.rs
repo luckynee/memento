@@ -232,7 +232,7 @@ fn render_item(item: &IngestItem, policy: &SegmentPolicy) -> Option<RenderedItem
     match item.role {
         Role::User => Some(RenderedItem {
             kind: match item.kind_hint {
-                Some(kind @ (Kind::Decision | Kind::Constraint | Kind::Task)) => kind,
+                Some(kind @ (Kind::Decision | Kind::Constraint)) => kind,
                 _ => Kind::UserRequest,
             },
             text: strip_scaffolding(&item.text, policy),
@@ -492,7 +492,7 @@ mod tests {
         for (hint, expected) in [
             (Some(Kind::Decision), Kind::Decision),
             (Some(Kind::Constraint), Kind::Constraint),
-            (Some(Kind::Task), Kind::Task),
+            (Some(Kind::Task), Kind::UserRequest),
             (Some(Kind::Command), Kind::UserRequest),
             (None, Kind::UserRequest),
         ] {
