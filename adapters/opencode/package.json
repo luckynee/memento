@@ -1,0 +1,20 @@
+{
+    "name": "@memento-pool/opencode",
+    "private": true,
+    "type": "module",
+    "exports": {
+        ".": "./src/index.ts"
+    },
+    "scripts": {
+        "test": "bun test",
+        "typecheck": "tsc --noEmit"
+    },
+    "dependencies": {
+        "@opencode/plugin": "2.2.5"
+    },
+    "devDependencies": {
+        "@opencode/ai": "2.2.5",
+        "@types/bun": "latest",
+        "typescript": "^5.9.3"
+    }
+}
