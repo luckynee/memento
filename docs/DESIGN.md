@@ -148,7 +148,7 @@ All routes under `http://127.0.0.1:7377`. Optional bearer token via `MEMENTO_TOK
 | Method and path | Body or query | Response |
 | --- | --- | --- |
 | `GET /health` | | `{ "ok": true, "qdrant": true }` |
-| `PUT /v1/sessions` | `{ harness, project, session, parent?, retention?, title? }` | session record |
+| `PUT /v1/sessions` | `{ harness, project, session, parent?, retention?, title? }`; merge semantics: absent fields keep stored values, `created` is set once | session record |
 | `GET /v1/sessions` | `?harness&project` | `{ sessions: [...] }` |
 | `GET /v1/sessions/{harness}/{session}/lineage` | | `{ lineage: ["ses_child", "ses_parent", ...] }` |
 | `POST /v1/ingest` | neutral ingest schema | `{ segments: n, skipped: n }` |
