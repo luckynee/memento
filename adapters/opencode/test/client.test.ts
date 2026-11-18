@@ -25,6 +25,19 @@ describe("daemon client", () => {
         expect(url.searchParams.get("session")).toBe("x/y");
     });
 
+    test("sends the optional injected marker", async () => {
+        let body: unknown;
+        const fetcher = (async (_url, init) => {
+            body = JSON.parse(String(init?.body));
+            return Response.json({ segments: 0, skipped: 1 });
+        }) as typeof fetch;
+        await new MementoClient({ fetch: fetcher }).ingest({
+            harness: "h", project: "p", session: "s",
+            items: [{ source_id: "i", ts: "t", role: "user", text: "generated", kind_hint: null, tool: null, injected: true }],
+        });
+        expect(body).toMatchObject({ items: [{ injected: true }] });
+    });
+
     test("maps JSON and non-JSON HTTP errors", async () => {
         const jsonClient = new MementoClient({ fetch: (async () => Response.json({ error: { code: "bad", message: "details" } }, { status: 400 })) as unknown as typeof fetch });
         try {

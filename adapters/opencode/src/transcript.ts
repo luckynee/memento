@@ -1,11 +1,6 @@
-export type IngestItem = {
-    source_id: string;
-    ts: string;
-    role: "user" | "assistant" | "tool";
-    text: string;
-    kind_hint: string | null;
-    tool: { name: string; input: unknown; output: string; ok: boolean } | null;
-};
+import type { IngestItem } from "./client";
+
+export type { IngestItem } from "./client";
 
 type RecordValue = Record<string, unknown>;
 

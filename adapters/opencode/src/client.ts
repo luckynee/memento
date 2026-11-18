@@ -1,4 +1,12 @@
-import type { IngestItem } from "./transcript";
+export type IngestItem = {
+    source_id: string;
+    ts: string;
+    role: "user" | "assistant" | "tool";
+    text: string;
+    kind_hint: string | null;
+    tool: { name: string; input: unknown; output: string; ok: boolean } | null;
+    injected?: boolean;
+};
 
 export type SessionIdentity = {
     harness: string;

@@ -19,6 +19,7 @@ describe("transcript mapping", () => {
         ]);
         expect(mapMessage({ id: "u", type: "user", time: { created: 0 }, text: " " })).toEqual([]);
         expect(mapMessage({ id: "other", type: "system", time: { created: 0 } })).toEqual([]);
+        expect(mapMessage({ id: "synthetic", type: "synthetic", time: { created: 0 }, text: "generated" })).toEqual([]);
         expect(mapMessage({ id: "bad", type: "user", time: { created: NaN }, text: "x" })).toEqual([]);
     });
 
