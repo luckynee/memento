@@ -14,8 +14,9 @@ use axum::{
 use chrono::Utc;
 use memento_core::{
     digest::{DigestInput, render_digest},
-    lineage::{self, SessionLink},
+    lineage::{self, SessionKey, SessionLink},
     protocol::{
+        ClaimRequest, ClaimResponse, ContinuationRecord, ContinuationRequest, DigestResponse,
         ErrorBody, ErrorDetail, ForgetRequest, ForgetResponse, ForgetScope, Health, IngestRequest,
         IngestResponse, Retention, Scope, SearchRequest, SearchResponse, SessionRecord,
     },
@@ -52,6 +53,8 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/sessions", get(list_sessions).put(put_session))
+        .route("/v1/continuations", axum::routing::put(put_continuation))
+        .route("/v1/continuations/claim", post(claim_continuation))
         .route(
             "/v1/sessions/{harness}/{session}/lineage",
             get(session_lineage),
@@ -228,6 +231,7 @@ struct SessionUpdate {
     project: String,
     session: String,
     parent: Option<String>,
+    parent_harness: Option<String>,
     retention: Option<Retention>,
     title: Option<String>,
 }
@@ -243,30 +247,35 @@ async fn put_session(
     if let Some(parent) = &update.parent {
         required(parent)?;
     }
+    if let Some(parent_harness) = &update.parent_harness {
+        required(parent_harness)?;
+    }
     let _guard = state.registry_lock.lock().await;
+    let record = merge_session(&state, update).await?;
+    Ok(Json(record))
+}
+
+async fn merge_session(
+    state: &RouterState,
+    update: SessionUpdate,
+) -> Result<SessionRecord, ApiError> {
     let existing = state
         .app
         .store
         .get_session(&update.harness, &update.session)
         .await;
-    let existing = store_result(&state, existing).await?;
-    let links = state.app.store.session_links(&update.harness, None).await;
-    let links = store_result(&state, links)
+    let existing = store_result(state, existing).await?;
+    let links = state.app.store.session_links().await;
+    let links = store_result(state, links)
         .await?
         .into_iter()
         .collect::<BTreeMap<_, _>>();
-    if let Some(parent) = &update.parent
-        && lineage::would_create_cycle(&update.session, parent, |session| {
-            links.get(session).cloned().flatten()
-        })
-    {
-        return Err(ApiError::cycle());
-    }
     let mut record = existing.unwrap_or_else(|| SessionRecord {
         harness: update.harness.clone(),
         project: update.project.clone(),
         session: update.session.clone(),
         parent: None,
+        parent_harness: None,
         retention: Retention::default(),
         title: None,
         created: Some(Utc::now()),
@@ -274,6 +283,31 @@ async fn put_session(
     record.project = update.project;
     if let Some(parent) = update.parent {
         record.parent = Some(parent);
+        record.parent_harness = Some(
+            update
+                .parent_harness
+                .unwrap_or_else(|| record.harness.clone()),
+        );
+    } else if let Some(parent_harness) = update.parent_harness {
+        record.parent_harness = Some(parent_harness);
+    }
+    if let Some(parent) = &record.parent {
+        let child = SessionKey {
+            harness: record.harness.clone(),
+            session: record.session.clone(),
+        };
+        let parent = SessionKey {
+            harness: record
+                .parent_harness
+                .clone()
+                .unwrap_or_else(|| record.harness.clone()),
+            session: parent.clone(),
+        };
+        if lineage::would_create_cycle(&child, &parent, |session| {
+            links.get(session).cloned().flatten()
+        }) {
+            return Err(ApiError::cycle());
+        }
     }
     if let Some(retention) = update.retention {
         record.retention = retention;
@@ -282,8 +316,109 @@ async fn put_session(
         record.title = Some(title);
     }
     let result = state.app.store.upsert_session(record.clone()).await;
+    store_result(state, result).await?;
+    Ok(record)
+}
+
+async fn put_continuation(
+    State(state): State<RouterState>,
+    body: Result<Json<ContinuationRequest>, JsonRejection>,
+) -> ApiResult<ContinuationRecord> {
+    let request = json_body(body)?;
+    required(&request.project)?;
+    required(&request.parent_harness)?;
+    required(&request.parent_session)?;
+    if let Some(target) = &request.target_harness {
+        required(target)?;
+    }
+    let _guard = state.registry_lock.lock().await;
+    let parent = state
+        .app
+        .store
+        .get_session(&request.parent_harness, &request.parent_session)
+        .await;
+    if store_result(&state, parent).await?.is_none() {
+        return Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            code: "not_found",
+            message: "parent session not found",
+        });
+    }
+    let record = ContinuationRecord {
+        project: request.project,
+        parent_harness: request.parent_harness,
+        parent_session: request.parent_session,
+        target_harness: request.target_harness,
+        created: Utc::now(),
+    };
+    let result = state.app.store.upsert_continuation(record.clone()).await;
     store_result(&state, result).await?;
     Ok(Json(record))
+}
+
+async fn claim_continuation(
+    State(state): State<RouterState>,
+    body: Result<Json<ClaimRequest>, JsonRejection>,
+) -> ApiResult<ClaimResponse> {
+    let request = json_body(body)?;
+    required(&request.project)?;
+    required(&request.harness)?;
+    required(&request.session)?;
+    let _guard = state.registry_lock.lock().await;
+    let pending = state.app.store.get_continuation(&request.project).await;
+    let Some(pending) = store_result(&state, pending).await? else {
+        return Ok(Json(unclaimed()));
+    };
+    if Utc::now().signed_duration_since(pending.created) >= chrono::Duration::hours(24) {
+        let result = state.app.store.delete_continuation(&request.project).await;
+        store_result(&state, result).await?;
+        return Ok(Json(unclaimed()));
+    }
+    if pending
+        .target_harness
+        .as_deref()
+        .is_some_and(|target| target != request.harness)
+    {
+        return Ok(Json(unclaimed()));
+    }
+    let record = merge_session(
+        &state,
+        SessionUpdate {
+            harness: request.harness,
+            project: request.project.clone(),
+            session: request.session,
+            parent: Some(pending.parent_session.clone()),
+            parent_harness: Some(pending.parent_harness.clone()),
+            retention: None,
+            title: None,
+        },
+    )
+    .await?;
+    let digest = render_session_digest(
+        &state,
+        &record.harness,
+        &record.project,
+        &record.session,
+        None,
+    )
+    .await?;
+    let result = state.app.store.delete_continuation(&request.project).await;
+    store_result(&state, result).await?;
+    Ok(Json(ClaimResponse {
+        claimed: true,
+        parent_harness: Some(pending.parent_harness),
+        parent: Some(pending.parent_session),
+        digest: Some(digest.text),
+    }))
+}
+
+fn unclaimed() -> ClaimResponse {
+    ClaimResponse {
+        claimed: false,
+        parent_harness: None,
+        parent: None,
+        digest: None,
+    }
 }
 
 #[derive(Deserialize)]
@@ -321,19 +456,25 @@ async fn ancestors(
     state: &RouterState,
     harness: &str,
     session: &str,
-) -> Result<Vec<String>, ApiError> {
-    let links = state.app.store.session_links(harness, None).await;
+) -> Result<Vec<SessionKey>, ApiError> {
+    let links = state.app.store.session_links().await;
     let links = store_result(state, links)
         .await?
         .into_iter()
         .collect::<BTreeMap<_, _>>();
-    lineage::ancestors(session, |session| links.get(session).cloned().flatten())
-        .map_err(ApiError::internal)
+    lineage::ancestors(
+        &SessionKey {
+            harness: harness.into(),
+            session: session.into(),
+        },
+        |session| links.get(session).cloned().flatten(),
+    )
+    .map_err(ApiError::internal)
 }
 
 #[derive(Serialize)]
 struct LineageResponse {
-    lineage: Vec<String>,
+    lineage: Vec<SessionKey>,
 }
 
 async fn session_lineage(
@@ -371,6 +512,7 @@ async fn ingest(
                 project: request.project.clone(),
                 session: request.session.clone(),
                 parent: None,
+                parent_harness: None,
                 retention: Retention::default(),
                 title: None,
                 created: Some(Utc::now()),
@@ -403,13 +545,16 @@ async fn search(
         return Ok(Json(SearchResponse { hits: Vec::new() }));
     }
     let sessions = match request.scope {
-        Scope::Session => Some(vec![request.session.clone()]),
+        Scope::Session => Some(vec![SessionKey {
+            harness: request.harness.clone(),
+            session: request.session.clone(),
+        }]),
         Scope::Lineage => Some(ancestors(&state, &request.harness, &request.session).await?),
         Scope::Project | Scope::Global => None,
     };
     let filter = ScopeFilter {
-        harness: Some(request.harness),
-        project: (request.scope != Scope::Global).then_some(request.project),
+        harness: None,
+        project: (request.scope == Scope::Project).then_some(request.project),
         sessions,
         kinds: request.kinds,
     };
@@ -447,27 +592,44 @@ async fn digest(
     required(&query.harness)?;
     required(&query.project)?;
     required(&query.session)?;
-    let lineage = ancestors(&state, &query.harness, &query.session).await?;
+    Ok(Json(
+        render_session_digest(
+            &state,
+            &query.harness,
+            &query.project,
+            &query.session,
+            query.budget,
+        )
+        .await?,
+    ))
+}
+
+async fn render_session_digest(
+    state: &RouterState,
+    harness: &str,
+    project: &str,
+    session: &str,
+    budget: Option<usize>,
+) -> Result<DigestResponse, ApiError> {
+    let lineage = ancestors(state, harness, session).await?;
     let segments = state
         .app
         .store
         .scroll_segments(&ScopeFilter {
-            harness: Some(query.harness.clone()),
-            project: Some(query.project.clone()),
             sessions: Some(lineage.clone()),
             ..Default::default()
         })
         .await;
-    let segments = store_result(&state, segments).await?;
-    Ok(Json(render_digest(
+    let segments = store_result(state, segments).await?;
+    Ok(render_digest(
         &DigestInput {
-            harness: query.harness,
-            project: query.project,
-            lineage,
+            harness: harness.into(),
+            project: project.into(),
+            lineage: lineage.iter().map(ToString::to_string).collect(),
             segments,
         },
-        query.budget.unwrap_or(12000).clamp(1000, 100000),
-    )))
+        budget.unwrap_or(12000).clamp(1000, 100000),
+    ))
 }
 
 async fn forget(
@@ -489,21 +651,32 @@ async fn forget(
             let session = request.session.as_deref().unwrap_or_default();
             required(session)?;
             if request.scope == ForgetScope::Session {
-                Some(vec![session.to_owned()])
+                Some(vec![SessionKey {
+                    harness: request.harness.clone(),
+                    session: session.to_owned(),
+                }])
             } else {
-                let links = state.app.store.session_links(&request.harness, None).await;
+                let links = state.app.store.session_links().await;
                 let links = store_result(&state, links)
                     .await?
                     .into_iter()
-                    .map(|(session, parent)| SessionLink { session, parent })
+                    .map(|(key, parent)| SessionLink { key, parent })
                     .collect::<Vec<_>>();
-                Some(lineage::descendants(session, &links))
+                Some(lineage::descendants(
+                    &SessionKey {
+                        harness: request.harness.clone(),
+                        session: session.to_owned(),
+                    },
+                    &links,
+                ))
             }
         }
     };
     let filter = ScopeFilter {
-        harness: Some(request.harness),
-        project: request.project,
+        harness: None,
+        project: (request.scope == ForgetScope::Project)
+            .then_some(request.project)
+            .flatten(),
         sessions,
         ..Default::default()
     };
@@ -539,9 +712,14 @@ async fn stats(
         .app
         .store
         .count_by_kind(&ScopeFilter {
-            harness: Some(query.harness),
+            harness: Some(query.harness.clone()),
             project: query.project,
-            sessions: query.session.map(|session| vec![session]),
+            sessions: query.session.map(|session| {
+                vec![SessionKey {
+                    harness: query.harness,
+                    session,
+                }]
+            }),
             ..Default::default()
         })
         .await;

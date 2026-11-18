@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use memento_core::{
+    lineage::SessionKey,
     protocol::{Kind, Retention, SessionRecord},
     segment::Segment,
 };
@@ -28,7 +29,11 @@ async fn qdrant_storage_round_trip() {
     );
     let store = Store::new(client.clone(), &prefix, Arc::new(FakeEmbedder));
     let result = run_test(&store).await;
-    for collection in [&store.segments_collection, &store.sessions_collection] {
+    for collection in [
+        &store.segments_collection,
+        &store.sessions_collection,
+        &store.continuations_collection,
+    ] {
         if client.collection_exists(collection).await.unwrap() {
             client
                 .delete_collection(DeleteCollectionBuilder::new(collection))
@@ -79,6 +84,7 @@ async fn run_test(store: &Store) -> anyhow::Result<()> {
         project: "p".into(),
         session: "s1".into(),
         parent: Some("parent".into()),
+        parent_harness: None,
         retention: Retention::Keep,
         title: Some("title".into()),
         created: Some("2026-11-18T10:00:00Z".parse().unwrap()),
@@ -87,11 +93,23 @@ async fn run_test(store: &Store) -> anyhow::Result<()> {
     assert_eq!(store.get_session("h", "s1").await?, Some(session.clone()));
     assert_eq!(store.list_sessions("h", Some("p")).await?, vec![session]);
     assert_eq!(
-        store.session_links("h", Some("p")).await?,
-        vec![("s1".into(), Some("parent".into()))]
+        store.session_links().await?,
+        vec![(
+            SessionKey {
+                harness: "h".into(),
+                session: "s1".into()
+            },
+            Some(SessionKey {
+                harness: "h".into(),
+                session: "parent".into()
+            })
+        )]
     );
     let filtered = ScopeFilter {
-        sessions: Some(vec!["s1".into()]),
+        sessions: Some(vec![SessionKey {
+            harness: "h".into(),
+            session: "s1".into(),
+        }]),
         ..all.clone()
     };
     assert_eq!(store.delete_segments(&filtered).await?, 1);

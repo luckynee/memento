@@ -2,17 +2,31 @@ use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 pub const MAX_LINEAGE_DEPTH: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct SessionKey {
+    pub harness: String,
+    pub session: String,
+}
+
+impl fmt::Display for SessionKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/{}", self.harness, self.session)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionLink {
-    pub session: String,
-    pub parent: Option<String>,
+    pub key: SessionKey,
+    pub parent: Option<SessionKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LineageError {
-    Cycle { session: String },
+    Cycle { session: SessionKey },
     TooDeep { limit: usize },
 }
 
@@ -28,12 +42,12 @@ impl fmt::Display for LineageError {
 impl Error for LineageError {}
 
 pub fn ancestors(
-    start: &str,
-    parent_of: impl Fn(&str) -> Option<String>,
-) -> Result<Vec<String>, LineageError> {
+    start: &SessionKey,
+    parent_of: impl Fn(&SessionKey) -> Option<SessionKey>,
+) -> Result<Vec<SessionKey>, LineageError> {
     let mut result = Vec::new();
     let mut seen = HashSet::new();
-    let mut current = Some(start.to_owned());
+    let mut current = Some(start.clone());
     while let Some(session) = current {
         if !seen.insert(session.clone()) {
             return Err(LineageError::Cycle { session });
@@ -49,11 +63,11 @@ pub fn ancestors(
     Ok(result)
 }
 
-pub fn descendants(start: &str, links: &[SessionLink]) -> Vec<String> {
-    let mut children: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+pub fn descendants(start: &SessionKey, links: &[SessionLink]) -> Vec<SessionKey> {
+    let mut children: BTreeMap<&SessionKey, BTreeSet<&SessionKey>> = BTreeMap::new();
     for link in links {
         if let Some(parent) = &link.parent {
-            children.entry(parent).or_default().insert(&link.session);
+            children.entry(parent).or_default().insert(&link.key);
         }
     }
     let mut seen = HashSet::new();
@@ -61,7 +75,7 @@ pub fn descendants(start: &str, links: &[SessionLink]) -> Vec<String> {
     let mut result = Vec::new();
     seen.insert(start);
     while let Some(session) = queue.pop_front() {
-        result.push(session.to_owned());
+        result.push(session.clone());
         if let Some(siblings) = children.get(session) {
             for child in siblings {
                 if seen.insert(*child) {
@@ -74,14 +88,14 @@ pub fn descendants(start: &str, links: &[SessionLink]) -> Vec<String> {
 }
 
 pub fn would_create_cycle(
-    child: &str,
-    parent: &str,
-    parent_of: impl Fn(&str) -> Option<String>,
+    child: &SessionKey,
+    parent: &SessionKey,
+    parent_of: impl Fn(&SessionKey) -> Option<SessionKey>,
 ) -> bool {
     let mut seen = HashSet::new();
-    let mut current = Some(parent.to_owned());
+    let mut current = Some(parent.clone());
     while let Some(session) = current {
-        if session == child {
+        if &session == child {
             return true;
         }
         if !seen.insert(session.clone()) {
@@ -96,62 +110,93 @@ pub fn would_create_cycle(
 mod tests {
     use super::*;
 
+    fn key(harness: &str, session: &str) -> SessionKey {
+        SessionKey {
+            harness: harness.into(),
+            session: session.into(),
+        }
+    }
+
     #[test]
-    fn chain_and_cycle() {
-        let parent = |session: &str| match session {
-            "c" => Some("b".into()),
-            "b" => Some("a".into()),
-            _ => None,
-        };
-        assert_eq!(ancestors("c", parent).unwrap(), ["c", "b", "a"]);
+    fn chain_and_cycle_across_harnesses() {
+        let parent =
+            |session: &SessionKey| match (session.harness.as_str(), session.session.as_str()) {
+                ("claude", "same") => Some(key("opencode", "same")),
+                ("opencode", "same") => Some(key("codex", "root")),
+                _ => None,
+            };
+        let start = key("claude", "same");
         assert_eq!(
-            ancestors("a", |_| Some("a".into())),
-            Err(LineageError::Cycle {
-                session: "a".into()
-            })
+            ancestors(&start, parent).unwrap(),
+            [start.clone(), key("opencode", "same"), key("codex", "root")]
+        );
+        assert_eq!(start.to_string(), "claude/same");
+        assert_eq!(
+            ancestors(&start, |_| Some(start.clone())),
+            Err(LineageError::Cycle { session: start })
         );
     }
 
     #[test]
     fn depth_limit() {
-        let parent = |session: &str| {
-            let number: usize = session.parse().unwrap();
-            (number > 0).then(|| (number - 1).to_string())
+        let parent = |session: &SessionKey| {
+            let number: usize = session.session.parse().unwrap();
+            (number > 0).then(|| key("h", &(number - 1).to_string()))
         };
-        assert_eq!(ancestors("63", parent).unwrap().len(), 64);
+        assert_eq!(ancestors(&key("h", "63"), parent).unwrap().len(), 64);
         assert_eq!(
-            ancestors("64", parent),
+            ancestors(&key("h", "64"), parent),
             Err(LineageError::TooDeep { limit: 64 })
         );
     }
 
     #[test]
     fn descendants_are_breadth_first_sorted_and_cycle_safe() {
-        let links = [("b", "a"), ("c", "a"), ("d", "b"), ("a", "d"), ("e", "b")]
-            .into_iter()
-            .rev()
-            .map(|(session, parent)| SessionLink {
-                session: session.into(),
-                parent: Some(parent.into()),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(descendants("a", &links), ["a", "b", "c", "d", "e"]);
+        let links = [
+            (key("b", "same"), key("a", "root")),
+            (key("a", "same"), key("a", "root")),
+            (key("c", "child"), key("a", "same")),
+            (key("a", "root"), key("c", "child")),
+        ]
+        .into_iter()
+        .rev()
+        .map(|(key, parent)| SessionLink {
+            key,
+            parent: Some(parent),
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(
+            descendants(&key("a", "root"), &links),
+            [
+                key("a", "root"),
+                key("a", "same"),
+                key("b", "same"),
+                key("c", "child")
+            ]
+        );
     }
 
     #[test]
-    fn cycle_prediction_handles_existing_cycles_and_long_chains() {
-        let parent = |session: &str| match session {
-            "b" => Some("a".into()),
-            "c" => Some("b".into()),
-            _ => None,
-        };
-        assert!(would_create_cycle("a", "c", parent));
-        assert!(would_create_cycle("a", "a", parent));
-        assert!(!would_create_cycle("c", "a", parent));
-        assert!(!would_create_cycle("z", "a", |_| Some("a".into())));
-        assert!(would_create_cycle("0", "70", |session| {
-            let number: usize = session.parse().unwrap();
-            (number > 0).then(|| (number - 1).to_string())
+    fn cycle_prediction_handles_cross_harnesses_existing_cycles_and_long_chains() {
+        let parent =
+            |session: &SessionKey| match (session.harness.as_str(), session.session.as_str()) {
+                ("b", "s") => Some(key("a", "s")),
+                ("c", "s") => Some(key("b", "s")),
+                _ => None,
+            };
+        assert!(would_create_cycle(&key("a", "s"), &key("c", "s"), parent));
+        assert!(would_create_cycle(&key("a", "s"), &key("a", "s"), parent));
+        assert!(!would_create_cycle(&key("c", "s"), &key("a", "s"), parent));
+        assert!(!would_create_cycle(&key("z", "s"), &key("a", "s"), |_| {
+            Some(key("a", "s"))
         }));
+        assert!(would_create_cycle(
+            &key("h", "0"),
+            &key("h", "70"),
+            |session| {
+                let number: usize = session.session.parse().unwrap();
+                (number > 0).then(|| key("h", &(number - 1).to_string()))
+            }
+        ));
     }
 }

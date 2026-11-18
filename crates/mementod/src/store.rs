@@ -5,7 +5,8 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, ensure};
 use memento_core::{
-    protocol::{Kind, SessionRecord},
+    lineage::SessionKey,
+    protocol::{ContinuationRecord, Kind, SessionRecord},
     segment::Segment,
 };
 use qdrant_client::{
@@ -25,12 +26,13 @@ use uuid::Uuid;
 use crate::embed::Embedder;
 
 const SESSION_NAMESPACE: Uuid = Uuid::from_u128(0x2c450e36_854d_5a3c_aab2_743e57e955b8);
+const CONTINUATION_NAMESPACE: Uuid = Uuid::from_u128(0x8bcc899f_a24d_53d6_83e1_80669ad0e156);
 
 #[derive(Debug, Clone, Default)]
 pub struct ScopeFilter {
     pub harness: Option<String>,
     pub project: Option<String>,
-    pub sessions: Option<Vec<String>>,
+    pub sessions: Option<Vec<SessionKey>>,
     pub kinds: Option<Vec<Kind>>,
 }
 
@@ -48,7 +50,13 @@ impl ScopeFilter {
                 !sessions.is_empty(),
                 "empty session filter would match nothing"
             );
-            conditions.push(Condition::matches("session", sessions.clone()));
+            let pairs = sessions.iter().map(|session| {
+                Condition::from(Filter::must([
+                    Condition::matches("harness", session.harness.clone()),
+                    Condition::matches("session", session.session.clone()),
+                ]))
+            });
+            conditions.push(Condition::from(Filter::should(pairs)));
         }
         if let Some(kinds) = &self.kinds {
             ensure!(!kinds.is_empty(), "empty kind filter would match nothing");
@@ -63,6 +71,7 @@ pub struct Store {
     pub client: Qdrant,
     pub segments_collection: String,
     pub sessions_collection: String,
+    pub continuations_collection: String,
     embedder: Arc<dyn Embedder>,
 }
 
@@ -72,6 +81,7 @@ impl Store {
             client,
             segments_collection: format!("{prefix}_segments"),
             sessions_collection: format!("{prefix}_sessions"),
+            continuations_collection: format!("{prefix}_continuations"),
             embedder,
         }
     }
@@ -114,6 +124,17 @@ impl Store {
                 .await
                 .context("creating session collection")?;
         }
+        if !self
+            .client
+            .collection_exists(&self.continuations_collection)
+            .await
+            .context("checking continuation collection")?
+        {
+            self.client
+                .create_collection(CreateCollectionBuilder::new(&self.continuations_collection))
+                .await
+                .context("creating continuation collection")?;
+        }
         for field in ["project", "harness", "session", "kind", "path", "paths"] {
             let mut request = CreateFieldIndexCollectionBuilder::new(
                 &self.segments_collection,
@@ -137,7 +158,7 @@ impl Store {
             ))
             .await
             .context("indexing segment ts")?;
-        for field in ["harness", "project", "session", "parent"] {
+        for field in ["harness", "project", "session", "parent", "parent_harness"] {
             self.client
                 .create_field_index(CreateFieldIndexCollectionBuilder::new(
                     &self.sessions_collection,
@@ -147,6 +168,14 @@ impl Store {
                 .await
                 .with_context(|| format!("indexing session {field}"))?;
         }
+        self.client
+            .create_field_index(CreateFieldIndexCollectionBuilder::new(
+                &self.continuations_collection,
+                "project",
+                FieldType::Keyword,
+            ))
+            .await
+            .context("indexing continuation project")?;
         Ok(())
     }
 
@@ -356,8 +385,10 @@ impl Store {
 
     pub async fn get_session(&self, harness: &str, session: &str) -> Result<Option<SessionRecord>> {
         let filter = ScopeFilter {
-            harness: Some(harness.into()),
-            sessions: Some(vec![session.into()]),
+            sessions: Some(vec![SessionKey {
+                harness: harness.into(),
+                session: session.into(),
+            }]),
             ..Default::default()
         };
         let mut sessions = self.list_sessions_filtered(filter).await?;
@@ -378,17 +409,77 @@ impl Store {
         .await
     }
 
-    pub async fn session_links(
-        &self,
-        harness: &str,
-        project: Option<&str>,
-    ) -> Result<Vec<(String, Option<String>)>> {
+    pub async fn session_links(&self) -> Result<Vec<(SessionKey, Option<SessionKey>)>> {
         Ok(self
-            .list_sessions(harness, project)
+            .list_sessions_filtered(ScopeFilter::default())
             .await?
             .into_iter()
-            .map(|session| (session.session, session.parent))
+            .map(|session| {
+                let parent = session.parent.map(|parent| SessionKey {
+                    harness: session
+                        .parent_harness
+                        .unwrap_or_else(|| session.harness.clone()),
+                    session: parent,
+                });
+                (
+                    SessionKey {
+                        harness: session.harness,
+                        session: session.session,
+                    },
+                    parent,
+                )
+            })
             .collect())
+    }
+
+    pub async fn upsert_continuation(&self, record: ContinuationRecord) -> Result<()> {
+        let id = Uuid::new_v5(&CONTINUATION_NAMESPACE, record.project.as_bytes());
+        let payload =
+            Payload::try_from(serde_json::to_value(record).context("serializing continuation")?)
+                .context("encoding continuation payload")?;
+        let point = PointStruct {
+            id: Some(id.to_string().into()),
+            payload: payload.into(),
+            vectors: Some(HashMap::<String, Vector>::new().into()),
+        };
+        self.client
+            .upsert_points(
+                UpsertPointsBuilder::new(&self.continuations_collection, vec![point]).wait(true),
+            )
+            .await
+            .context("upserting continuation")?;
+        Ok(())
+    }
+
+    pub async fn get_continuation(&self, project: &str) -> Result<Option<ContinuationRecord>> {
+        let mut records = self
+            .scroll_payloads(
+                &self.continuations_collection,
+                Filter::must([Condition::matches("project", project.to_owned())]),
+            )
+            .await?
+            .into_iter()
+            .map(|(_, payload)| {
+                Payload::from(payload)
+                    .deserialize()
+                    .context("decoding continuation payload")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(records.len() <= 1, "duplicate continuation records");
+        Ok(records.pop())
+    }
+
+    pub async fn delete_continuation(&self, project: &str) -> Result<()> {
+        let id = Uuid::new_v5(&CONTINUATION_NAMESPACE, project.as_bytes());
+        self.client
+            .delete_points(
+                DeletePointsBuilder::new(&self.continuations_collection)
+                    .points(vec![PointId::from(id.to_string())])
+                    .wait(true),
+            )
+            .await
+            .context("deleting continuation")?;
+        Ok(())
     }
 
     async fn list_sessions_filtered(&self, filter: ScopeFilter) -> Result<Vec<SessionRecord>> {
@@ -524,7 +615,16 @@ mod tests {
         let filter = ScopeFilter {
             harness: Some("h".into()),
             project: Some("p".into()),
-            sessions: Some(vec!["a".into(), "b".into()]),
+            sessions: Some(vec![
+                SessionKey {
+                    harness: "h".into(),
+                    session: "a".into(),
+                },
+                SessionKey {
+                    harness: "other".into(),
+                    session: "b".into(),
+                },
+            ]),
             kinds: Some(vec![Kind::Task]),
         }
         .to_filter()

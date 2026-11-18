@@ -78,9 +78,14 @@ async fn route_workflow() {
         rerank: Default::default(),
     });
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let result = tokio::spawn(async move { run_workflow(&address).await }).await;
+    let test_store = Arc::clone(&store);
+    let result = tokio::spawn(async move { run_workflow(&address, &test_store).await }).await;
     server.abort();
-    for collection in [&store.segments_collection, &store.sessions_collection] {
+    for collection in [
+        &store.segments_collection,
+        &store.sessions_collection,
+        &store.continuations_collection,
+    ] {
         client
             .delete_collection(DeleteCollectionBuilder::new(collection))
             .await
@@ -89,7 +94,7 @@ async fn route_workflow() {
     result.unwrap();
 }
 
-async fn run_workflow(address: &str) {
+async fn run_workflow(address: &str, store: &Store) {
     let call = |method: &'static str, path: &'static str, body: Value| async move {
         request(address, method, path, Some("test-token"), &body.to_string()).await
     };
@@ -146,7 +151,10 @@ async fn run_workflow(address: &str) {
     let lineage = call("GET", "/v1/sessions/h/child/lineage", json!(null))
         .await
         .1;
-    assert_eq!(lineage["lineage"], json!(["child", "parent"]));
+    assert_eq!(
+        lineage["lineage"],
+        json!([{"harness":"h","session":"child"}, {"harness":"h","session":"parent"}])
+    );
     let search = json!({"harness":"h","project":"p","session":"child","query":"unique_identifier","scope":"lineage"});
     let hits = call("POST", "/v1/search", search.clone()).await.1;
     assert!(
@@ -200,4 +208,311 @@ async fn run_workflow(address: &str) {
     assert_eq!(sessions["sessions"][0]["session"], "parent");
     let stats = call("GET", "/v1/stats?harness=h", json!(null)).await.1;
     assert_eq!(stats["total"], 2);
+    cross_harness_workflow(address, store).await;
+}
+
+async fn cross_harness_workflow(address: &str, store: &Store) {
+    use chrono::{Duration, Utc};
+    use memento_core::protocol::ContinuationRecord;
+
+    let call = |method: &'static str, path: &'static str, body: Value| async move {
+        request(address, method, path, Some("test-token"), &body.to_string()).await
+    };
+    let ingest = |harness: &str, project: &str, session: &str, text: &str| {
+        json!({
+            "harness": harness, "project": project, "session": session,
+            "items": [{"source_id":"same","ts":"2026-11-18T10:00:00Z","role":"user","text":text}]
+        })
+    };
+    assert_eq!(
+        call(
+            "POST",
+            "/v1/ingest",
+            ingest("opencode", "cross", "same", "crossparent unique_marker")
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        call(
+            "POST",
+            "/v1/ingest",
+            ingest("claude-code", "cross", "same", "crosschild unique_marker")
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        call(
+            "POST",
+            "/v1/ingest",
+            ingest("codex", "other", "other", "global_marker unique_marker")
+        )
+        .await
+        .0,
+        200
+    );
+    let linked = call(
+        "PUT",
+        "/v1/sessions",
+        json!({
+            "harness":"claude-code","project":"cross","session":"same",
+            "parent_harness":"opencode","parent":"same"
+        }),
+    )
+    .await;
+    assert_eq!(linked.0, 200);
+    assert_eq!(linked.1["parent_harness"], "opencode");
+    let merged = call(
+        "PUT",
+        "/v1/sessions",
+        json!({
+            "harness":"claude-code","project":"cross","session":"same","title":"kept"
+        }),
+    )
+    .await;
+    assert_eq!(merged.1["parent_harness"], "opencode");
+    assert_eq!(
+        call(
+            "PUT",
+            "/v1/sessions",
+            json!({
+                "harness":"opencode","project":"cross","session":"same",
+                "parent_harness":"claude-code","parent":"same"
+            })
+        )
+        .await
+        .0,
+        409
+    );
+    let lineage = call("GET", "/v1/sessions/claude-code/same/lineage", json!(null))
+        .await
+        .1;
+    assert_eq!(
+        lineage["lineage"],
+        json!([
+            {"harness":"claude-code","session":"same"},
+            {"harness":"opencode","session":"same"}
+        ])
+    );
+    let search = |scope| json!({"harness":"claude-code","project":"cross","session":"same","query":"unique_marker","scope":scope});
+    let lineage_hits = call("POST", "/v1/search", search("lineage")).await.1;
+    assert_eq!(lineage_hits["hits"].as_array().unwrap().len(), 2);
+    assert!(
+        lineage_hits["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|hit| hit["text"].as_str().unwrap().contains("crossparent"))
+    );
+    assert_eq!(
+        call("POST", "/v1/search", search("session")).await.1["hits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        call(
+            "POST",
+            "/v1/ingest",
+            ingest("opencode", "cross", "other", "decoy unique_marker")
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        call(
+            "POST",
+            "/v1/ingest",
+            ingest("codex", "cross", "same", "decoy unique_marker")
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        call("POST", "/v1/search", search("lineage")).await.1["hits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        call("POST", "/v1/search", search("project")).await.1["hits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    assert_eq!(
+        call("POST", "/v1/search", search("global")).await.1["hits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        7
+    );
+    let digest = call(
+        "GET",
+        "/v1/digest?harness=claude-code&project=cross&session=same",
+        json!(null),
+    )
+    .await
+    .1;
+    let text = digest["text"].as_str().unwrap();
+    assert!(text.contains("claude-code/same <- opencode/same"));
+    assert!(text.contains("crossparent") && text.contains("crosschild"));
+
+    assert_eq!(
+        call(
+            "PUT",
+            "/v1/continuations",
+            json!({"project":"cross","parent_harness":"none","parent_session":"missing"})
+        )
+        .await
+        .0,
+        404
+    );
+    let pending = json!({"project":"cross","parent_harness":"opencode","parent_session":"same","target_harness":"codex"});
+    assert_eq!(
+        call("PUT", "/v1/continuations", pending.clone()).await.0,
+        200
+    );
+    assert_eq!(
+        call(
+            "POST",
+            "/v1/continuations/claim",
+            json!({"project":"cross","harness":"claude-code","session":"new"})
+        )
+        .await
+        .1,
+        json!({"claimed":false})
+    );
+    let claimed = call(
+        "POST",
+        "/v1/continuations/claim",
+        json!({"project":"cross","harness":"codex","session":"new"}),
+    )
+    .await;
+    assert_eq!(claimed.0, 200);
+    assert_eq!(claimed.1["claimed"], true);
+    assert_eq!(claimed.1["parent_harness"], "opencode");
+    assert_eq!(claimed.1["parent"], "same");
+    assert!(
+        claimed.1["digest"]
+            .as_str()
+            .unwrap()
+            .contains("crossparent")
+    );
+    assert_eq!(
+        call(
+            "POST",
+            "/v1/continuations/claim",
+            json!({"project":"cross","harness":"codex","session":"new"})
+        )
+        .await
+        .1,
+        json!({"claimed":false})
+    );
+    assert_eq!(call("PUT", "/v1/continuations", json!({"project":"cross","parent_harness":"opencode","parent_session":"same","target_harness":"claude-code"})).await.0, 200);
+    assert_eq!(
+        call("PUT", "/v1/continuations", pending.clone()).await.0,
+        200
+    );
+    let (first, second) = tokio::join!(
+        call(
+            "POST",
+            "/v1/continuations/claim",
+            json!({"project":"cross","harness":"codex","session":"race1"})
+        ),
+        call(
+            "POST",
+            "/v1/continuations/claim",
+            json!({"project":"cross","harness":"codex","session":"race2"})
+        )
+    );
+    assert_eq!(
+        usize::from(first.1["claimed"] == true) + usize::from(second.1["claimed"] == true),
+        1
+    );
+    store
+        .upsert_continuation(ContinuationRecord {
+            project: "cross".into(),
+            parent_harness: "opencode".into(),
+            parent_session: "same".into(),
+            target_harness: None,
+            created: Utc::now() - Duration::hours(25),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        call(
+            "POST",
+            "/v1/continuations/claim",
+            json!({"project":"cross","harness":"codex","session":"expired"})
+        )
+        .await
+        .1,
+        json!({"claimed":false})
+    );
+    assert!(store.get_continuation("cross").await.unwrap().is_none());
+
+    assert_eq!(
+        call(
+            "PUT",
+            "/v1/continuations",
+            json!({"project":"cross","parent_harness":"claude-code","parent_session":"same"})
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        call(
+            "POST",
+            "/v1/continuations/claim",
+            json!({"project":"cross","harness":"opencode","session":"same"})
+        )
+        .await
+        .0,
+        409
+    );
+    assert!(store.get_continuation("cross").await.unwrap().is_some());
+
+    let forgotten = call(
+        "POST",
+        "/v1/forget",
+        json!({"harness":"claude-code","session":"same","scope":"lineage"}),
+    )
+    .await
+    .1;
+    assert_eq!(forgotten["deleted"], 1);
+    assert!(
+        store
+            .get_session("opencode", "same")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(store.get_session("codex", "new").await.unwrap().is_some());
+    assert!(
+        store
+            .get_session("claude-code", "same")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let forgotten = call(
+        "POST",
+        "/v1/forget",
+        json!({"harness":"opencode","session":"same","scope":"lineage"}),
+    )
+    .await
+    .1;
+    assert_eq!(forgotten["deleted"], 1);
+    assert!(store.get_session("codex", "new").await.unwrap().is_none());
+    assert!(store.get_session("codex", "other").await.unwrap().is_some());
 }

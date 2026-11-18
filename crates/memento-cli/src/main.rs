@@ -5,6 +5,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
+use memento_core::lineage::SessionKey;
 use memento_core::protocol::{
     DigestResponse, ErrorBody, ForgetRequest, ForgetResponse, ForgetScope, Health, IngestRequest,
     IngestResponse, Kind, Retention, Scope, SearchRequest, SearchResponse, SessionRecord,
@@ -96,6 +97,8 @@ enum SessionsCommand {
         child: String,
         #[arg(long, help = "Parent session identifier")]
         parent: String,
+        #[arg(long, help = "Parent harness identifier")]
+        parent_harness: Option<String>,
         #[arg(long, help = "Child session title")]
         title: Option<String>,
         #[arg(long, value_enum, help = "Child session retention mode")]
@@ -337,12 +340,16 @@ fn build_request(
                     project,
                     child,
                     parent,
+                    parent_harness,
                     title,
                     retention,
                 },
         } => {
             let mut body =
                 json!({"harness": harness, "project": project, "session": child, "parent": parent});
+            if let Some(parent_harness) = parent_harness {
+                body["parent_harness"] = json!(parent_harness);
+            }
             if let Some(title) = title {
                 body["title"] = json!(title);
             }
@@ -500,14 +507,18 @@ fn render(command: &Command, body: &str) -> Result<String, CliError> {
             command: SessionsCommand::Lineage { .. },
         } => {
             let response: Value = parse_response(body)?;
-            let lineage: Vec<String> = serde_json::from_value(
+            let lineage: Vec<SessionKey> = serde_json::from_value(
                 response
                     .get("lineage")
                     .cloned()
                     .ok_or_else(|| CliError::other("invalid daemon response: missing lineage"))?,
             )
             .map_err(|error| CliError::other(format!("invalid daemon response: {error}")))?;
-            Ok(lineage.join(" -> "))
+            Ok(lineage
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" -> "))
         }
         Command::Search(_) => {
             let response: SearchResponse = parse_response(body)?;
@@ -830,6 +841,8 @@ mod tests {
             "c",
             "--parent",
             "s",
+            "--parent-harness",
+            "other",
             "--title",
             "title",
             "--retention",
@@ -839,7 +852,7 @@ mod tests {
         assert_eq!(link.url().path(), "/v1/sessions");
         assert_eq!(
             body(&link),
-            json!({"harness":"h","project":"p","session":"c","parent":"s","title":"title","retention":"keep"})
+            json!({"harness":"h","project":"p","session":"c","parent":"s","parent_harness":"other","title":"title","retention":"keep"})
         );
 
         let lineage = request(&[
@@ -852,6 +865,14 @@ mod tests {
         ]);
         assert_eq!(lineage.method(), Method::GET);
         assert_eq!(lineage.url().path(), "/v1/sessions/h%2Fone/s%3Ftwo/lineage");
+        assert_eq!(
+            render(
+                &parse(&["sessions", "lineage", "--harness", "h", "--session", "s"]).command,
+                r#"{"lineage":[{"harness":"h","session":"s"},{"harness":"other","session":"p"}]}"#
+            )
+            .unwrap(),
+            "h/s -> other/p"
+        );
     }
 
     #[test]

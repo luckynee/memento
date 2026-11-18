@@ -65,10 +65,46 @@ pub struct SessionRecord {
     pub project: String,
     pub session: String,
     pub parent: Option<String>,
+    pub parent_harness: Option<String>,
     #[serde(default)]
     pub retention: Retention,
     pub title: Option<String>,
     pub created: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContinuationRequest {
+    pub project: String,
+    pub parent_harness: String,
+    pub parent_session: String,
+    pub target_harness: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContinuationRecord {
+    pub project: String,
+    pub parent_harness: String,
+    pub parent_session: String,
+    pub target_harness: Option<String>,
+    pub created: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimRequest {
+    pub project: String,
+    pub harness: String,
+    pub session: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimResponse {
+    pub claimed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_harness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

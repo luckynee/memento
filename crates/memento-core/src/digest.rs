@@ -31,6 +31,7 @@ struct Entry {
     ts: DateTime<Utc>,
     source_id: String,
     chunk_index: u32,
+    harness: String,
     session: String,
     kind: Kind,
     text: String,
@@ -50,7 +51,7 @@ fn kind_order(kind: Kind) -> u8 {
 }
 
 fn entries(segments: &[Segment]) -> Vec<Entry> {
-    let mut groups: BTreeMap<(&str, &str), Vec<&Segment>> = BTreeMap::new();
+    let mut groups: BTreeMap<(&str, &str, &str), Vec<&Segment>> = BTreeMap::new();
     for segment in segments {
         if segment.tool.as_deref().is_some_and(|name| {
             segment.kind != Kind::Task || !name.eq_ignore_ascii_case("todowrite")
@@ -58,13 +59,13 @@ fn entries(segments: &[Segment]) -> Vec<Entry> {
             continue;
         }
         groups
-            .entry((&segment.session, &segment.source_id))
+            .entry((&segment.harness, &segment.session, &segment.source_id))
             .or_default()
             .push(segment);
     }
     let mut result = Vec::new();
     let policy = SegmentPolicy::default();
-    for ((session, source_id), mut chunks) in groups {
+    for ((harness, session, source_id), mut chunks) in groups {
         chunks.sort_by(|left, right| {
             left.chunk_index
                 .cmp(&right.chunk_index)
@@ -91,6 +92,7 @@ fn entries(segments: &[Segment]) -> Vec<Entry> {
             ts: first.ts,
             source_id: source_id.to_owned(),
             chunk_index: first.chunk_index,
+            harness: harness.to_owned(),
             session: session.to_owned(),
             kind: first.kind,
             text,
@@ -102,6 +104,7 @@ fn entries(segments: &[Segment]) -> Vec<Entry> {
             .then_with(|| left.source_id.cmp(&right.source_id))
             .then_with(|| left.chunk_index.cmp(&right.chunk_index))
             .then_with(|| left.session.cmp(&right.session))
+            .then_with(|| left.harness.cmp(&right.harness))
     });
     result
 }
