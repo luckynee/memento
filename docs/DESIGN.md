@@ -38,7 +38,7 @@ OpenCode plugin (TypeScript, adapters/opencode)      memento (Rust workspace)
 | `qdrant-client` | 1.20.0 | gRPC only, connect to 6334 |
 | `fastembed` | 7.7.1 | `EmbeddingModel::BGESmallENV15`, 384 dims, cosine. Pins `ort 2.0.0-rc.15` (Rust >= 1.92, glibc only, x86-64-v3, needs libc++ at runtime). Cache via `FASTEMBED_CACHE_DIR` |
 | Lexical | Qdrant server-side `qdrant/bm25` | Self-hosted since 1.15.3, via `Document` / `DocumentBuilder`, sparse vector with `Modifier::Idf` |
-| Recency | Qdrant formula query (>= 1.14) | `FormulaBuilder`, `Expression::exp_decay` on datetime payload `ts` |
+| Fusion | Qdrant RRF (`Fusion::Rrf`) | recency rerank done in Rust, see Search |
 | OpenCode | v2.3.2, `@opencode/plugin` 2.x | Promise plugin API |
 
 ## Identity and scope
@@ -88,14 +88,15 @@ Raw transcripts are not indexed. Tool output dominates coding sessions and file 
 | --- | --- | --- |
 | user text | `user_request` | full text, chunked |
 | assistant text | `kind_hint` if valid (`decision`, `constraint`, `task`), else `assistant_note` | full text, chunked |
-| tool in edit set (`edit`, `write`, `patch`, `apply_patch`, `multiedit`) | `file_change` | `<tool> <path>` plus input/diff truncated to 2000 chars |
-| tool in shell set (`bash`, `shell`) | `command` | command line; when `ok == false`, plus last 1000 chars of output |
+| tool in edit set (`edit`, `write`, `patch`, `apply_patch`, `multiedit`) | `file_change` | `<tool> <paths>` plus input/diff truncated to 2000 chars |
+| tool in shell set (`bash`, `shell`) | `command` | command line plus output tail: last 1000 chars when `ok == false`, last 400 chars when `ok == true` |
 | tool in read set (`read`, `grep`, `glob`, `list`, `webfetch`, `websearch`) | `file_ref` | `<tool> <path or pattern>` only, no output |
 | todo tools (`todowrite`) | `task` | rendered todo list |
-| any other tool | dropped | |
+| subagent tools (`task`, `subagent`) | `assistant_note` | `<tool>` plus output truncated to 2000 chars (subagent reports are dense summaries) |
+| any other tool (MCP, LSP, unknown) | dropped by default | configurable through `SegmentPolicy` |
 
-- Chunking: max 1500 chars, 200 char overlap, split on paragraph then line boundaries.
-- Path is taken from input keys `filePath`, `path`, `file`, `pattern` (first present).
+- Chunking: max 1000 chars, 150 char overlap, split on paragraph, then line, then whitespace boundaries. BGE-small-en-v1.5 truncates input at 512 tokens and code tokenizes densely, so chunks stay well under that limit. Every segment kind is chunked, including `file_change` and `command` text.
+- Path is taken from input keys `filePath`, `path`, `file`, `pattern` (first present); `webfetch` uses `url`, `websearch` uses `query`. For patch-style input (`patch`, `patchText`, `diff`, or `input` string) paths are parsed from `*** Add File: `, `*** Update File: `, `*** Delete File: `, `*** Move to: ` and `+++ b/` lines; multiple paths are joined with `, ` in text and the first path is stored in `path`.
 - Point id: UUIDv5 over `harness/session/source_id/chunk_index`, so re-ingest is idempotent.
 - Empty segments are skipped.
 
@@ -108,23 +109,37 @@ Collection `memento_segments`:
 - payload: `harness`, `project`, `session`, `kind`, `text`, `source_id`, `chunk_index`, `ts` (RFC 3339), `tool` (optional), `path` (optional).
 - keyword indexes: `project` (`is_tenant = true`), `harness`, `session`, `kind`, `path`; datetime index on `ts`.
 
-Collection `memento_sessions` (registry, 1-dim dummy vector or payload-only points):
+Collection `memento_sessions` (registry): payload-only points if the Rust client supports a collection without vectors, otherwise a 1-dim dummy dense vector. Point id: UUIDv5 over `harness/session`.
 
 - payload: `harness`, `project`, `session`, `parent` (optional), `retention`, `created`, `title` (optional).
+- keyword indexes: `harness`, `project`, `session`, `parent`.
+- Linking rejects cycles and self-parenting (409).
 
-Search: prefetch dense (limit 50) and bm25 (limit 50) under the scope filter, RRF fusion, then formula rescore `score + 0.1 * exp_decay(ts, scale 7 days)`, limit `k` (default 8).
+Lineage terms:
+
+- ancestors(S): S, its parent, the parent's parent, up to the root (cycle-safe, max depth 64).
+- descendants(S): S and every session whose ancestor chain contains S.
+- Search scope `lineage` uses ancestors(S). `forget` scope `lineage` uses descendants(S), so forgetting a continuation never deletes the parent history that siblings still use.
+
+Search:
+
+1. Qdrant query: prefetch dense (limit 50) and bm25 (limit 50), both under the scope filter and optional `kinds` filter, fused with RRF at the top level with an explicit `limit` of 50. No formula query: RRF scores are sums of `1/(k + rank)` and Qdrant's docs warn that an unweighted decay term dominates them.
+2. Rerank in Rust (pure, unit-tested): `normalized = rrf_score / max_rrf_score`, `final = normalized + recency_weight * exp(-ln2 * age / half_life)` where age is measured against the newest `ts` in the candidate set (not wall clock, so results are reproducible), defaults `recency_weight = 0.15`, `half_life = 24h`. Ties break on `(ts desc, source_id, chunk_index)`. Return top `k` (default 8, max 50).
 
 ## Digest
 
-`GET /v1/digest` builds a deterministic working-state document for a session lineage within a char budget (default 12000):
+`GET /v1/digest` builds a deterministic working-state document for a session lineage (ancestors) within a char budget (default 12000). Segments are loaded fully by scroll and sorted by `(ts, source_id, chunk_index)` before rendering; chunks of one source are re-joined (overlap removed) and rendered as one entry, never split mid-entry. Each section has its own share of the budget and unused share flows to the next section:
 
-1. Header: harness, project, session lineage.
-2. `constraint` and `decision` segments, oldest first.
-3. Latest `task` segment.
-4. `user_request` segments, newest first until budget.
-5. Distinct `file_change` paths, newest first.
+| Section | Share | Selection | Rendered order |
+| --- | --- | --- | --- |
+| Header (harness, project, lineage) | fixed | | |
+| Constraints and decisions | 35% | newest entries that fit | chronological |
+| Current tasks | 10% | latest `task` entry only | as stored |
+| User requests | 35% | newest entries that fit; an entry longer than 1500 chars is truncated deterministically | chronological |
+| Files changed | 10% | distinct paths from `file_change`, newest first | newest first |
+| Recent notes | 10% | newest `assistant_note` entries that fit | chronological |
 
-Deterministic output for the same stored data keeps the injected prefix byte-stable, which preserves prompt caching on the new model.
+Identical stored data yields byte-identical output, which keeps the injected prefix cacheable.
 
 ## Daemon HTTP API (mementod, JSON)
 
@@ -158,13 +173,23 @@ Errors: `{ "error": { "code": "...", "message": "..." } }` with 4xx/5xx.
 
 Location: `adapters/opencode/` (Promise plugin, `@opencode/plugin`). Verified contracts:
 
-- Ingestion trigger: event `session.execution.succeeded` (`data: { sessionID }`); then `ctx.session.context({ sessionID })` (messages after the last compaction) and ingest messages newer than the last ingested message id kept in `ctx.storage`. On first sight of a session, ingest the full active context (backfill).
+- Ingestion triggers: event `session.execution.succeeded` (`data: { sessionID }`) and `session.step.ended` (`data: { sessionID, assistantMessageID, finish }`, catches progress in turns that later fail or are aborted); then `ctx.session.context({ sessionID })` (messages after the last compaction) and ingest messages newer than the last ingested message id kept in `ctx.storage`. Assistant messages are re-sent while still growing (point ids are idempotent). On first sight of a session, ingest the full active context (backfill). Ingestion is serialized per session.
+- Flush before snapshot: when a switch is detected, the adapter awaits any in-flight ingestion and runs one synchronous ingest of the current context before fetching the digest, so failed, aborted, or just-finished turns are included.
 - Transcript shapes: user `{ id, type: "user", time: { created }, text }`; assistant `{ id, type: "assistant", model, content: (text | reasoning | tool)[] }`; tool part `{ type: "tool", id, name, state }` with `state.input`, `state.content`, `state.error`.
 - Jev at ingest: for each assistant text item, one `choice` question with choices `decision`, `constraint`, `task`, `note`; result becomes `kind_hint` (`note` maps to null). Failures fall back to null.
-- Model switch: event `session.model.selected` (`data: { sessionID, model, previous? }`) and the `context` hook `event.model`. The origin model is the first model seen for the session (stored). When `event.model` differs from origin in provider or id, the hook rewrites `event.messages`: keep system messages, insert one user message containing the frozen digest (computed once at switch time, stored), keep the verbatim tail starting at the Nth-last `user` message before the switch point (default 3 user turns) and everything after the switch point. Cuts only happen at `user` message boundaries so tool-call/result pairs stay intact. Switching back to the origin model restores full history (the hook only changes the outgoing request; persisted history is untouched).
-- Tool `memory_search({ query, scope? })`: calls `/v1/search` (k = 12), then Jev `predicate` relevance per hit in parallel, returns hits with probability >= 0.5 (max 6). Results arrive as tool output at the end of the context, which keeps the prefix cacheable.
+- Model switch detection: the `context` hook compares `event.model` (provider + id, variant ignored) with the model of the previous primary request for the session (stored). `session.model.selected` is only a hint; the hook is the source of truth.
+- Snapshots: state per session is `{ origin, lastModel, snapshots: { "<provider>/<id>": { cutMessageID, digest } } }`. Before the first switch the session runs untouched on its origin model. On a request whose model differs from `lastModel`: if a snapshot for that model exists it is reused unchanged (keeps that model's prompt cache valid when you bounce back to it); otherwise the adapter flushes ingestion, fetches the digest once, and stores a new snapshot whose cut is the id of the last `user` message at that moment. After the first switch every model, including the origin, is served from its snapshot, because the origin's cache has likely expired and its history now contains other models' turns.
+- Rewrite (pure function, deterministic, byte-stable for identical inputs): the frozen digest is appended as an extra `event.system` text part (avoids consecutive `user` messages); `event.messages` keeps the verbatim tail before the cut plus everything from the cut onward. The tail starts at the Nth-last `user` message before the cut (default 3) and then moves forward one `user` boundary at a time until the pre-cut tail is within `tailCharBudget` (default 40000 chars). If even the single last pre-cut turn exceeds the budget, tool-result texts inside the pre-cut tail are truncated deterministically (head 1000 + tail 500 chars). Cuts only happen at `user` boundaries so tool-call/result pairs stay intact. If the cut message id is no longer present in `event.messages` (OpenCode compacted after the switch), the rewrite keeps messages as given and only adds the digest.
+- Persisted history is never touched; the hook changes only the outgoing request.
+- Tool `memory_search({ query, scope? })`: calls `/v1/search` (k = 12). Jev `predicate` relevance runs in parallel only for prose kinds (`user_request`, `assistant_note`, `decision`, `constraint`, `task`); `file_change`, `command` and `file_ref` hits pass through on score because they are short and lexical. Keep hits with probability >= 0.5, return max 6 ordered by score. On any Jev error or timeout (3 s), fall back to the top 6 by score. Results arrive as tool output at the end of the context, which keeps the prefix cacheable.
 - Command `memento-continue <session>`: links current session to parent via `PUT /v1/sessions`, then puts the digest as `ctx.session.instructions.entry.put({ key: "memento-continuation", ... })`.
-- Options (`ctx.options`): `url`, `token`, `tailUserTurns`, `digestBudget`, `jev` (bool), `jevModel`.
+- Options (`ctx.options`): `url`, `token`, `harness` (`opencode`), `tailUserTurns` (3), `tailCharBudget` (40000), `digestBudget` (12000), `jev` (true), `jevModel` (`opencode/jev-1.13`), `enabled` (true).
+
+## Deployment
+
+- `deploy/compose.yaml`: `qdrant` (`qdrant/qdrant:v1.20.2`, named volume for `/qdrant/storage`, no host port by default) and `mementod` (port `127.0.0.1:7377`, `depends_on` qdrant healthy).
+- Qdrant healthcheck without curl: `bash -c ':> /dev/tcp/127.0.0.1/6333'` (image is Debian based; verify bash presence during implementation).
+- `mementod` image: multi-stage, glibc Debian builder and runtime (ORT prebuilt binaries are glibc only and need libc++). The embedding model is downloaded at build time by `mementod warmup` into `/opt/memento/models` (`FASTEMBED_CACHE_DIR`), so containers start offline.
 
 ## Non-goals for v1
 
