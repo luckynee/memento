@@ -209,6 +209,43 @@ Location: `adapters/opencode/` (Promise plugin, `@opencode/plugin`). Verified co
 - Qdrant healthcheck without curl: `bash -c ':> /dev/tcp/127.0.0.1/6333'` (image is Debian based; verify bash presence during implementation).
 - `mementod` image: multi-stage, glibc Debian builder and runtime (ORT prebuilt binaries are glibc only and need libc++). The embedding model is downloaded at build time by `mementod warmup` into `/opt/memento/models` (`FASTEMBED_CACHE_DIR`), so containers start offline.
 
+## Cross-harness (v1.1)
+
+Verified 2026-11-18: Claude Code 2.1.319 and Codex CLI 0.169.0 store JSONL transcripts and expose command hooks (`SessionStart`, `UserPromptSubmit`, `Stop`, `SessionEnd`) that receive JSON on stdin with `session_id`, `transcript_path`, `cwd`, `hook_event_name`, and accept `{"hookSpecificOutput":{"hookEventName":"<event>","additionalContext":"..."}}` on `SessionStart` and `UserPromptSubmit`. agy 1.5.11 stores conversations as SQLite with binary step payloads (format unverified) and documents no lifecycle hooks, but supports MCP servers (`agy mcp add`).
+
+Harness ids: `opencode`, `claude-code`, `codex`, `agy`.
+
+### Identity
+
+- `project` is the canonical absolute path of the main checkout: the parent of `git rev-parse --path-format=absolute --git-common-dir` (so linked worktrees map to their main repository), or the canonical cwd outside git. The OpenCode adapter uses `ctx.location.project.canonical` (OpenCode's saved canonical checkout directory) and falls back to `ctx.location.project.id`. `memento project-key [DIR]` prints the key. Existing data keyed by OpenCode project ids is not migrated.
+- A session is identified by the pair `(harness, session)`. Session records gain `parent_harness` (defaults to the session's own harness), so a Claude Code session can continue an OpenCode session.
+- Lineage, ancestors, and descendants are computed over `(harness, session)` pairs (cycle-safe across harnesses). Qdrant filters for session and lineage scope are a `should` of `must(harness, session)` pairs.
+
+### Scopes
+
+- `session`, `lineage`: pair-based as above.
+- `project`: every harness, filtered by `project`.
+- `global`: everything.
+
+### Pending continuations
+
+`PUT /v1/continuations { project, parent_harness, parent_session, target_harness? }` stores one pending continuation per project (latest wins, expires after 24 h). `POST /v1/continuations/claim { project, harness, session }` atomically consumes it when `target_harness` is absent or equal, links the session (`parent_harness`, `parent`), and returns `{ claimed: bool, parent_harness?, parent?, digest? }` with the lineage digest. CLI: `memento continue --from <harness>/<session> [--project DIR] [--to HARNESS]`. Every adapter claims on its first event for a new session.
+
+### Transcript importers (CLI)
+
+`memento import claude-code|codex --transcript PATH [--session ID] [--project DIR]` parses the JSONL into neutral items and posts them. Incremental: a cursor file in `${XDG_STATE_HOME:-~/.local/state}/memento/cursors.json` keyed by canonical transcript path stores the byte offset of the last fully parsed line; only new complete lines are sent. Reasoning (`thinking`, `reasoning`) is dropped. Claude Code records with `isMeta: true`, `isSidechain` subagent transcripts, and harness command/caveat wrappers are marked `injected` or stripped by the policy. Codex `session_meta`, `turn_context`, `<environment_context>` and `<user_instructions>` user messages are marked `injected`.
+
+### Hooks (CLI)
+
+`memento hook claude-code|codex` reads the hook JSON from stdin:
+- `SessionStart`: claim a pending continuation for `project-key(cwd)`; if claimed, print the `additionalContext` JSON with the framed digest (`<memento-continuation>` wrapper, reference data, not instructions).
+- `Stop`, `SessionEnd`: incremental import of `transcript_path`.
+- Any failure exits 0 with a message on stderr; hooks never block the harness.
+
+### MCP server
+
+`memento mcp --harness NAME` serves stdio MCP tools for harnesses without hooks (agy) and as an option for all: `memory_search { query, scope?, project?, session? }`, `memory_digest { project?, harness?, session? }`, `memory_continue { from_harness, from_session }` (claims nothing, returns the parent digest), and `memory_note { kind: decision|constraint|task|note, text, session? }` which stores an explicit note for harnesses whose transcripts cannot be imported (default session `<harness>-notes`, project from the server's cwd).
+
 ## Non-goals for v1
 
 - Proactive per-turn recall injection (needs deterministic per-message injection storage to stay cache-safe).
