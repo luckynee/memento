@@ -10,6 +10,10 @@ use crate::protocol::{IngestItem, IngestRequest, Kind, Role, ToolCall};
 
 #[derive(Debug, Clone)]
 pub struct SegmentPolicy {
+    pub scaffold_strip_tags: HashSet<String>,
+    pub scaffold_unwrap_tags: HashSet<String>,
+    pub ignored_tools: HashSet<String>,
+    pub self_command_prefixes: Vec<String>,
     pub edit_tools: HashSet<String>,
     pub shell_tools: HashSet<String>,
     pub read_tools: HashSet<String>,
@@ -26,6 +30,24 @@ pub struct SegmentPolicy {
 impl Default for SegmentPolicy {
     fn default() -> Self {
         Self {
+            scaffold_strip_tags: tool_set(&[
+                "system-reminder",
+                "skill_content",
+                "environment_context",
+                "user_instructions",
+                "command-message",
+                "command-name",
+                "local-command-stdout",
+                "local-command-stderr",
+                "local-command-caveat",
+                "subagent",
+                "memento-digest",
+                "memento-memory",
+                "memento-continuation",
+            ]),
+            scaffold_unwrap_tags: tool_set(&["command-args"]),
+            ignored_tools: tool_set(&["skill", "memory_search", "question", "execute"]),
+            self_command_prefixes: vec!["memento ".into(), "mementod ".into()],
             edit_tools: tool_set(&["edit", "write", "patch", "apply_patch", "multiedit"]),
             shell_tools: tool_set(&["bash", "shell"]),
             read_tools: tool_set(&["read", "grep", "glob", "list", "webfetch", "websearch"]),
@@ -43,6 +65,87 @@ impl Default for SegmentPolicy {
 
 fn tool_set(names: &[&str]) -> HashSet<String> {
     names.iter().map(|name| (*name).to_owned()).collect()
+}
+
+struct ScaffoldTag<'a> {
+    name: &'a str,
+    closing: bool,
+    end: usize,
+}
+
+fn scaffold_tag(text: &str, start: usize) -> Option<ScaffoldTag<'_>> {
+    let rest = text.get(start + 1..)?;
+    let (closing, rest) = match rest.strip_prefix('/') {
+        Some(rest) => (true, rest),
+        None => (false, rest),
+    };
+    let name_end = rest
+        .bytes()
+        .position(|byte| !byte.is_ascii_alphanumeric() && byte != b'-' && byte != b'_')
+        .unwrap_or(rest.len());
+    if name_end == 0 {
+        return None;
+    }
+    let name = &rest[..name_end];
+    let after_name = &rest[name_end..];
+    if !after_name.starts_with('>') && !after_name.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let mut quote = None;
+    for (offset, character) in after_name.char_indices() {
+        match (quote, character) {
+            (Some(expected), found) if expected == found => quote = None,
+            (None, '\'' | '"') => quote = Some(character),
+            (None, '>') => {
+                let end = text.len() - after_name.len() + offset + 1;
+                return Some(ScaffoldTag { name, closing, end });
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+pub(crate) fn strip_scaffolding(text: &str, policy: &SegmentPolicy) -> String {
+    let mut output = String::new();
+    let mut position = 0;
+    let mut stripped = Vec::new();
+    while let Some(relative) = text[position..].find('<') {
+        let start = position + relative;
+        if stripped.is_empty() {
+            output.push_str(&text[position..start]);
+        }
+        let Some(tag) = scaffold_tag(text, start) else {
+            if stripped.is_empty() {
+                output.push('<');
+            }
+            position = start + 1;
+            continue;
+        };
+        let name = tag.name.to_ascii_lowercase();
+        if policy.scaffold_strip_tags.contains(&name) {
+            if tag.closing {
+                if stripped.last() == Some(&name) {
+                    stripped.pop();
+                } else if stripped.is_empty() {
+                    output.push_str(&text[start..tag.end]);
+                }
+            } else {
+                stripped.push(name);
+            }
+        } else if stripped.is_empty() && !policy.scaffold_unwrap_tags.contains(&name) {
+            output.push_str(&text[start..tag.end]);
+        }
+        position = tag.end;
+    }
+    if stripped.is_empty() {
+        output.push_str(&text[position..]);
+    }
+    if output == text {
+        output
+    } else {
+        output.trim().to_string()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +173,10 @@ pub struct SegmentOutcome {
 pub fn segment_items(request: &IngestRequest, policy: &SegmentPolicy) -> SegmentOutcome {
     let mut outcome = SegmentOutcome::default();
     for item in &request.items {
+        if item.injected {
+            outcome.skipped += 1;
+            continue;
+        }
         let Some(rendered) = render_item(item, policy) else {
             outcome.skipped += 1;
             continue;
@@ -125,7 +232,7 @@ fn render_item(item: &IngestItem, policy: &SegmentPolicy) -> Option<RenderedItem
     match item.role {
         Role::User => Some(RenderedItem {
             kind: Kind::UserRequest,
-            text: item.text.clone(),
+            text: strip_scaffolding(&item.text, policy),
             tool: None,
             path: None,
             paths: Vec::new(),
@@ -135,7 +242,7 @@ fn render_item(item: &IngestItem, policy: &SegmentPolicy) -> Option<RenderedItem
                 Some(kind @ (Kind::Decision | Kind::Constraint | Kind::Task)) => kind,
                 _ => Kind::AssistantNote,
             },
-            text: item.text.clone(),
+            text: strip_scaffolding(&item.text, policy),
             tool: None,
             path: None,
             paths: Vec::new(),
@@ -146,6 +253,9 @@ fn render_item(item: &IngestItem, policy: &SegmentPolicy) -> Option<RenderedItem
 
 fn render_tool(tool: &ToolCall, policy: &SegmentPolicy) -> Option<RenderedItem> {
     let name = tool.name.to_lowercase();
+    if policy.ignored_tools.contains(&name) {
+        return None;
+    }
     let paths = tool_paths(&name, &tool.input);
     let path = paths.first().cloned();
     let (kind, text) = if policy.edit_tools.contains(&name) {
@@ -160,6 +270,13 @@ fn render_tool(tool: &ToolCall, policy: &SegmentPolicy) -> Option<RenderedItem> 
             .get("command")
             .and_then(Value::as_str)
             .unwrap_or("");
+        if policy
+            .self_command_prefixes
+            .iter()
+            .any(|prefix| command.trim_start().starts_with(prefix))
+        {
+            return None;
+        }
         let output_limit = if tool.ok {
             policy.successful_output_max_chars
         } else {
@@ -312,6 +429,7 @@ mod tests {
             ts: "2026-11-18T10:00:00Z".parse().unwrap(),
             role,
             text: text.into(),
+            injected: false,
             kind_hint: None,
             tool: None,
         }
@@ -713,5 +831,81 @@ mod tests {
             );
             assert_eq!(segment.source_id, "source");
         }
+    }
+
+    #[test]
+    fn scaffold_blocks_are_stripped_from_both_text_roles() {
+        let policy = SegmentPolicy::default();
+        for tag in &policy.scaffold_strip_tags {
+            for role in [Role::User, Role::Assistant] {
+                let text = format!("before <{tag} key=\"a > b\">\nsecret\n</{tag}> after");
+                let outcome = run(vec![item(role, &text)], &policy);
+                assert_eq!(outcome.segments[0].text, "before  after", "{tag}");
+            }
+        }
+    }
+
+    #[test]
+    fn scaffold_unwrap_nested_adjacent_case_and_unclosed() {
+        let policy = SegmentPolicy::default();
+        let cases = [
+            ("a<command-args x='1'>keep</command-args>b", "akeepb"),
+            ("a<SYSTEM-REMINDER>hide</sYsTeM-rEmInDeR>b", "ab"),
+            (
+                "a<subagent>outer<subagent>inner</subagent>end</subagent>b",
+                "ab",
+            ),
+            (
+                "a<subagent>x</subagent><skill_content>y</skill_content>b",
+                "ab",
+            ),
+            (
+                "a<subagent>x<system-reminder>y</system-reminder>z</subagent>b",
+                "ab",
+            ),
+            ("a<system-reminder attr='x'>unfinished", "a"),
+            (
+                "a<system-reminderish>keep</system-reminderish>b",
+                "a<system-reminderish>keep</system-reminderish>b",
+            ),
+            ("é<COMMAND-ARGS>🙂</COMMAND-ARGS>界", "é🙂界"),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(strip_scaffolding(text, &policy), expected);
+        }
+    }
+
+    #[test]
+    fn injected_empty_ignored_and_self_commands_are_skipped() {
+        let mut injected = item(Role::User, "injected");
+        injected.injected = true;
+        let mut policy = SegmentPolicy::default();
+        policy.edit_tools.insert("skill".into());
+        let mut items = vec![
+            injected,
+            item(Role::User, "<system-reminder>hidden</system-reminder>"),
+            item(Role::Assistant, "<subagent>unclosed"),
+        ];
+        for name in ["SKILL", "memory_search", "question", "execute"] {
+            items.push(tool_item(name, json!({"path": "x"}), Some("output"), true));
+        }
+        for command in ["  memento digest", "\nmementod serve"] {
+            items.push(tool_item(
+                "shell",
+                json!({"command": command}),
+                Some("output"),
+                true,
+            ));
+        }
+        items.push(tool_item(
+            "shell",
+            json!({"command": "memento-other"}),
+            None,
+            true,
+        ));
+        let outcome = run(items, &policy);
+        assert_eq!(outcome.skipped, 9);
+        assert_eq!(outcome.segments.len(), 1);
+        assert_eq!(outcome.segments[0].text, "memento-other");
     }
 }

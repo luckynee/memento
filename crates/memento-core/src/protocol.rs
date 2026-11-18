@@ -18,6 +18,8 @@ pub struct IngestItem {
     pub role: Role,
     #[serde(default)]
     pub text: String,
+    #[serde(default)]
+    pub injected: bool,
     pub kind_hint: Option<Kind>,
     pub tool: Option<ToolCall>,
 }
@@ -181,6 +183,7 @@ mod tests {
                     "ts": "2026-11-18T10:00:00Z",
                     "role": "user",
                     "text": "...",
+                    "injected": false,
                     "kind_hint": null,
                     "tool": null
                 },
@@ -189,6 +192,7 @@ mod tests {
                     "ts": "2026-11-18T10:00:05Z",
                     "role": "tool",
                     "text": "",
+                    "injected": false,
                     "kind_hint": null,
                     "tool": {
                         "name": "edit",
@@ -221,6 +225,7 @@ mod tests {
         }))
         .unwrap();
         assert!(item.text.is_empty());
+        assert!(!item.injected);
     }
 
     #[test]
