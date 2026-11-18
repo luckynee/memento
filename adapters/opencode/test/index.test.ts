@@ -1,0 +1,70 @@
+import { expect, test } from "bun:test";
+import type { Plugin } from "@opencode/plugin";
+import plugin from "../src/index";
+
+test("step ended dispatches ingestion and cleanup stops the subscription", async () => {
+    const values = new Map<string, unknown>();
+    const ingests: unknown[] = [];
+    let subscriptionTypes: readonly string[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url, init) => {
+        if (String(url).endsWith("/v1/ingest")) {
+            ingests.push(JSON.parse(String(init?.body)));
+            return Response.json({ segments: 1, skipped: 0 });
+        }
+        return Response.json({});
+    }) as typeof fetch;
+    const registration = () => ({ async dispose() {} });
+    const ctx = {
+        options: { jev: false },
+        location: { project: { id: "p" } },
+        storage: {
+            async get(key: string) { return values.get(key); },
+            async set(key: string, value: unknown) { values.set(key, value); },
+        },
+        session: {
+            async context() { return [{ id: "u", type: "user", time: { created: 0 }, text: "hello" }]; },
+            async hook() { return registration(); },
+            instructions: { entry: { async put() {} } },
+        },
+        tool: { async transform() { return registration(); } },
+        command: { async transform() { return registration(); } },
+        event: {
+            async *subscribe(input: { types: readonly string[]; signal: AbortSignal }) {
+                subscriptionTypes = input.types;
+                yield { type: "session.step.ended", data: { sessionID: "s", assistantMessageID: "a", finish: "stop" } };
+                if (!input.signal.aborted) {
+                    await new Promise<void>((resolve) => input.signal.addEventListener("abort", () => resolve(), { once: true }));
+                }
+            },
+        },
+    } as unknown as Plugin.Context;
+    try {
+        const cleanup = await plugin.setup(ctx);
+        await new Promise<void>((resolve, reject) => {
+            let attempts = 0;
+            const check = () => {
+                if (ingests.length) {
+                    resolve();
+                } else if (++attempts >= 1000) {
+                    reject(new Error("ingest did not arrive"));
+                } else {
+                    setTimeout(check, 1);
+                }
+            };
+            check();
+        });
+        expect(subscriptionTypes).toContain("session.step.ended");
+        expect(ingests).toHaveLength(1);
+        if (cleanup) { await cleanup(); }
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test("disabled plugin registers nothing", async () => {
+    const ctx = { options: { enabled: false } } as unknown as Plugin.Context;
+    const cleanup = await plugin.setup(ctx);
+    expect(typeof cleanup).toBe("function");
+    if (cleanup) { await cleanup(); }
+});

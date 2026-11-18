@@ -1,0 +1,87 @@
+import { describe, expect, test } from "bun:test";
+import { MementoError, type SearchHit } from "../src/client";
+import { DEFAULT_JEV_MODEL, type DecisionsFn } from "../src/jev";
+import { createMemorySearchTool } from "../src/tools";
+
+const hits: SearchHit[] = [
+    { id: "1", score: 1, kind: "decision", text: "reject", session: "s", ts: "t" },
+    { id: "2", score: 9, kind: "file_change", text: "file", session: "s", ts: "t", path: "a" },
+    { id: "3", score: 5, kind: "task", text: "keep", session: "s", ts: "t" },
+    { id: "4", score: 8, kind: "command", text: "command", session: "s", ts: "t" },
+    { id: "5", score: 7, kind: "unknown", text: "other", session: "s", ts: "t" },
+    { id: "6", score: 4, kind: "file_ref", text: "ref", session: "s", ts: "t" },
+    { id: "7", score: 3, kind: "constraint", text: "keep2", session: "s", ts: "t" },
+    { id: "8", score: 2, kind: "assistant_note", text: "keep3", session: "s", ts: "t" },
+];
+const context = { sessionID: "s", signal: new AbortController().signal };
+
+function setup(decide?: DecisionsFn, jevTimeoutMs?: number) {
+    const calls: unknown[] = [];
+    const tool = createMemorySearchTool({
+        client: { async search(payload, signal) { calls.push({ payload, signal }); return { hits }; } },
+        decide, jevModel: DEFAULT_JEV_MODEL, harness: "opencode", project: "p", jevTimeoutMs,
+    });
+    return { tool, calls };
+}
+
+describe("memory search", () => {
+    test("judges only prose, preserves other kinds, sorts and limits", async () => {
+        const judged: string[] = [];
+        const fake = setup(async (input) => {
+            const text = input.input[0].text;
+            judged.push(text);
+            return { answers: [{ type: "predicate", name: "relevant", probability: text.endsWith("reject") ? 0.2 : 0.8 }] };
+        });
+        const result = await fake.tool.execute({ query: "q" }, context);
+        expect(judged).toHaveLength(4);
+        expect(result.content).toContain('Found 6 memories for "q" (scope: lineage).');
+        expect(result.content).not.toContain("\nreject");
+        expect(result.content.indexOf("\nfile")).toBeLessThan(result.content.indexOf("\ncommand"));
+        expect(result.content).toContain("| a");
+        expect(fake.calls[0]).toMatchObject({ payload: { query: "q", k: 12 } });
+    });
+
+    test("falls back for error answer, missing answer, thrown decision and disabled Jev", async () => {
+        const cases: (DecisionsFn | undefined)[] = [
+            async () => ({ answers: [{ type: "error", name: "relevant", reason: "offline" }] }),
+            async () => ({ answers: [] }),
+            async () => { throw new Error("offline"); },
+            undefined,
+        ];
+        for (const decide of cases) {
+            const result = await setup(decide).tool.execute({ query: "q", scope: "project" }, context);
+            expect(result.content).toContain("(scope: project)");
+            expect(result.content.indexOf("\nfile")).toBeLessThan(result.content.indexOf("\ncommand"));
+            expect(result.content).toContain("\nkeep");
+            expect(result.content).not.toContain("\nreject");
+        }
+    });
+
+    test("falls back on whole-phase timeout", async () => {
+        const fake = setup(async () => new Promise(() => {}), 5);
+        const result = await fake.tool.execute({ query: "q" }, context);
+        expect(result.content).toContain("\nfile");
+        expect(result.content).toContain("Found 6 memories");
+    });
+
+    test("validates input and reports daemon errors", async () => {
+        const fake = setup();
+        expect((await fake.tool.execute({}, context)).content).toContain("query");
+        expect((await fake.tool.execute({ query: "q", scope: "bad" }, context)).content).toContain("scope");
+        expect((await fake.tool.execute({ query: "q", extra: 1 }, context)).content).toContain("unexpected");
+        const tool = createMemorySearchTool({
+            client: { async search() { throw new MementoError("offline", "unavailable"); } },
+            jevModel: DEFAULT_JEV_MODEL, harness: "h", project: "p",
+        });
+        expect((await tool.execute({ query: "q" }, context)).content).toBe("memento daemon unavailable: offline");
+    });
+
+    test("reports no hits after successful relevance filtering", async () => {
+        const tool = createMemorySearchTool({
+            client: { async search() { return { hits: [hits[0]] }; } },
+            decide: async () => ({ answers: [{ type: "predicate", name: "relevant", probability: 0.1 }] }),
+            jevModel: DEFAULT_JEV_MODEL, harness: "h", project: "p",
+        });
+        expect((await tool.execute({ query: "q" }, context)).content).toBe('No relevant memories found for "q".');
+    });
+});
