@@ -148,6 +148,8 @@ pub struct SearchHit {
     pub score: f32,
     pub kind: Kind,
     pub text: String,
+    #[serde(default)]
+    pub harness: String,
     pub session: String,
     pub ts: DateTime<Utc>,
     pub path: Option<String>,
@@ -262,6 +264,13 @@ mod tests {
         .unwrap();
         assert!(item.text.is_empty());
         assert!(!item.injected);
+        let hit: SearchHit = serde_json::from_value(json!({
+            "id": "00000000-0000-0000-0000-000000000001",
+            "score": 1.0, "kind": "decision", "text": "text",
+            "session": "s", "ts": "2026-11-18T10:00:00Z", "path": null
+        }))
+        .unwrap();
+        assert!(hit.harness.is_empty());
     }
 
     #[test]
