@@ -284,7 +284,7 @@ fn endpoint(base: &str, segments: &[&str]) -> Result<Url, CliError> {
 fn build_request(
     client: &Client,
     cli: &Cli,
-    ingest: Option<&IngestRequest>,
+    ingest: Option<&serde_json::Value>,
 ) -> Result<Request, CliError> {
     let (method, segments): (Method, Vec<&str>) = match &cli.command {
         Command::Health => (Method::GET, vec!["health"]),
@@ -427,7 +427,7 @@ fn response_error(status: reqwest::StatusCode, body: &str) -> CliError {
     }
 }
 
-fn read_ingest(path: &PathBuf) -> Result<IngestRequest, CliError> {
+fn read_ingest(path: &PathBuf) -> Result<serde_json::Value, CliError> {
     let mut input = String::new();
     if path.as_os_str() == "-" {
         io::stdin()
@@ -441,8 +441,11 @@ fn read_ingest(path: &PathBuf) -> Result<IngestRequest, CliError> {
             ))
         })?;
     }
-    serde_json::from_str(&input)
-        .map_err(|error| CliError::other(format!("invalid ingest JSON: {error}")))
+    let raw: serde_json::Value = serde_json::from_str(&input)
+        .map_err(|error| CliError::other(format!("invalid ingest JSON: {error}")))?;
+    serde_json::from_value::<IngestRequest>(raw.clone())
+        .map_err(|error| CliError::other(format!("invalid ingest JSON: {error}")))?;
+    Ok(raw)
 }
 
 fn parse_response<T: serde::de::DeserializeOwned>(body: &str) -> Result<T, CliError> {
@@ -930,12 +933,13 @@ mod tests {
 
     #[test]
     fn builds_ingest_from_validated_schema() {
-        let input = json!({"harness":"h","project":"p","session":"s","items":[]});
-        let ingest: IngestRequest = serde_json::from_value(input.clone()).unwrap();
+        let input =
+            json!({"harness":"h","project":"p","session":"s","items":[],"future_field":true});
+        assert!(serde_json::from_value::<IngestRequest>(input.clone()).is_ok());
         let request = build_request(
             &Client::new(),
             &parse(&["ingest", "--file", "-"]),
-            Some(&ingest),
+            Some(&input),
         )
         .unwrap();
         assert_eq!(request.method(), Method::POST);
