@@ -47,3 +47,4 @@
 - Codex ignores project `.codex/hooks.json` until the project is trusted; `-c projects."<dir>".trust_level=...` does not count; `codex exec --trust` writes `[projects."<dir>"] trust_level = "trusted"` to `~/.codex/config.toml`. Scripted runs also need `--dangerously-bypass-hook-trust`.
 - Claude Code `-p` loads project `.claude/settings.json` hooks without extra trust flags.
 - agy `-p` takes the next token as its prompt: put flags before `-p "prompt"`.
+- Big-context test 2026-11-19 (OpenCode, commandcode/gpt-6-luna to commandcode/claude-haiku-5-5 at 285,576 tokens): first switched request 22,780 tokens vs 287,355 for a vanilla switch, 4/4 recall. OpenCode v2.3.2 leaves `system` role messages in history after a switch; Anthropic-protocol providers reject them (HTTP 400), so the adapter hoists them into system parts when rewriting. `9router/cx/gpt-6-luna` auto-compacts near 200k. Recording: `/home/luckynee/video/memento-big-context-demo.*`.
