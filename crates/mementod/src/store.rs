@@ -1,12 +1,12 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
 use anyhow::{Context, Result, anyhow, ensure};
 use memento_core::{
     lineage::SessionKey,
-    protocol::{ContinuationRecord, Kind, SessionRecord},
+    protocol::{ContinuationRecord, Kind, Role, SessionRecord},
     segment::Segment,
 };
 use qdrant_client::{
@@ -15,7 +15,7 @@ use qdrant_client::{
         Condition, CountPointsBuilder, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder,
         DeletePointsBuilder, Distance, Document, DocumentBuilder, FieldType, Filter, Fusion,
         KeywordIndexParamsBuilder, Modifier, PointId, PointStruct, PrefetchQueryBuilder, Query,
-        QueryPointsBuilder, ScrollPointsBuilder, SparseVectorParamsBuilder,
+        QueryPointsBuilder, Range, ScrollPointsBuilder, SparseVectorParamsBuilder,
         SparseVectorsConfigBuilder, UpsertPointsBuilder, Vector, VectorParamsBuilder,
         VectorsConfigBuilder, point_id::PointIdOptions,
     },
@@ -135,7 +135,15 @@ impl Store {
                 .await
                 .context("creating continuation collection")?;
         }
-        for field in ["project", "harness", "session", "kind", "path", "paths"] {
+        for field in [
+            "project",
+            "harness",
+            "session",
+            "kind",
+            "path",
+            "paths",
+            "source_id",
+        ] {
             let mut request = CreateFieldIndexCollectionBuilder::new(
                 &self.segments_collection,
                 field,
@@ -150,6 +158,14 @@ impl Store {
                 .await
                 .with_context(|| format!("indexing segment {field}"))?;
         }
+        self.client
+            .create_field_index(CreateFieldIndexCollectionBuilder::new(
+                &self.segments_collection,
+                "chunk_index",
+                FieldType::Integer,
+            ))
+            .await
+            .context("indexing segment chunk_index")?;
         self.client
             .create_field_index(CreateFieldIndexCollectionBuilder::new(
                 &self.segments_collection,
@@ -218,6 +234,141 @@ impl Store {
                 .await
                 .context("upserting segment batch")?;
         }
+        Ok(())
+    }
+
+    pub async fn ingest_segments(
+        &self,
+        segments: &[Segment],
+        source_roles: &HashMap<String, Role>,
+        cosine_threshold: f32,
+        jaccard_threshold: f32,
+    ) -> Result<(usize, usize)> {
+        let mut stored = 0;
+        let mut duplicates = 0;
+        for batch in segments.chunks(64) {
+            let vectors = self
+                .embedder
+                .embed_documents(batch.iter().map(|segment| segment.text.clone()).collect())
+                .await
+                .context("embedding segment batch")?;
+            ensure!(
+                vectors.len() == batch.len(),
+                "embedder returned incorrect vector count"
+            );
+            for (segment, vector) in batch.iter().zip(vectors) {
+                ensure!(
+                    vector.len() == self.embedder.dimensions(),
+                    "embedder returned incorrect vector dimensions"
+                );
+                if prose_kind(segment.kind)
+                    && self
+                        .is_duplicate(
+                            segment,
+                            source_roles.get(&segment.source_id).copied(),
+                            &vector,
+                            cosine_threshold,
+                            jaccard_threshold,
+                        )
+                        .await?
+                {
+                    duplicates += 1;
+                    self.client
+                        .delete_points(
+                            DeletePointsBuilder::new(&self.segments_collection)
+                                .points(vec![PointId::from(segment.id.to_string())])
+                                .wait(true),
+                        )
+                        .await
+                        .context("deleting duplicate source chunk")?;
+                    continue;
+                }
+                let vectors: HashMap<String, Vector> = HashMap::from([
+                    ("dense".into(), vector.into()),
+                    (
+                        "bm25".into(),
+                        DocumentBuilder::new(&segment.text, "qdrant/bm25")
+                            .build()
+                            .into(),
+                    ),
+                ]);
+                let point = PointStruct::new(
+                    segment.id.to_string(),
+                    vectors,
+                    segment_payload_with_role(
+                        segment,
+                        source_roles.get(&segment.source_id).copied(),
+                    )?,
+                );
+                self.client
+                    .upsert_points(
+                        UpsertPointsBuilder::new(&self.segments_collection, vec![point]).wait(true),
+                    )
+                    .await
+                    .context("upserting segment")?;
+                stored += 1;
+            }
+        }
+        Ok((stored, duplicates))
+    }
+
+    async fn is_duplicate(
+        &self,
+        segment: &Segment,
+        source_role: Option<Role>,
+        vector: &[f32],
+        cosine_threshold: f32,
+        jaccard_threshold: f32,
+    ) -> Result<bool> {
+        let filter = Filter {
+            must: vec![
+                Condition::matches("project", segment.project.clone()),
+                Condition::matches("kind", kind_name(&segment.kind)?),
+                Condition::matches("source_role", role_name(source_role).to_owned()),
+                Condition::matches("provenance", segment.tool.clone().unwrap_or_default()),
+            ],
+            must_not: vec![Condition::matches("source_id", segment.source_id.clone())],
+            ..Default::default()
+        };
+        let response = self
+            .client
+            .query(
+                QueryPointsBuilder::new(&self.segments_collection)
+                    .query(Query::new_nearest(vector.to_vec()))
+                    .using("dense")
+                    .filter(filter)
+                    .limit(3u64)
+                    .with_payload(true),
+            )
+            .await
+            .context("querying duplicate candidates")?;
+        for point in response.result {
+            if point.score >= cosine_threshold {
+                let candidate = segment_from_payload(point.id, point.payload)?;
+                if shingle_jaccard(&segment.text, &candidate.text) >= jaccard_threshold {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    pub async fn delete_stale_chunks(
+        &self,
+        harness: &str,
+        session: &str,
+        source_id: &str,
+        count: u32,
+    ) -> Result<()> {
+        let filter = stale_chunks_filter(harness, session, source_id, count);
+        self.client
+            .delete_points(
+                DeletePointsBuilder::new(&self.segments_collection)
+                    .points(filter)
+                    .wait(true),
+            )
+            .await
+            .with_context(|| format!("deleting stale chunks for source {source_id}"))?;
         Ok(())
     }
 
@@ -495,6 +646,55 @@ impl Store {
     }
 }
 
+fn prose_kind(kind: Kind) -> bool {
+    matches!(
+        kind,
+        Kind::UserRequest | Kind::AssistantNote | Kind::Decision | Kind::Constraint | Kind::Task
+    )
+}
+
+fn role_name(role: Option<Role>) -> &'static str {
+    match role {
+        Some(Role::User) => "user",
+        Some(Role::Assistant) => "assistant",
+        Some(Role::Tool) => "tool",
+        None => "unknown",
+    }
+}
+
+fn shingle_jaccard(left: &str, right: &str) -> f32 {
+    fn shingles(text: &str) -> HashSet<Vec<String>> {
+        let words = text
+            .split(|character: char| !character.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .map(str::to_lowercase)
+            .collect::<Vec<_>>();
+        words.windows(3).map(|window| window.to_vec()).collect()
+    }
+    let left = shingles(left);
+    let right = shingles(right);
+    let union = left.union(&right).count();
+    if union == 0 {
+        return 0.0;
+    }
+    left.intersection(&right).count() as f32 / union as f32
+}
+
+fn stale_chunks_filter(harness: &str, session: &str, source_id: &str, count: u32) -> Filter {
+    Filter::must([
+        Condition::matches("harness", harness.to_owned()),
+        Condition::matches("session", session.to_owned()),
+        Condition::matches("source_id", source_id.to_owned()),
+        Condition::range(
+            "chunk_index",
+            Range {
+                gte: Some(f64::from(count)),
+                ..Default::default()
+            },
+        ),
+    ])
+}
+
 fn kind_name(kind: &Kind) -> Result<String> {
     serde_json::to_value(kind)?
         .as_str()
@@ -534,6 +734,17 @@ fn segment_payload(segment: &Segment) -> Result<Payload> {
     };
     Payload::try_from(serde_json::to_value(payload).context("serializing segment")?)
         .context("encoding segment payload")
+}
+
+fn segment_payload_with_role(segment: &Segment, role: Option<Role>) -> Result<Payload> {
+    let mut payload: HashMap<String, qdrant_client::qdrant::Value> =
+        segment_payload(segment)?.into();
+    payload.insert("source_role".into(), role_name(role).into());
+    payload.insert(
+        "provenance".into(),
+        segment.tool.clone().unwrap_or_default().into(),
+    );
+    Ok(Payload::from(payload))
 }
 
 fn segment_from_payload(
@@ -638,5 +849,18 @@ mod tests {
             .to_filter()
             .is_err()
         );
+    }
+
+    #[test]
+    fn duplicate_shingles_are_normalized_and_need_three_words() {
+        assert_eq!(
+            shingle_jaccard("One, TWO three four", "one two THREE four"),
+            1.0
+        );
+        assert_eq!(shingle_jaccard("one two", "one two"), 0.0);
+        assert_eq!(shingle_jaccard("one two three", "different two three"), 0.0);
+        assert!(prose_kind(Kind::Decision));
+        assert!(!prose_kind(Kind::FileChange));
+        assert_eq!(stale_chunks_filter("h", "s", "id", 2).must.len(), 4);
     }
 }

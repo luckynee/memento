@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{Arc, Weak},
+};
 
 use axum::{
     Json, Router,
@@ -24,7 +27,7 @@ use memento_core::{
     segment::{SegmentPolicy, segment_items},
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::{
     config::Config,
@@ -43,12 +46,48 @@ pub struct AppState {
 struct RouterState {
     app: AppState,
     registry_lock: Arc<Mutex<()>>,
+    operation_lock: Arc<RwLock<()>>,
+    session_locks: Arc<std::sync::Mutex<HashMap<SessionKey, Weak<Mutex<()>>>>>,
+}
+
+fn validate_link(
+    child: &SessionKey,
+    parent: &SessionKey,
+    links: &BTreeMap<SessionKey, Option<SessionKey>>,
+) -> Result<(), ApiError> {
+    if lineage::would_create_cycle(child, parent, |session| {
+        links.get(session).cloned().flatten()
+    }) {
+        return Err(ApiError::cycle());
+    }
+    let mut updated_links = links.clone();
+    updated_links.insert(child.clone(), Some(parent.clone()));
+    let links = updated_links
+        .iter()
+        .map(|(key, parent)| SessionLink {
+            key: key.clone(),
+            parent: parent.clone(),
+        })
+        .collect::<Vec<_>>();
+    for descendant in lineage::descendants(child, &links) {
+        if let Err(error) = lineage::ancestors(&descendant, |session| {
+            updated_links.get(session).cloned().flatten()
+        }) {
+            return Err(match error {
+                lineage::LineageError::TooDeep { .. } => ApiError::too_deep(),
+                lineage::LineageError::Cycle { .. } => ApiError::cycle(),
+            });
+        }
+    }
+    Ok(())
 }
 
 pub fn router(state: AppState) -> Router {
     let state = RouterState {
         app: state,
         registry_lock: Arc::new(Mutex::new(())),
+        operation_lock: Arc::new(RwLock::new(())),
+        session_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
     };
     Router::new()
         .route("/health", get(health))
@@ -92,6 +131,22 @@ impl ApiError {
             status: StatusCode::CONFLICT,
             code: "cycle",
             message: "session link would create a cycle",
+        }
+    }
+
+    fn cross_project() -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: "cross_project",
+            message: "parent and child projects differ",
+        }
+    }
+
+    fn too_deep() -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: "too_deep",
+            message: "session lineage exceeds depth limit",
         }
     }
 
@@ -265,6 +320,12 @@ async fn merge_session(
         .get_session(&update.harness, &update.session)
         .await;
     let existing = store_result(state, existing).await?;
+    if existing
+        .as_ref()
+        .is_some_and(|record| record.project != update.project)
+    {
+        return Err(ApiError::cross_project());
+    }
     let links = state.app.store.session_links().await;
     let links = store_result(state, links)
         .await?
@@ -303,11 +364,18 @@ async fn merge_session(
                 .unwrap_or_else(|| record.harness.clone()),
             session: parent.clone(),
         };
-        if lineage::would_create_cycle(&child, &parent, |session| {
-            links.get(session).cloned().flatten()
-        }) {
-            return Err(ApiError::cycle());
+        let parent_record = state
+            .app
+            .store
+            .get_session(&parent.harness, &parent.session)
+            .await;
+        if store_result(state, parent_record)
+            .await?
+            .is_some_and(|parent| parent.project != record.project)
+        {
+            return Err(ApiError::cross_project());
         }
+        validate_link(&child, &parent, &links)?;
     }
     if let Some(retention) = update.retention {
         record.retention = retention;
@@ -337,12 +405,15 @@ async fn put_continuation(
         .store
         .get_session(&request.parent_harness, &request.parent_session)
         .await;
-    if store_result(&state, parent).await?.is_none() {
+    let Some(parent) = store_result(&state, parent).await? else {
         return Err(ApiError {
             status: StatusCode::NOT_FOUND,
             code: "not_found",
             message: "parent session not found",
         });
+    };
+    if parent.project != request.project {
+        return Err(ApiError::cross_project());
     }
     let record = ContinuationRecord {
         project: request.project,
@@ -350,6 +421,8 @@ async fn put_continuation(
         parent_session: request.parent_session,
         target_harness: request.target_harness,
         created: Utc::now(),
+        claimed_by: None,
+        claimed_at: None,
     };
     let result = state.app.store.upsert_continuation(record.clone()).await;
     store_result(&state, result).await?;
@@ -366,10 +439,12 @@ async fn claim_continuation(
     required(&request.session)?;
     let _guard = state.registry_lock.lock().await;
     let pending = state.app.store.get_continuation(&request.project).await;
-    let Some(pending) = store_result(&state, pending).await? else {
+    let Some(mut pending) = store_result(&state, pending).await? else {
         return Ok(Json(unclaimed()));
     };
-    if Utc::now().signed_duration_since(pending.created) >= chrono::Duration::hours(24) {
+    if Utc::now().signed_duration_since(pending.claimed_at.unwrap_or(pending.created))
+        >= chrono::Duration::hours(24)
+    {
         let result = state.app.store.delete_continuation(&request.project).await;
         store_result(&state, result).await?;
         return Ok(Json(unclaimed()));
@@ -380,6 +455,44 @@ async fn claim_continuation(
         .is_some_and(|target| target != request.harness)
     {
         return Ok(Json(unclaimed()));
+    }
+    let caller = SessionKey {
+        harness: request.harness.clone(),
+        session: request.session.clone(),
+    };
+    if pending
+        .claimed_by
+        .as_ref()
+        .is_some_and(|claimed| claimed != &caller)
+    {
+        return Ok(Json(unclaimed()));
+    }
+    let parent = state
+        .app
+        .store
+        .get_session(&pending.parent_harness, &pending.parent_session)
+        .await;
+    if store_result(&state, parent)
+        .await?
+        .is_some_and(|parent| parent.project != request.project)
+    {
+        return Err(ApiError::cross_project());
+    }
+    let links = state.app.store.session_links().await;
+    let links = store_result(&state, links).await?.into_iter().collect();
+    validate_link(
+        &caller,
+        &SessionKey {
+            harness: pending.parent_harness.clone(),
+            session: pending.parent_session.clone(),
+        },
+        &links,
+    )?;
+    if pending.claimed_by.is_none() {
+        pending.claimed_by = Some(caller);
+        pending.claimed_at = Some(Utc::now());
+        let result = state.app.store.upsert_continuation(pending.clone()).await;
+        store_result(&state, result).await?;
     }
     let record = merge_session(
         &state,
@@ -394,6 +507,7 @@ async fn claim_continuation(
         },
     )
     .await?;
+    drop(_guard);
     let digest = render_session_digest(
         &state,
         &record.harness,
@@ -402,8 +516,6 @@ async fn claim_continuation(
         None,
     )
     .await?;
-    let result = state.app.store.delete_continuation(&request.project).await;
-    store_result(&state, result).await?;
     Ok(Json(ClaimResponse {
         claimed: true,
         parent_harness: Some(pending.parent_harness),
@@ -497,13 +609,37 @@ async fn ingest(
     required(&request.harness)?;
     required(&request.project)?;
     required(&request.session)?;
+    let _operation = state.operation_lock.read().await;
+    let key = SessionKey {
+        harness: request.harness.clone(),
+        session: request.session.clone(),
+    };
+    let session_lock = {
+        let mut locks = state.session_locks.lock().map_err(ApiError::internal)?;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            lock
+        } else {
+            let lock = Arc::new(Mutex::new(()));
+            locks.insert(key, Arc::downgrade(&lock));
+            lock
+        }
+    };
+    let _session = session_lock.lock().await;
     let _guard = state.registry_lock.lock().await;
     let existing = state
         .app
         .store
         .get_session(&request.harness, &request.session)
         .await;
-    if store_result(&state, existing).await?.is_none() {
+    let existing = store_result(&state, existing).await?;
+    if existing
+        .as_ref()
+        .is_some_and(|record| record.project != request.project)
+    {
+        return Err(ApiError::cross_project());
+    }
+    if existing.is_none() {
         let result = state
             .app
             .store
@@ -520,12 +656,40 @@ async fn ingest(
             .await;
         store_result(&state, result).await?;
     }
+    drop(_guard);
     let outcome = segment_items(&request, &state.app.policy);
-    let result = state.app.store.upsert_segments(&outcome.segments).await;
-    store_result(&state, result).await?;
+    let source_roles = request
+        .items
+        .iter()
+        .map(|item| (item.source_id.clone(), item.role))
+        .collect();
+    let result = state
+        .app
+        .store
+        .ingest_segments(
+            &outcome.segments,
+            &source_roles,
+            state.app.config.duplicate_cosine_threshold,
+            state.app.config.duplicate_jaccard_threshold,
+        )
+        .await;
+    let (segments, duplicates) = store_result(&state, result).await?;
+    let mut source_counts = BTreeMap::new();
+    for segment in &outcome.segments {
+        source_counts.insert(&segment.source_id, segment.chunk_index + 1);
+    }
+    for (source_id, count) in source_counts {
+        let result = state
+            .app
+            .store
+            .delete_stale_chunks(&request.harness, &request.session, source_id, count)
+            .await;
+        store_result(&state, result).await?;
+    }
     Ok(Json(IngestResponse {
-        segments: outcome.segments.len(),
+        segments,
         skipped: outcome.skipped,
+        duplicates,
     }))
 }
 
@@ -617,6 +781,7 @@ async fn render_session_digest(
         .store
         .scroll_segments(&ScopeFilter {
             sessions: Some(lineage.clone()),
+            project: Some(project.to_owned()),
             ..Default::default()
         })
         .await;
@@ -641,6 +806,7 @@ async fn forget(
     if let Some(project) = &request.project {
         required(project)?;
     }
+    let _operation = state.operation_lock.write().await;
     let _guard = state.registry_lock.lock().await;
     let sessions = match request.scope {
         ForgetScope::Project => {
@@ -751,5 +917,31 @@ mod tests {
         assert!(!error.message.contains("sensitive"));
         assert_eq!(ApiError::cycle().status, StatusCode::CONFLICT);
         assert_eq!(ApiError::invalid("bad").status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn link_depth_accounts_for_existing_descendants() {
+        let key = |number: usize| SessionKey {
+            harness: "h".into(),
+            session: number.to_string(),
+        };
+        let mut links = BTreeMap::new();
+        for number in 1..64 {
+            links.insert(key(number), Some(key(number - 1)));
+        }
+        assert_eq!(
+            validate_link(&key(64), &key(63), &links)
+                .err()
+                .unwrap()
+                .code,
+            "too_deep"
+        );
+        links.remove(&key(63));
+        assert!(validate_link(&key(63), &key(62), &links).is_ok());
+        links.insert(key(63), Some(key(62)));
+        assert_eq!(
+            validate_link(&key(0), &key(64), &links).err().unwrap().code,
+            "too_deep"
+        );
     }
 }

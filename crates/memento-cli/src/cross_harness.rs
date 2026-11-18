@@ -978,6 +978,7 @@ fn import(
         IngestResponse {
             segments: 0,
             skipped: 0,
+            duplicates: 0,
         }
     } else {
         parse_response(&http(

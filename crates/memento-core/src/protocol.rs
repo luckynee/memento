@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::lineage::SessionKey;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IngestRequest {
     pub harness: String,
@@ -57,6 +59,8 @@ pub struct ToolCall {
 pub struct IngestResponse {
     pub segments: usize,
     pub skipped: usize,
+    #[serde(default)]
+    pub duplicates: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +91,10 @@ pub struct ContinuationRecord {
     pub parent_session: String,
     pub target_harness: Option<String>,
     pub created: DateTime<Utc>,
+    #[serde(default)]
+    pub claimed_by: Option<SessionKey>,
+    #[serde(default)]
+    pub claimed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,6 +279,16 @@ mod tests {
         }))
         .unwrap();
         assert!(hit.harness.is_empty());
+        let ingest: IngestResponse =
+            serde_json::from_value(json!({"segments": 1, "skipped": 0})).unwrap();
+        assert_eq!(ingest.duplicates, 0);
+        let continuation: ContinuationRecord = serde_json::from_value(json!({
+            "project": "p", "parent_harness": "h", "parent_session": "s",
+            "target_harness": null, "created": "2026-11-18T10:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(continuation.claimed_by, None);
+        assert_eq!(continuation.claimed_at, None);
     }
 
     #[test]

@@ -73,6 +73,8 @@ async fn route_workflow() {
             token: Some("test-token".into()),
             collection_prefix: prefix,
             cache_dir: None,
+            duplicate_cosine_threshold: 0.95,
+            duplicate_jaccard_threshold: 0.8,
         },
         policy: Default::default(),
         rerank: Default::default(),
@@ -209,6 +211,220 @@ async fn run_workflow(address: &str, store: &Store) {
     let stats = call("GET", "/v1/stats?harness=h", json!(null)).await.1;
     assert_eq!(stats["total"], 2);
     cross_harness_workflow(address, store).await;
+    regression_workflow(address, store).await;
+}
+
+async fn regression_workflow(address: &str, store: &Store) {
+    use chrono::Utc;
+    use memento_core::{lineage::SessionKey, protocol::ContinuationRecord};
+
+    let call = |method: &'static str, path: &'static str, body: Value| async move {
+        request(address, method, path, Some("test-token"), &body.to_string()).await
+    };
+    assert_eq!(
+        call(
+            "PUT",
+            "/v1/sessions",
+            json!({"harness":"reg","project":"one","session":"parent"})
+        )
+        .await
+        .0,
+        200
+    );
+    let invalid_link = call(
+        "PUT",
+        "/v1/sessions",
+        json!({"harness":"reg","project":"two","session":"child","parent":"parent"}),
+    )
+    .await;
+    assert_eq!(
+        (invalid_link.0, &invalid_link.1["error"]["code"]),
+        (409, &json!("cross_project"))
+    );
+    let changed_project = call(
+        "PUT",
+        "/v1/sessions",
+        json!({"harness":"reg","project":"two","session":"parent"}),
+    )
+    .await;
+    assert_eq!(changed_project.1["error"]["code"], "cross_project");
+    let invalid_pending = call(
+        "PUT",
+        "/v1/continuations",
+        json!({"project":"two","parent_harness":"reg","parent_session":"parent"}),
+    )
+    .await;
+    assert_eq!(
+        (invalid_pending.0, &invalid_pending.1["error"]["code"]),
+        (409, &json!("cross_project"))
+    );
+    store
+        .upsert_continuation(ContinuationRecord {
+            project: "two".into(),
+            parent_harness: "reg".into(),
+            parent_session: "parent".into(),
+            target_harness: None,
+            created: Utc::now(),
+            claimed_by: None,
+            claimed_at: None,
+        })
+        .await
+        .unwrap();
+    let invalid_claim = call(
+        "POST",
+        "/v1/continuations/claim",
+        json!({"project":"two","harness":"reg","session":"child"}),
+    )
+    .await;
+    assert_eq!(
+        (invalid_claim.0, &invalid_claim.1["error"]["code"]),
+        (409, &json!("cross_project"))
+    );
+    assert_eq!(
+        call(
+            "PUT",
+            "/v1/continuations",
+            json!({"project":"one","parent_harness":"reg","parent_session":"parent"})
+        )
+        .await
+        .0,
+        200
+    );
+    let claim = json!({"project":"one","harness":"reg","session":"continuation"});
+    let first = call("POST", "/v1/continuations/claim", claim.clone()).await;
+    assert_eq!(first.1["claimed"], true);
+    let retained = store.get_continuation("one").await.unwrap().unwrap();
+    assert_eq!(
+        retained.claimed_by,
+        Some(SessionKey {
+            harness: "reg".into(),
+            session: "continuation".into()
+        })
+    );
+    assert!(retained.claimed_at.is_some());
+    assert_eq!(
+        call(
+            "POST",
+            "/v1/continuations/claim",
+            json!({"project":"one","harness":"reg","session":"another"})
+        )
+        .await
+        .1,
+        json!({"claimed":false})
+    );
+    let content = |project: &str, session: &str, source: &str, text: &str| {
+        json!({
+            "harness":"reg", "project":project, "session":session,
+            "items":[{"source_id":source,"ts":"2026-11-18T10:00:00Z","role":"user","text":text}]
+        })
+    };
+    assert_eq!(
+        call(
+            "POST",
+            "/v1/ingest",
+            content("one", "parent", "fresh", "A newly added digest message")
+        )
+        .await
+        .1["segments"],
+        1
+    );
+    let repeated = call("POST", "/v1/continuations/claim", claim).await;
+    assert_eq!(repeated.1["claimed"], true);
+    assert!(
+        repeated.1["digest"]
+            .as_str()
+            .unwrap()
+            .contains("A newly added digest message")
+    );
+
+    let long = (0..500).map(|i| format!("word{i} ")).collect::<String>();
+    assert!(
+        call(
+            "POST",
+            "/v1/ingest",
+            content("chunks", "s", "source", &long)
+        )
+        .await
+        .1["segments"]
+            .as_u64()
+            .unwrap()
+            > 1
+    );
+    assert_eq!(
+        call(
+            "POST",
+            "/v1/ingest",
+            content("chunks", "s", "source", "short replacement words here")
+        )
+        .await
+        .1["segments"],
+        1
+    );
+    let chunks = store
+        .scroll_segments(&mementod::store::ScopeFilter {
+            project: Some("chunks".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].text, "short replacement words here");
+    let phrase = "The quick brown fox jumps over the lazy dog today";
+    assert_eq!(
+        call(
+            "POST",
+            "/v1/ingest",
+            content("dedupe", "dedupe-session", "first", phrase)
+        )
+        .await
+        .1["segments"],
+        1
+    );
+    let assistant = json!({"harness":"reg","project":"dedupe","session":"dedupe-session","items":[
+        {"source_id":"assistant","ts":"2026-11-18T10:00:00Z","role":"assistant","kind_hint":"decision","text":phrase}
+    ]});
+    let user_decision = json!({"harness":"reg","project":"dedupe","session":"dedupe-session","items":[
+        {"source_id":"user-decision","ts":"2026-11-18T10:00:00Z","role":"user","kind_hint":"decision","text":phrase}
+    ]});
+    assert_eq!(call("POST", "/v1/ingest", assistant).await.1["segments"], 1);
+    assert_eq!(
+        call("POST", "/v1/ingest", user_decision).await.1["segments"],
+        1
+    );
+    let duplicate = call(
+        "POST",
+        "/v1/ingest",
+        content("dedupe", "dedupe-session", "second", phrase),
+    )
+    .await
+    .1;
+    assert_eq!(duplicate["segments"], 0);
+    assert_eq!(duplicate["duplicates"], 1);
+    assert_eq!(
+        call(
+            "POST",
+            "/v1/ingest",
+            content("dedupe", "dedupe-session", "first", phrase)
+        )
+        .await
+        .1["segments"],
+        1
+    );
+    assert_eq!(
+        call(
+            "POST",
+            "/v1/ingest",
+            content("another-project", "s2", "third", phrase)
+        )
+        .await
+        .1["segments"],
+        1
+    );
+    let tool = json!({"harness":"reg","project":"dedupe","session":"dedupe-session","items":[
+        {"source_id":"tool1","ts":"2026-11-18T10:00:00Z","role":"tool","tool":{"name":"read","input":{"path":"same"},"ok":true}},
+        {"source_id":"tool2","ts":"2026-11-18T10:00:00Z","role":"tool","tool":{"name":"read","input":{"path":"same"},"ok":true}}
+    ]});
+    assert_eq!(call("POST", "/v1/ingest", tool).await.1["segments"], 2);
 }
 
 async fn cross_harness_workflow(address: &str, store: &Store) {
@@ -414,8 +630,8 @@ async fn cross_harness_workflow(address: &str, store: &Store) {
             json!({"project":"cross","harness":"codex","session":"new"})
         )
         .await
-        .1,
-        json!({"claimed":false})
+        .1["claimed"],
+        true
     );
     assert_eq!(call("PUT", "/v1/continuations", json!({"project":"cross","parent_harness":"opencode","parent_session":"same","target_harness":"claude-code"})).await.0, 200);
     assert_eq!(
@@ -445,6 +661,8 @@ async fn cross_harness_workflow(address: &str, store: &Store) {
             parent_session: "same".into(),
             target_harness: None,
             created: Utc::now() - Duration::hours(25),
+            claimed_by: None,
+            claimed_at: None,
         })
         .await
         .unwrap();

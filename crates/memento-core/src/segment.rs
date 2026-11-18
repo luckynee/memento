@@ -231,7 +231,10 @@ struct RenderedItem {
 fn render_item(item: &IngestItem, policy: &SegmentPolicy) -> Option<RenderedItem> {
     match item.role {
         Role::User => Some(RenderedItem {
-            kind: Kind::UserRequest,
+            kind: match item.kind_hint {
+                Some(kind @ (Kind::Decision | Kind::Constraint | Kind::Task)) => kind,
+                _ => Kind::UserRequest,
+            },
             text: strip_scaffolding(&item.text, policy),
             tool: None,
             path: None,
@@ -486,6 +489,20 @@ mod tests {
         );
         assert_eq!(outcome.segments[0].text, "request");
         assert_eq!(outcome.skipped, 0);
+        for (hint, expected) in [
+            (Some(Kind::Decision), Kind::Decision),
+            (Some(Kind::Constraint), Kind::Constraint),
+            (Some(Kind::Task), Kind::Task),
+            (Some(Kind::Command), Kind::UserRequest),
+            (None, Kind::UserRequest),
+        ] {
+            let mut user = item(Role::User, "user text");
+            user.kind_hint = hint;
+            assert_eq!(
+                run(vec![user], &SegmentPolicy::default()).segments[0].kind,
+                expected
+            );
+        }
     }
 
     #[test]
