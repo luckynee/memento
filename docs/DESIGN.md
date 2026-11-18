@@ -229,7 +229,7 @@ Harness ids: `opencode`, `claude-code`, `codex`, `agy`.
 
 ### Pending continuations
 
-`PUT /v1/continuations { project, parent_harness, parent_session, target_harness? }` stores one pending continuation per project (latest wins, expires after 24 h). `POST /v1/continuations/claim { project, harness, session }` atomically consumes it when `target_harness` is absent or equal, links the session (`parent_harness`, `parent`), and returns `{ claimed: bool, parent_harness?, parent?, digest? }` with the lineage digest. CLI: `memento continue --from <harness>/<session> [--project DIR] [--to HARNESS]`. Every adapter claims on its first event for a new session.
+`PUT /v1/continuations { project, parent_harness, parent_session, target_harness? }` stores one pending continuation per project (latest wins, expires after 24 h). `POST /v1/continuations/claim { project, harness, session }` claims it when `target_harness` is absent or equal: it records `claimed_by` and `claimed_at`, links the session (`parent_harness`, `parent`), and returns `{ claimed: bool, parent_harness?, parent?, digest? }` with the lineage digest. Claims are idempotent per caller for 24 h (a repeated claim by the same session returns the digest again, so a lost response is recoverable); another session gets `claimed: false`. Links, continuations and claims are rejected with 409 `cross_project` when parent and child projects differ, and with 409 `too_deep` when the lineage would exceed 64. CLI: `memento continue --from <harness>/<session> [--project DIR] [--to HARNESS]`. Every adapter claims on its first event for a new session.
 
 ### Transcript importers (CLI)
 
@@ -239,15 +239,28 @@ Harness ids: `opencode`, `claude-code`, `codex`, `agy`.
 
 `memento hook claude-code|codex` reads the hook JSON from stdin:
 - `SessionStart`: claim a pending continuation for `project-key(cwd)`; if claimed, print the `additionalContext` JSON with the framed digest (`<memento-continuation>` wrapper, reference data, not instructions).
-- `Stop`, `SessionEnd`: incremental import of `transcript_path`.
+- `Stop`: incremental import of `transcript_path`, installed with `"async": true` for both Claude Code and Codex.
+- `SessionEnd`: fast no-op and not installed (Claude Code gives all `SessionEnd` hooks a shared 1.5 s budget, Codex 1-3 s; verified 2026-11-19).
+- `SessionStart`: overall deadline 8 s, then prints nothing.
+- Optional Jev classification of imported text: when `opencode` is on PATH and `MEMENTO_JEV` is not `0`, the CLI calls `opencode api post /api/experimental/generate/decisions` with `opencode/jev-1.13-free` (user text: `decision|constraint|request`; assistant text: `decision|constraint|task|note`; confidence >= 0.6), at most 12 items per import, 5 s each, with a 10 minute cooldown file after a failure. Never on `SessionStart`.
 - Any failure exits 0 with a message on stderr; hooks never block the harness.
 - Output contract: `SessionStart` prints the `hookSpecificOutput` JSON or nothing; `Stop` prints `{}` (Codex rejects plain text on `Stop`); `SessionEnd` prints nothing.
 - Codex specifics (developers.openai.com/codex/hooks, verified 2026-11-18): `~/.codex/hooks.json` (or `[hooks]` in `config.toml`), matcher groups `{ "matcher"?, "hooks": [{ "type": "command", "command", "timeout"?, "async"?, "additionalContextLimit"? }] }`; `SessionEnd` timeout is 1 s by default and at most 3 s, so imports run from `Stop` with `"async": true`; `SessionStart` sources `startup|resume|clear|compact|fork` (on `compact` the digest is re-injected); non-managed hooks need trust via `/hooks`, or `--dangerously-bypass-hook-trust` for scripted runs; default `additionalContext` spill threshold about 2500 tokens (`additionalContextLimit` raises it).
-- `memento install-hooks claude-code|codex [--project DIR | --user] [--dry-run]` prints or merges the hook entries, preserving existing configuration.
+- `memento install-hooks claude-code|codex [--project DIR | --user] [--dry-run]` prints or merges the hook entries under an exclusive lock, preserving existing configuration and file permissions, removing memento `SessionEnd` entries from older installs, and writing a `.bak` copy with the original mode.
 
 ### MCP server
 
 `memento-mcp --harness NAME` (crate `memento-mcp`, `rmcp` 3.x) serves stdio MCP tools for harnesses without hooks (agy) and as an option for all: `memory_search { query, scope?, project?, session? }`, `memory_digest { project?, harness?, session? }`, `memory_continue { from_harness, from_session }` (claims nothing, returns the parent digest), and `memory_note { kind: decision|constraint|task|note, text, session? }` which stores an explicit note for harnesses whose transcripts cannot be imported (default session `<harness>-notes`, project from the server's cwd).
+
+### Hardening (2026-11-19)
+
+- Ingest: `IngestResponse.duplicates` counts prose segments skipped as near-duplicates of an existing segment in the same project (dense cosine >= 0.95 and 3-gram word-shingle Jaccard >= 0.8; `MEMENTO_DUPLICATE_COSINE_THRESHOLD`, `MEMENTO_DUPLICATE_JACCARD_THRESHOLD`). This curbs memory echo when a model restates the digest.
+- Re-ingesting a source with fewer chunks deletes its higher-index chunks.
+- User items honor `kind_hint` `decision` and `constraint` only; user text never becomes `task`.
+- Per-session locks for ingest; a short registry lock for registry writes and claims; embedding and upserts run outside global locks.
+- OpenCode adapter: no snapshot after a failed pre-switch flush; bounded in-memory caches; claim completion persisted only after the continuation instruction is written; mid-history `system` messages are hoisted into system parts when rewriting (Anthropic-protocol providers reject them).
+- OpenCode code-mode `execute` stays ignored: verified on 33 local calls that it only wraps catalog and MCP tools, never shell or edits.
+- Deployment: the daemon listens on `0.0.0.0` inside the container but the host port is `127.0.0.1` only; the Compose network contains only `qdrant` and `mementod`. Set `MEMENTO_TOKEN` if you attach other containers to that network.
 
 ## Non-goals for v1
 
