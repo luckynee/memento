@@ -1,0 +1,7 @@
+target/
+.git/
+**/node_modules/
+adapters/
+data/
+.fastembed_cache/
+*.log
