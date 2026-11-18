@@ -14,8 +14,11 @@ pub struct SegmentPolicy {
     pub shell_tools: HashSet<String>,
     pub read_tools: HashSet<String>,
     pub todo_tools: HashSet<String>,
+    pub subagent_tools: HashSet<String>,
     pub edit_input_max_chars: usize,
     pub failed_output_max_chars: usize,
+    pub successful_output_max_chars: usize,
+    pub subagent_output_max_chars: usize,
     pub chunk_max_chars: usize,
     pub chunk_overlap_chars: usize,
 }
@@ -27,10 +30,13 @@ impl Default for SegmentPolicy {
             shell_tools: tool_set(&["bash", "shell"]),
             read_tools: tool_set(&["read", "grep", "glob", "list", "webfetch", "websearch"]),
             todo_tools: tool_set(&["todowrite"]),
+            subagent_tools: tool_set(&["task", "subagent"]),
             edit_input_max_chars: 2000,
             failed_output_max_chars: 1000,
-            chunk_max_chars: 1500,
-            chunk_overlap_chars: 200,
+            successful_output_max_chars: 400,
+            subagent_output_max_chars: 2000,
+            chunk_max_chars: 1000,
+            chunk_overlap_chars: 150,
         }
     }
 }
@@ -135,12 +141,13 @@ fn render_item(item: &IngestItem, policy: &SegmentPolicy) -> Option<RenderedItem
 
 fn render_tool(tool: &ToolCall, policy: &SegmentPolicy) -> Option<RenderedItem> {
     let name = tool.name.to_lowercase();
-    let path = tool_path(&name, &tool.input);
+    let paths = tool_paths(&name, &tool.input);
+    let path = paths.first().cloned();
     let (kind, text) = if policy.edit_tools.contains(&name) {
         let input = truncate_prefix(&tool.input.to_string(), policy.edit_input_max_chars);
         (
             Kind::FileChange,
-            format!("{} {}\n{}", tool.name, path.as_deref().unwrap_or(""), input),
+            format!("{} {}\n{}", tool.name, paths.join(", "), input),
         )
     } else if policy.shell_tools.contains(&name) {
         let command = tool
@@ -148,14 +155,16 @@ fn render_tool(tool: &ToolCall, policy: &SegmentPolicy) -> Option<RenderedItem> 
             .get("command")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let output = if tool.ok {
-            String::new()
+        let output_limit = if tool.ok {
+            policy.successful_output_max_chars
         } else {
-            tool.output
-                .as_deref()
-                .map(|output| truncate_suffix(output, policy.failed_output_max_chars))
-                .unwrap_or_default()
+            policy.failed_output_max_chars
         };
+        let output = tool
+            .output
+            .as_deref()
+            .map(|output| truncate_suffix(output, output_limit))
+            .unwrap_or_default();
         let text = if output.is_empty() {
             command.to_owned()
         } else if command.is_empty() {
@@ -187,6 +196,19 @@ fn render_tool(tool: &ToolCall, policy: &SegmentPolicy) -> Option<RenderedItem> 
             })
             .unwrap_or_default();
         (Kind::Task, text)
+    } else if policy.subagent_tools.contains(&name) {
+        let output = tool
+            .output
+            .as_deref()
+            .filter(|output| !output.trim().is_empty())?;
+        (
+            Kind::AssistantNote,
+            format!(
+                "{}\n{}",
+                tool.name,
+                truncate_prefix(output, policy.subagent_output_max_chars)
+            ),
+        )
     } else {
         return None;
     };
@@ -198,15 +220,42 @@ fn render_tool(tool: &ToolCall, policy: &SegmentPolicy) -> Option<RenderedItem> 
     })
 }
 
-fn tool_path(name: &str, input: &Value) -> Option<String> {
+fn tool_paths(name: &str, input: &Value) -> Vec<String> {
     let keys: &[&str] = match name {
         "webfetch" => &["url"],
         "websearch" => &["query"],
         _ => &["filePath", "path", "file", "pattern"],
     };
-    keys.iter()
+    let mut paths: Vec<String> = keys
+        .iter()
         .find_map(|key| input.get(key).and_then(Value::as_str))
         .map(str::to_owned)
+        .into_iter()
+        .collect();
+    if name == "webfetch" || name == "websearch" {
+        return paths;
+    }
+    for key in ["patch", "patchText", "diff", "input"] {
+        if let Some(patch) = input.get(key).and_then(Value::as_str) {
+            for line in patch.lines() {
+                let path = [
+                    "*** Add File: ",
+                    "*** Update File: ",
+                    "*** Delete File: ",
+                    "*** Move to: ",
+                    "+++ b/",
+                ]
+                .iter()
+                .find_map(|prefix| line.strip_prefix(prefix));
+                if let Some(path) = path.filter(|path| !path.is_empty())
+                    && !paths.iter().any(|existing| existing == path)
+                {
+                    paths.push(path.to_owned());
+                }
+            }
+        }
+    }
+    paths
 }
 
 fn truncate_prefix(text: &str, max_chars: usize) -> String {
@@ -326,9 +375,10 @@ mod tests {
     }
 
     #[test]
-    fn shell_tools_only_include_failed_output_tail() {
+    fn shell_tools_include_output_tail_for_both_statuses() {
         let policy = SegmentPolicy {
             failed_output_max_chars: 3,
+            successful_output_max_chars: 4,
             ..SegmentPolicy::default()
         };
         for name in ["bash", "SHELL"] {
@@ -342,7 +392,7 @@ mod tests {
                 &policy,
             );
             assert_eq!(success.segments[0].kind, Kind::Command);
-            assert_eq!(success.segments[0].text, "run");
+            assert_eq!(success.segments[0].text, "run\ntput...[truncated 9 chars]");
             let failure = run(
                 vec![tool_item(
                     name,
@@ -353,7 +403,164 @@ mod tests {
                 &policy,
             );
             assert_eq!(failure.segments[0].text, "run\nabc...[truncated 3 chars]");
+            for output in [None, Some("")] {
+                let outcome = run(
+                    vec![tool_item(name, json!({"command": "run"}), output, true)],
+                    &policy,
+                );
+                assert_eq!(outcome.segments[0].text, "run");
+            }
         }
+    }
+
+    #[test]
+    fn default_limits_and_subagent_reports() {
+        let policy = SegmentPolicy::default();
+        assert_eq!(
+            (policy.chunk_max_chars, policy.chunk_overlap_chars),
+            (1000, 150)
+        );
+        assert_eq!(
+            (
+                policy.successful_output_max_chars,
+                policy.failed_output_max_chars
+            ),
+            (400, 1000)
+        );
+        assert_eq!(
+            (
+                policy.edit_input_max_chars,
+                policy.subagent_output_max_chars
+            ),
+            (2000, 2000)
+        );
+        for name in ["task", "SUBAGENT"] {
+            let output = "é".repeat(2001);
+            let outcome = run(
+                vec![tool_item(name, json!({}), Some(&output), true)],
+                &policy,
+            );
+            assert!(outcome.segments.len() > 1);
+            assert!(
+                outcome
+                    .segments
+                    .iter()
+                    .all(|segment| segment.kind == Kind::AssistantNote)
+            );
+            assert!(outcome.segments[0].text.starts_with(&format!("{name}\n")));
+            assert!(
+                outcome
+                    .segments
+                    .last()
+                    .unwrap()
+                    .text
+                    .ends_with("...[truncated 1 chars]")
+            );
+            for empty in [None, Some(""), Some(" \n")] {
+                let outcome = run(vec![tool_item(name, json!({}), empty, true)], &policy);
+                assert_eq!(outcome.skipped, 1);
+                assert!(outcome.segments.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn patch_paths_are_ordered_deduplicated_and_recorded() {
+        let patch = "*** Begin Patch\n*** Update File: src/a.rs\n*** Add File: src/b.rs\n*** Move to: src/c.rs\n*** Delete File: src/a.rs\n+++ b/src/d.rs\n*** End Patch";
+        for key in ["patch", "patchText", "diff", "input"] {
+            let outcome = run(
+                vec![tool_item("apply_patch", json!({key: patch}), None, true)],
+                &SegmentPolicy::default(),
+            );
+            let segment = &outcome.segments[0];
+            assert_eq!(segment.path.as_deref(), Some("src/a.rs"));
+            assert!(
+                segment
+                    .text
+                    .starts_with("apply_patch src/a.rs, src/b.rs, src/c.rs, src/d.rs\n")
+            );
+        }
+        let outcome = run(
+            vec![tool_item(
+                "patch",
+                json!({"path": "explicit", "diff": "+++ b/unified.rs\n+change"}),
+                None,
+                true,
+            )],
+            &SegmentPolicy::default(),
+        );
+        assert_eq!(outcome.segments[0].path.as_deref(), Some("explicit"));
+        assert!(
+            outcome.segments[0]
+                .text
+                .starts_with("patch explicit, unified.rs\n")
+        );
+    }
+
+    #[test]
+    fn file_changes_and_commands_are_truncated_before_chunking() {
+        let policy = SegmentPolicy::default();
+        let edit = run(
+            vec![tool_item(
+                "edit",
+                json!({"path": "file", "diff": "x".repeat(2100)}),
+                None,
+                true,
+            )],
+            &policy,
+        );
+        assert!(edit.segments.len() > 1);
+        assert!(edit.segments.iter().all(
+            |segment| segment.kind == Kind::FileChange && segment.text.chars().count() <= 1000
+        ));
+        assert!(
+            edit.segments
+                .last()
+                .unwrap()
+                .text
+                .contains("...[truncated ")
+        );
+        let output = "é".repeat(1200);
+        let command = run(
+            vec![tool_item(
+                "bash",
+                json!({"command": "x".repeat(1100)}),
+                Some(&output),
+                false,
+            )],
+            &policy,
+        );
+        assert!(command.segments.len() > 1);
+        assert!(
+            command.segments.iter().all(
+                |segment| segment.kind == Kind::Command && segment.text.chars().count() <= 1000
+            )
+        );
+        assert!(
+            command
+                .segments
+                .last()
+                .unwrap()
+                .text
+                .contains("...[truncated 200 chars]")
+        );
+    }
+
+    #[test]
+    fn configurable_tool_sets_and_unknown_tools() {
+        let mut policy = SegmentPolicy::default();
+        policy.subagent_tools.insert("custom".into());
+        let outcome = run(
+            vec![
+                tool_item("CUSTOM", json!({}), Some("report"), true),
+                tool_item("mcp", json!({}), Some("ignored"), true),
+                tool_item("lsp", json!({}), Some("ignored"), true),
+            ],
+            &policy,
+        );
+        assert_eq!(outcome.segments.len(), 1);
+        assert_eq!(outcome.segments[0].text, "CUSTOM\nreport");
+        assert_eq!(outcome.skipped, 2);
     }
 
     #[test]
