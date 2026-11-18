@@ -110,10 +110,22 @@ export function rewriteForSwitch<M extends ConversationMessage, S extends System
     snapshot: SwitchSnapshot,
     opts: { tailUserTurns: number; tailCharBudget: number; cloneMessage(original: M, content: ReadonlyArray<unknown>): M },
 ): { system: S[]; messages: M[] } {
-    const system = [...input.system, { type: "text", text: buildDigestText(snapshot.digest) } as S];
+    const system = [...input.system];
+    for (const message of input.messages) {
+        if (message.role !== "system") {
+            continue;
+        }
+        for (const value of message.content) {
+            const part = record(value);
+            if (part?.type === "text" && typeof part.text === "string") {
+                system.push({ type: "text", text: part.text } as S);
+            }
+        }
+    }
+    system.push({ type: "text", text: buildDigestText(snapshot.digest) } as S);
     const cutIndex = snapshot.cutMessageID === null ? -1 : input.messages.findIndex((message) => message.id === snapshot.cutMessageID);
     if (cutIndex < 0) {
-        return { system, messages: [...input.messages] };
+        return { system, messages: input.messages.filter((message) => message.role !== "system") };
     }
     const boundaries: number[] = [];
     for (let index = 0; index < cutIndex; index++) {
@@ -141,6 +153,6 @@ export function rewriteForSwitch<M extends ConversationMessage, S extends System
     });
     return {
         system,
-        messages: [...input.messages.slice(0, start).filter((message) => message.role === "system"), ...tail],
+        messages: tail.filter((message) => message.role !== "system"),
     };
 }

@@ -35,10 +35,10 @@ describe("snapshot rewriting", () => {
         const input = { system: system(), messages };
         const snapshot = { cutMessageID: "u4", digest: "digest" };
         const result = rewriteForSwitch(input, snapshot, options);
-        expect(result.system).toEqual([...input.system, { type: "text", text: buildDigestText("digest") }]);
-        expect(result.messages).toEqual(messages);
-        expect(result.messages[4]).toBe(messages[4]);
-        expect(result.messages[5]).toBe(messages[5]);
+        expect(result.system).toEqual([...input.system, { type: "text", text: "system" }, { type: "text", text: buildDigestText("digest") }]);
+        expect(result.messages).toEqual(messages.slice(1));
+        expect(result.messages[3]).toBe(messages[4]);
+        expect(result.messages[4]).toBe(messages[5]);
         expect(JSON.stringify(result)).toBe(JSON.stringify(rewriteForSwitch(input, snapshot, options)));
         expect(sameModel(a, { ...a, variant: "ignored" } as ModelRef)).toBe(true);
     });
@@ -46,7 +46,38 @@ describe("snapshot rewriting", () => {
     test("moves the start forward until the tail fits", () => {
         const messages = history();
         const result = rewriteForSwitch({ system: system(), messages }, { cutMessageID: "u4", digest: "d" }, { ...options, tailCharBudget: 12 });
-        expect(result.messages.map((entry) => entry.id)).toEqual(["sys", "u3", "a3", "u4", "a4"]);
+        expect(result.messages.map((entry) => entry.id)).toEqual(["u3", "a3", "u4", "a4"]);
+    });
+
+    test("hoists all system text in order across the cut without changing tail selection", () => {
+        const messages: ConversationMessage[] = [
+            { id: "sys1", role: "system", content: [{ type: "text", text: " first \n" }, { type: "image", data: "ignored" }, { type: "text", text: "second" }] },
+            message("old", "user", "old"),
+            message("sys2", "system", "before tail"),
+            message("tail", "user", "tail"),
+            message("sys3", "system", "before cut"),
+            message("cut", "user", "cut"),
+            { id: "sys4", role: "system", content: [{ type: "reasoning", text: "ignored" }, { type: "text", text: "after cut" }, { type: "text", text: "" }] },
+            message("answer", "assistant", "answer"),
+        ];
+        const input = { system: [{ type: "text" as const, text: "base" }, { type: "text" as const, text: "base two" }], messages };
+        const snapshot = { cutMessageID: "cut", digest: "digest" };
+        const before = JSON.stringify(input);
+        const result = rewriteForSwitch(input, snapshot, { ...options, tailUserTurns: 1 });
+        expect(result.system).toEqual([
+            ...input.system,
+            { type: "text", text: " first \n" },
+            { type: "text", text: "second" },
+            { type: "text", text: "before tail" },
+            { type: "text", text: "before cut" },
+            { type: "text", text: "after cut" },
+            { type: "text", text: "" },
+            { type: "text", text: buildDigestText("digest") },
+        ]);
+        expect(result.messages.map((entry) => entry.id)).toEqual(["tail", "cut", "answer"]);
+        expect(result.messages.every((entry) => entry.role !== "system")).toBe(true);
+        expect(JSON.stringify(result)).toBe(JSON.stringify(rewriteForSwitch(input, snapshot, { ...options, tailUserTurns: 1 })));
+        expect(JSON.stringify(input)).toBe(before);
     });
 
     test("truncates oversized tool results only before the cut without mutating input", () => {
@@ -85,12 +116,21 @@ describe("snapshot rewriting", () => {
         expect(content[1]).toBe(json);
     });
 
-    test("compacted or missing cut retains messages and appends digest", () => {
-        const messages = history();
+    test("compacted or missing cut hoists system text and retains other messages", () => {
+        const messages = [...history(), message("sys2", "system", "after"), message("end", "user", "end")];
         for (const cutMessageID of [null, "missing"]) {
-            const result = rewriteForSwitch({ system: system(), messages }, { cutMessageID, digest: "d" }, options);
-            expect(result.messages).toEqual(messages);
-            expect(result.system[1].text).toBe(buildDigestText("d"));
+            const input = { system: system(), messages };
+            const snapshot = { cutMessageID, digest: "d" };
+            const result = rewriteForSwitch(input, snapshot, options);
+            expect(result.messages).toEqual(messages.filter((entry) => entry.role !== "system"));
+            expect(result.messages.every((entry) => entry.role !== "system")).toBe(true);
+            expect(result.system).toEqual([
+                ...input.system,
+                { type: "text", text: "system" },
+                { type: "text", text: "after" },
+                { type: "text", text: buildDigestText("d") },
+            ]);
+            expect(JSON.stringify(result)).toBe(JSON.stringify(rewriteForSwitch(input, snapshot, options)));
         }
     });
 
@@ -131,6 +171,7 @@ describe("switch controller", () => {
         await fake.controller.onContext(event);
         expect(event.system).toBe(originalSystem);
         expect(event.messages).toBe(originalMessages);
+        expect(event.messages[0].role).toBe("system");
         expect(fake.calls()).toBe(0);
     });
 
@@ -157,7 +198,7 @@ describe("switch controller", () => {
         await fake.controller.onContext(second);
         expect(fake.calls()).toBe(2);
         expect(JSON.stringify(first)).toBe(JSON.stringify(second));
-        expect(first.system[1].text).toBe(buildDigestText("digest-2"));
+        expect(first.system[2].text).toBe(buildDigestText("digest-2"));
     });
 
     test("digest failure leaves event untouched, does not update last model, and retries", async () => {
@@ -197,6 +238,6 @@ describe("switch controller", () => {
         await controller.onContext(event);
         expect(order).toEqual(["flush", "digest"]);
         expect(errors).toHaveLength(1);
-        expect(event.system[1].text).toBe(buildDigestText("d"));
+        expect(event.system[2].text).toBe(buildDigestText("d"));
     });
 });
