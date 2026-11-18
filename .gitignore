@@ -1,0 +1,7 @@
+/target
+/.fastembed_cache
+/data
+node_modules
+*.log
+.env
+.env.*
