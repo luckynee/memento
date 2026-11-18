@@ -1,0 +1,23 @@
+{"type":"session_meta","timestamp":"2026-11-18T10:00:00Z","payload":{"id":"exec-session","cwd":"/tmp"}}
+{"type":"response_item","timestamp":"2026-11-18T10:00:01Z","payload":{"type":"custom_tool_call","name":"exec","input":"await tools.exec_command({cmd: 'ignored'}); await tools.apply_patch(`*** Begin Patch\n*** Update File: src/demo.rs\n+hello\n*** End Patch`); trailing","call_id":"patch"}}
+{"type":"response_item","timestamp":"2026-11-18T10:00:02Z","payload":{"type":"custom_tool_call_output","call_id":"patch","output":"done"}}
+{"type":"response_item","timestamp":"2026-11-18T10:00:03Z","payload":{"type":"custom_tool_call","name":"exec","input":"tools.apply_patch(`*** Begin Patch\n*** Add File: open.rs\n+hello`)","call_id":"open-patch"}}
+{"type":"response_item","timestamp":"2026-11-18T10:00:04Z","payload":{"type":"custom_tool_call_output","call_id":"open-patch","output":"done"}}
+{"type":"response_item","timestamp":"2026-11-18T10:00:05Z","payload":{"type":"custom_tool_call","name":"exec","input":"const text = 'tools.exec_command({cmd: \"fake\"})'; await tools.exec_command({cmd: 'printf \\'hello\\''})","call_id":"single"}}
+{"type":"response_item","timestamp":"2026-11-18T10:00:06Z","payload":{"type":"custom_tool_call_output","call_id":"single","output":"{\"exit_code\":1}"}}
+{"type":"response_item","timestamp":"2026-11-18T10:00:07Z","payload":{"type":"custom_tool_call","name":"exec","input":"await tools.exec_command({\"cmd\": \"echo \\\"hello\\\"\"})","call_id":"double"}}
+{"type":"response_item","timestamp":"2026-11-18T10:00:08Z","payload":{"type":"custom_tool_call_output","call_id":"double","output":"ok"}}
+{"type":"response_item","timestamp":"2026-11-18T10:00:09Z","payload":{"type":"custom_tool_call","name":"exec","input":"await tools.exec_command({cmd: `printf \\`hello\\``})","call_id":"backtick"}}
+{"type":"response_item","timestamp":"2026-11-18T10:00:10Z","payload":{"type":"custom_tool_call_output","call_id":"backtick","output":"ok"}}
+{"type":"response_item","timestamp":"2026-11-18T10:00:11Z","payload":{"type":"custom_tool_call","name":"exec","input":"tools.exec_command({cmd: value}); tools.exec_command({cmd: 'not first'})","call_id":"dynamic"}}
+{"type":"response_item","timestamp":"2026-11-18T10:00:12Z","payload":{"type":"custom_tool_call_output","call_id":"dynamic","output":"ok"}}
+{"type":"response_item","timestamp":"2026-11-18T10:00:13Z","payload":{"type":"custom_tool_call","name":"exec","input":"await tools.other({}); await tools.web__run('ignored')","call_id":"other"}}
+{"type":"response_item","timestamp":"2026-11-18T10:00:14Z","payload":{"type":"custom_tool_call_output","call_id":"other","output":"ok"}}
+{"type":"response_item","timestamp":"2026-11-18T10:00:15Z","payload":{"type":"custom_tool_call","name":"exec","input":"await tools.web__run(`look up \\`rust\\``); await tools.mcp__foo('ignored')","call_id":"web"}}
+{"type":"response_item","timestamp":"2026-11-18T10:00:16Z","payload":{"type":"custom_tool_call_output","call_id":"web","output":"ok"}}
+{"type":"response_item","timestamp":"2026-11-18T10:00:17Z","payload":{"type":"custom_tool_call","name":"exec","input":"await tools.web__run({query: 'ignored'})","call_id":"web-object"}}
+{"type":"response_item","timestamp":"2026-11-18T10:00:18Z","payload":{"type":"custom_tool_call_output","call_id":"web-object","output":"ok"}}
+{"type":"response_item","timestamp":"2026-11-18T10:00:19Z","payload":{"type":"custom_tool_call","name":"exec","input":"await tools.mcp__example('private')","call_id":"mcp"}}
+{"type":"response_item","timestamp":"2026-11-18T10:00:20Z","payload":{"type":"custom_tool_call_output","call_id":"mcp","output":"private result"}}
+{"type":"response_item","timestamp":"2026-11-18T10:00:21Z","payload":{"type":"custom_tool_call","name":"exec","input":"// tools.exec_command({cmd: 'fake'})\nconst text = 'tools.other()';","call_id":"no-tools"}}
+{"type":"response_item","timestamp":"2026-11-18T10:00:22Z","payload":{"type":"custom_tool_call_output","call_id":"no-tools","output":"ignored"}}

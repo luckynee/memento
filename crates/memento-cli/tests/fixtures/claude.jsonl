@@ -1,0 +1,8 @@
+{"type":"user","sessionId":"claude-session","cwd":"/tmp","timestamp":"2026-11-18T10:00:00Z","uuid":"u1","message":{"role":"user","content":"hello"}}
+{"type":"assistant","sessionId":"claude-session","timestamp":"2026-11-18T10:00:01Z","uuid":"a1","message":{"role":"assistant","content":[{"type":"thinking","thinking":"private"},{"type":"text","text":"answer"},{"type":"tool_use","id":"c1","name":"Edit","input":{"file_path":"a.rs","old_string":"old","new_string":"new"}}]}}
+{"type":"user","timestamp":"2026-11-18T10:00:02Z","uuid":"u2","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"c1","content":[{"type":"text","text":"failed"}],"is_error":true}]}}
+{"type":"user","timestamp":"2026-11-18T10:00:03Z","uuid":"u3","isMeta":true,"message":{"role":"user","content":"injected"}}
+{"type":"user","timestamp":"2026-11-18T10:00:04Z","uuid":"u4","isSidechain":true,"message":{"role":"user","content":"ignored"}}
+{"type":"summary","summary":"ignored"}
+not json
+{"type":"assistant","timestamp":"2026-11-18T10:00:05Z","uuid":"a2","message":{"role":"assistant","content":[{"type":"tool_use","id":"c2","name":"Bash","input":{"command":"pwd"}}]}}

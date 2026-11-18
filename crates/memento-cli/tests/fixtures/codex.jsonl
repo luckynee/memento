@@ -1,0 +1,13 @@
+{"type":"session_meta","timestamp":"2026-11-18T10:00:00Z","payload":{"id":"codex-session","cwd":"/tmp"}}
+{"type":"turn_context","timestamp":"2026-11-18T10:00:00Z","payload":{"cwd":"/tmp","model":"example"}}
+{"type":"response_item","timestamp":"2026-11-18T10:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}
+{"type":"response_item","timestamp":"2026-11-18T10:00:02Z","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"injected"}]}}
+{"type":"response_item","timestamp":"2026-11-18T10:00:03Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>hidden</environment_context>"}]}}
+{"type":"response_item","timestamp":"2026-11-18T10:00:04Z","payload":{"type":"reasoning","summary":[{"text":"private"}]}}
+{"type":"response_item","timestamp":"2026-11-18T10:00:05Z","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"false\"}","call_id":"c1"}}
+{"type":"response_item","timestamp":"2026-11-18T10:00:06Z","payload":{"type":"function_call_output","call_id":"c1","output":"{\"metadata\":{\"exit_code\":1}}"}}
+{"type":"response_item","timestamp":"2026-11-18T10:00:07Z","payload":{"type":"custom_tool_call","name":"apply_patch","input":"*** Update File: a.rs","call_id":"c2"}}
+{"type":"response_item","timestamp":"2026-11-18T10:00:08Z","payload":{"type":"custom_tool_call_output","call_id":"c2","output":[{"type":"text","text":"done"}]}}
+{"type":"future_record","payload":{"text":"ignored"}}
+not json
+{"type":"response_item","timestamp":"2026-11-18T10:00:09Z","payload":{"type":"function_call","name":"update_plan","arguments":"{\"plan\":[{\"step\":\"work\",\"status\":\"in_progress\"}]}","call_id":"c3"}}

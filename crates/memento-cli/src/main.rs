@@ -15,6 +15,8 @@ use reqwest::{Method, Url};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+mod cross_harness;
+
 #[derive(Debug, Parser)]
 #[command(name = "memento", about = "Client for the mementod memory daemon")]
 struct Cli {
@@ -66,6 +68,19 @@ enum Command {
     Forget(ForgetArgs),
     #[command(about = "Ingest transcript items")]
     Ingest(IngestArgs),
+    #[command(about = "Print the canonical project key")]
+    ProjectKey {
+        #[arg(help = "Project directory")]
+        dir: Option<PathBuf>,
+    },
+    #[command(about = "Import a harness transcript")]
+    Import(cross_harness::ImportArgs),
+    #[command(about = "Prepare a cross-harness continuation")]
+    Continue(cross_harness::ContinueArgs),
+    #[command(about = "Handle a harness lifecycle event")]
+    Hook(cross_harness::HookArgs),
+    #[command(about = "Install harness lifecycle hooks")]
+    InstallHooks(cross_harness::InstallArgs),
 }
 
 #[derive(Debug, Args)]
@@ -304,6 +319,11 @@ fn build_request(
         Command::Digest(_) => (Method::GET, vec!["v1", "digest"]),
         Command::Forget(_) => (Method::POST, vec!["v1", "forget"]),
         Command::Ingest(_) => (Method::POST, vec!["v1", "ingest"]),
+        Command::ProjectKey { .. }
+        | Command::Import(_)
+        | Command::Continue(_)
+        | Command::Hook(_)
+        | Command::InstallHooks(_) => return Err(CliError::other("not a legacy request")),
     };
     let mut request = client.request(method, endpoint(&cli.url, &segments)?);
     if let Some(token) = &cli.token {
@@ -397,6 +417,11 @@ fn build_request(
         Command::Ingest(_) => {
             request.json(ingest.ok_or_else(|| CliError::other("missing ingest input"))?)
         }
+        Command::ProjectKey { .. }
+        | Command::Import(_)
+        | Command::Continue(_)
+        | Command::Hook(_)
+        | Command::InstallHooks(_) => return Err(CliError::other("not a legacy request")),
     };
     request
         .build()
@@ -579,10 +604,25 @@ fn render(command: &Command, body: &str) -> Result<String, CliError> {
             );
             Ok(lines.join("\n"))
         }
+        Command::ProjectKey { .. }
+        | Command::Import(_)
+        | Command::Continue(_)
+        | Command::Hook(_)
+        | Command::InstallHooks(_) => Err(CliError::other("not a legacy response")),
     }
 }
 
 fn run(cli: Cli) -> Result<(), CliError> {
+    if matches!(
+        &cli.command,
+        Command::ProjectKey { .. }
+            | Command::Import(_)
+            | Command::Continue(_)
+            | Command::Hook(_)
+            | Command::InstallHooks(_)
+    ) {
+        return cross_harness::run(&cli);
+    }
     if let Command::Forget(args) = &cli.command {
         let stdin = io::stdin();
         if !confirm_forget(&mut stdin.lock(), stdin.is_terminal(), args.yes)? {
