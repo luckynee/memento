@@ -101,6 +101,18 @@ Raw transcripts are not indexed. Tool output dominates coding sessions and file 
 - Point id: UUIDv5 over `harness/session/source_id/chunk_index`, so re-ingest is idempotent.
 - Empty segments are skipped.
 
+## Noise and prompt injection
+
+Harness scaffolding is not session memory, and stored text is untrusted when it is shown to a model again.
+
+- OpenCode v2.3.2 (verified on 40 local sessions): user `text` has no injected blocks; agent prompts live in system instructions (not ingested); skill bodies are `skill` tool results; harness notices are `synthetic` records. The adapter skips `system` and `synthetic` records.
+- Adapters set `injected: true` on harness-generated items; the segmenter skips them.
+- `SegmentPolicy.scaffold_strip_tags` removes `<system-reminder>`, `<skill_content>`, `<environment_context>`, `<user_instructions>`, `<command-message>`, `<command-name>`, `<local-command-stdout|stderr|caveat>`, `<subagent>`, and memento's own `<memento-*>` wrappers from user and assistant text (an unclosed tag strips to the end); `scaffold_unwrap_tags` keeps the inner text of `<command-args>`. Text that is empty after stripping is skipped.
+- `ignored_tools` (`skill`, `memory_search`, `question`, `execute`) and `self_command_prefixes` (`memento `, `mementod `) prevent ingesting skill bodies and memento's own output.
+- The digest contains only user requests, assistant-authored decisions, constraints and notes, the latest todo list, and file paths; tool output (command tails, subagent reports) never reaches it. Search results may include tool output because they arrive as tool output.
+- Every `<memento-` or `</memento-` sequence in rendered text is escaped to `&lt;`, so stored text cannot close the wrapper. Digest, continuation, and search output are framed as reference data, not instructions, with current instructions taking precedence.
+- Residual risk: assistant-authored text that quotes an attack is still shown (escaped and framed). Optional future step: a Jev `predicate` screen at ingest for text addressed to an AI model.
+
 ## Qdrant data model
 
 Collection `memento_segments`:
