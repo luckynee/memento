@@ -8,5 +8,5 @@ test("validates adapter options and model references", () => {
     expect(resolveOptions({ enabled: false, harness: "custom", tailCharBudget: 99, jevCooldownMs: 0 })).toMatchObject({ enabled: false, harness: "custom", tailCharBudget: 99, jevCooldownMs: 0 });
     expect(parseJevModel("provider/model")).toEqual({ providerID: "provider", id: "model" });
     expect(parseJevModel({ providerID: "p", id: "m", variant: "v" })).toEqual({ providerID: "p", id: "m", variant: "v" });
-    expect(parseJevModel("bad")).toEqual({ providerID: "opencode", id: "jev-1.13" });
+    expect(parseJevModel("bad")).toEqual({ providerID: "opencode", id: "jev-1.13-free" });
 });

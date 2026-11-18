@@ -40,7 +40,7 @@ Add the plugin to `~/.config/opencode/opencode.jsonc` (or a project `.opencode/o
 
 ## Jev
 
-The adapter uses `opencode/jev-1.13` through `ctx.experimental.generate.decisions` to classify assistant notes and filter search hits. Jev is billed to OpenCode Models credits (pay-as-you-go); without credits calls fail with HTTP 402 and the adapter falls back to score ordering and unclassified notes. Disable it with the `jev: false` option.
+The adapter uses `opencode/jev-1.13-free` (free tier, cost 0) through `ctx.experimental.generate.decisions` to classify assistant notes and filter search hits. The paid `opencode/jev-1.13` bills OpenCode Models credits and returns HTTP 402 without balance. On any Jev failure the adapter falls back to score ordering and unclassified notes, and pauses Jev for `jevCooldownMs`. Disable it with `jev: false`.
 
 ## Development
 

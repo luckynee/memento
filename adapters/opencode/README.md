@@ -27,7 +27,7 @@ Run `bun install` in this directory, then add the plugin to `opencode.jsonc`:
 | `digestBudget` | `12000` | Digest character budget |
 | `enabled` | `true` | Enable the plugin |
 | `jev` | `true` | Enable Jev classification and relevance judgments |
-| `jevModel` | `opencode/jev-1.13` | Jev model as `provider/id` or a model object |
+| `jevModel` | `opencode/jev-1.13-free` | Jev model as `provider/id` or a model object |
 | `jevCooldownMs` | `600000` | Milliseconds to skip Jev after a failure; non-negative integer |
 | `harness` | `opencode` | Harness identifier |
 

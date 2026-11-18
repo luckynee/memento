@@ -1,5 +1,5 @@
 export type JevModel = { providerID: string; id: string; variant?: string };
-export const DEFAULT_JEV_MODEL: JevModel = { providerID: "opencode", id: "jev-1.13" };
+export const DEFAULT_JEV_MODEL: JevModel = { providerID: "opencode", id: "jev-1.13-free" };
 
 type Question =
     | { type: "predicate"; name: string; instructions: string }

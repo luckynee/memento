@@ -27,7 +27,7 @@ OpenCode plugin (TypeScript, adapters/opencode)      memento (Rust workspace)
 ```
 
 - Core (Rust) is harness-agnostic and model-free. Harness adapters map native transcripts to the neutral ingest schema.
-- Jev (System 1) is used only inside the OpenCode adapter through `ctx.experimental.generate.decisions` with model `{ providerID: "opencode", id: "jev-1.13" }`. Jev is a decision model: `predicate`, `choice`, and `score` questions; it cannot embed or generate text.
+- Jev (System 1) is used only inside the OpenCode adapter through `ctx.experimental.generate.decisions` with model `{ providerID: "opencode", id: "jev-1.13-free" }` (free tier, verified 2026-11-18; paid `jev-1.13` needs OpenCode Models credits). Jev is a decision model: `predicate`, `choice`, and `score` questions; it cannot embed or generate text.
 - Deployment: Docker Compose with `qdrant/qdrant:v1.20.2` and a `mementod` image. The CLI runs on the host.
 
 ## Pinned stack
@@ -188,7 +188,7 @@ Location: `adapters/opencode/` (Promise plugin, `@opencode/plugin`). Verified co
 - Persisted history is never touched; the hook changes only the outgoing request.
 - Tool `memory_search({ query, scope? })`: calls `/v1/search` (k = 12). Jev `predicate` relevance runs in parallel only for prose kinds (`user_request`, `assistant_note`, `decision`, `constraint`, `task`); `file_change`, `command` and `file_ref` hits pass through on score because they are short and lexical. Keep hits with probability >= 0.5, return max 6 ordered by score. On any Jev error or timeout (3 s), fall back to the top 6 by score. Results arrive as tool output at the end of the context, which keeps the prefix cacheable.
 - Command `memento-continue <session>`: links current session to parent via `PUT /v1/sessions`, then puts the digest as `ctx.session.instructions.entry.put({ key: "memento-continuation", ... })`.
-- Options (`ctx.options`): `url`, `token`, `harness` (`opencode`), `tailUserTurns` (3), `tailCharBudget` (40000), `digestBudget` (12000), `jev` (true), `jevModel` (`opencode/jev-1.13`), `enabled` (true).
+- Options (`ctx.options`): `url`, `token`, `harness` (`opencode`), `tailUserTurns` (3), `tailCharBudget` (40000), `digestBudget` (12000), `jev` (true), `jevModel` (`opencode/jev-1.13-free`), `enabled` (true).
 
 ## Deployment
 

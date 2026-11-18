@@ -31,5 +31,5 @@
 - `@opencode/plugin` 2.2.5 decision `predicate` questions take `{ type, name, instructions }` only (no `criteria`).
 - Qdrant v1.20.2 self-hosted: vectorless collections accept payload-only points; sparse `bm25` with `modifier: idf` and server-side `qdrant/bm25` documents works for upsert and query. Image has bash, no curl/wget.
 - Qdrant gRPC (qdrant-client 1.20.0): payload-only points need an explicitly empty named-vector map; `vectors: None` is rejected with `Expected some vectors`.
-- Jev `opencode/jev-1.13` bills OpenCode Models credits; with no balance `POST /api/experimental/generate/decisions` returns 402 (verified 2026-11-18). Adapter falls back.
+- Jev: `opencode/jev-1.13-free` works at cost 0 (`billing_source: free`); paid `opencode/jev-1.13` returns 402 without OpenCode Models credits (verified 2026-11-18). Adapter default is the free model.
 - End-to-end verified 2026-11-18 on a standalone OpenCode server: ingest on step/execution events, switch rewrite (digest system part + tail from the cut), multi-switch snapshots, `memory_search` via Code Mode, CLI `forget`.
