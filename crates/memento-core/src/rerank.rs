@@ -108,6 +108,7 @@ pub fn rerank(
             score,
             kind: segment.kind,
             text: segment.text,
+            harness: segment.harness,
             session: segment.session,
             ts: segment.ts,
             path: segment.path,
@@ -183,6 +184,7 @@ mod tests {
             10,
         );
         assert_eq!(hits[0].text, "old");
+        assert_eq!(hits[0].harness, "h");
         assert!((hits[0].score - 1.075).abs() < 0.00001);
         assert!((hits[1].score - 0.65).abs() < 0.00001);
     }
