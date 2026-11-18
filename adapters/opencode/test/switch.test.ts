@@ -222,22 +222,67 @@ describe("switch controller", () => {
         expect(fake.calls()).toBe(1);
     });
 
-    test("continues to digest after a flush failure", async () => {
+    test("leaves a failed flush untouched and retries before creating a snapshot", async () => {
         const errors: unknown[] = [];
         const order: string[] = [];
         const values = new Map<string, unknown>();
+        let fail = true;
         const controller = createSwitchController({
             client: { async digest() { order.push("digest"); return { text: "d", segments: 1 }; } },
             storage: { async get(key) { return values.get(key); }, async set(key, value) { values.set(key, value); } },
-            async flush() { order.push("flush"); throw new Error("failed"); },
+            async flush() { order.push("flush"); if (fail) { throw new Error("failed"); } },
             harness: "h", project: "p", digestBudget: 1, tailUserTurns: 1, tailCharBudget: 100,
             log(_message, error) { errors.push(error); },
         });
         await controller.onContext({ sessionID: "s", model: a, system: system(), messages: history() });
         const event = { sessionID: "s", model: b, system: system(), messages: history() };
+        const originalSystem = event.system;
+        const originalMessages = event.messages;
         await controller.onContext(event);
-        expect(order).toEqual(["flush", "digest"]);
+        expect(order).toEqual(["flush"]);
         expect(errors).toHaveLength(1);
+        expect(event.system).toBe(originalSystem);
+        expect(event.messages).toBe(originalMessages);
+        expect(values.get("memento/switch/s")).toEqual({ origin: a, lastModel: a, snapshots: {} });
+        fail = false;
+        await controller.onContext(event);
+        expect(order).toEqual(["flush", "flush", "digest"]);
         expect(event.system[2].text).toBe(buildDigestText("d"));
+    });
+
+    test("evicts least recently used sessions and reloads persisted snapshots", async () => {
+        const values = new Map<string, unknown>();
+        const reads: string[] = [];
+        let digests = 0;
+        const controller = createSwitchController({
+            client: { async digest() { digests++; return { text: "d", segments: 1 }; } },
+            storage: {
+                async get(key) { reads.push(key); return values.get(key); },
+                async set(key, value) { values.set(key, value); },
+            },
+            async flush() {},
+            harness: "h", project: "p", digestBudget: 1, tailUserTurns: 1, tailCharBudget: 100,
+            log() {},
+        });
+        const event = (sessionID: string, model: ModelRef) => ({ sessionID, model, system: system(), messages: history() });
+        await controller.onContext(event("s0", a));
+        await controller.onContext(event("s0", b));
+        for (let i = 1; i < 64; i++) {
+            await controller.onContext(event(`s${i}`, a));
+        }
+        await controller.onContext(event("s0", b));
+        await controller.onContext(event("s64", a));
+        await controller.onContext(event("s0", b));
+        expect(reads.filter((key) => key === "memento/switch/s0")).toHaveLength(1);
+        await controller.onContext(event("s1", a));
+        expect(reads.filter((key) => key === "memento/switch/s1")).toHaveLength(2);
+        for (let i = 65; i < 129; i++) {
+            await controller.onContext(event(`s${i}`, a));
+        }
+        const restored = event("s0", b);
+        await controller.onContext(restored);
+        expect(reads.filter((key) => key === "memento/switch/s0")).toHaveLength(2);
+        expect(digests).toBe(1);
+        expect(restored.system[2].text).toBe(buildDigestText("d"));
     });
 });

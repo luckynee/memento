@@ -122,6 +122,63 @@ describe("incremental ingestion", () => {
         expect(fake.ingests[2].items[0].kind_hint).toBe("decision");
     });
 
+    test("classifies user items through the same gate as assistant items", async () => {
+        const questions: string[][] = [];
+        const fake = setup(async (input) => {
+            const question = input.questions[0];
+            if (question.type === "choice") {
+                questions.push(question.choices.map((choice) => String(choice.value)));
+            }
+            return { answers: [{ type: "choice", name: "kind", choice: "constraint", confidence: 0.6 }] };
+        });
+        fake.contexts.set("s", [user("a"), assistant("b", "answer")]);
+        await fake.ingestor.flush("s");
+        expect(fake.ingests[0].items.map((item) => item.kind_hint)).toEqual(["constraint", "constraint"]);
+        expect(questions).toEqual([
+            ["decision", "constraint", "task", "request"],
+            ["decision", "constraint", "task", "note"],
+        ]);
+    });
+
+    test("evicts old classifications after 500 entries", async () => {
+        let calls = 0;
+        const fake = setup(async () => {
+            calls++;
+            return { answers: [{ type: "choice", name: "kind", choice: "decision" }] };
+        });
+        fake.contexts.set("s", Array.from({ length: 501 }, (_, index) => assistant(String(index), `text ${index}`)));
+        await fake.ingestor.flush("s");
+        expect(calls).toBe(501);
+        fake.values.delete("memento/ingest/s");
+        fake.contexts.set("s", [assistant("500", "text 500")]);
+        await fake.ingestor.flush("s");
+        expect(calls).toBe(501);
+        fake.values.delete("memento/ingest/s");
+        fake.contexts.set("s", [assistant("0", "text 0")]);
+        await fake.ingestor.flush("s");
+        expect(calls).toBe(502);
+    });
+
+    test("evicts least recently used sessions and reloads durable registration", async () => {
+        let calls = 0;
+        const fake = setup(async () => {
+            calls++;
+            return { answers: [{ type: "choice", name: "kind", choice: "decision" }] };
+        });
+        for (let i = 0; i < 64; i++) {
+            fake.contexts.set(`s${i}`, [assistant("a", "text")]);
+            await fake.ingestor.flush(`s${i}`);
+        }
+        await fake.ingestor.flush("s0");
+        fake.contexts.set("s64", [assistant("a", "text")]);
+        await fake.ingestor.flush("s64");
+        await fake.ingestor.flush("s0");
+        expect(calls).toBe(65);
+        await fake.ingestor.flush("s1");
+        expect(calls).toBe(66);
+        expect(fake.puts).toHaveLength(65);
+    });
+
     test("flush rejects to its caller but leaves the queue healthy", async () => {
         const fake = setup();
         fake.contexts.set("s", [user("a")]);
@@ -260,4 +317,138 @@ test("failed claims retry on a later event, including after restart", async () =
     expect(values.get("memento/claimed/s")).toBe(true);
     expect(values.get("memento/registered/s")).toBe(true);
     expect(JSON.parse(String(values.get("memento/parent/s")))).toEqual({ harness: "codex", session: "old" });
+});
+
+test("reclaims after an instruction failure and marks the claim complete only after success", async () => {
+    const values = new Map<string, unknown>();
+    const instructions = new Map<string, string>();
+    const order: string[] = [];
+    let instructionAttempts = 0;
+    const ingestor = createIngestor({
+        client: {
+            async claimContinuation() {
+                order.push("claim");
+                return { claimed: true, parent_harness: "codex", parent: "old", digest: "digest" };
+            },
+            async putSession() { order.push("register"); },
+            async ingest() { return { segments: 0, skipped: 0 }; },
+        },
+        storage: {
+            async get(key) { return values.get(key); },
+            async set(key, value) {
+                if (key === "memento/parent/s") { order.push("parent"); }
+                if (key === "memento/claimed/s") { order.push("completed"); }
+                values.set(key, value);
+            },
+        },
+        async loadContext() { return []; },
+        async putInstruction(session, key, value) {
+            order.push("instruction");
+            expect(values.get("memento/claimed/s")).toBeUndefined();
+            if (++instructionAttempts === 1) { throw new Error("instruction unavailable"); }
+            instructions.set(`${session}/${key}`, value);
+        },
+        jevModel: DEFAULT_JEV_MODEL, harness: "opencode", project: "p",
+        log() { order.push("logged"); },
+    });
+    await ingestor.ensureRegistered("s");
+    expect(values.get("memento/claimed/s")).toBeUndefined();
+    expect(values.get("memento/registered/s")).toBe("claim-pending");
+    expect(instructions.size).toBe(0);
+    await ingestor.ensureRegistered("s");
+    expect(order).toEqual(["claim", "parent", "instruction", "logged", "register", "claim", "parent", "instruction", "completed"]);
+    expect(values.get("memento/claimed/s")).toBe(true);
+    expect(values.get("memento/registered/s")).toBe(true);
+    expect(JSON.parse(String(values.get("memento/parent/s")))).toEqual({ harness: "codex", session: "old" });
+    expect(instructions.get("s/memento-continuation")).toContain("parent session codex/old");
+});
+
+test("reclaims after a parent save failure", async () => {
+    const values = new Map<string, unknown>();
+    let claims = 0;
+    let failParent = true;
+    let instructions = 0;
+    const ingestor = createIngestor({
+        client: {
+            async claimContinuation() {
+                claims++;
+                return { claimed: true, parent_harness: "codex", parent: "old", digest: "digest" };
+            },
+            async putSession() {},
+            async ingest() { return { segments: 0, skipped: 0 }; },
+        },
+        storage: {
+            async get(key) { return values.get(key); },
+            async set(key, value) {
+                if (key === "memento/parent/s" && failParent) {
+                    failParent = false;
+                    throw new Error("parent unavailable");
+                }
+                values.set(key, value);
+            },
+        },
+        async loadContext() { return []; },
+        async putInstruction() { instructions++; },
+        jevModel: DEFAULT_JEV_MODEL, harness: "opencode", project: "p", log() {},
+    });
+    await ingestor.ensureRegistered("s");
+    expect(values.get("memento/claimed/s")).toBeUndefined();
+    expect(instructions).toBe(0);
+    await ingestor.ensureRegistered("s");
+    expect(claims).toBe(2);
+    expect(instructions).toBe(1);
+    expect(values.get("memento/claimed/s")).toBe(true);
+});
+
+test("repeated successful claims replace the fixed continuation instruction", async () => {
+    const values = new Map<string, unknown>();
+    const instructions = new Map<string, string>();
+    let attempts = 0;
+    let failClaimMarker = true;
+    const ingestor = createIngestor({
+        client: {
+            async claimContinuation() {
+                attempts++;
+                return { claimed: true, parent_harness: "codex", parent: "old", digest: "digest" };
+            },
+            async putSession() {},
+            async ingest() { return { segments: 0, skipped: 0 }; },
+        },
+        storage: {
+            async get(key) { return values.get(key); },
+            async set(key, value) {
+                if (key === "memento/claimed/s" && failClaimMarker) {
+                    failClaimMarker = false;
+                    throw new Error("claim marker unavailable");
+                }
+                values.set(key, value);
+            },
+        },
+        async loadContext() { return []; },
+        async putInstruction(session, key, value) { instructions.set(`${session}/${key}`, value); },
+        jevModel: DEFAULT_JEV_MODEL, harness: "opencode", project: "p", log() {},
+    });
+    await ingestor.ensureRegistered("s");
+    await ingestor.ensureRegistered("s");
+    expect(attempts).toBe(2);
+    expect(instructions.size).toBe(1);
+    expect(instructions.get("s/memento-continuation")).toContain("parent session codex/old");
+    values.delete("memento/registered/s");
+    values.delete("memento/claimed/s");
+    await createIngestor({
+        client: {
+            async claimContinuation() {
+                attempts++;
+                return { claimed: true, parent_harness: "codex", parent: "old", digest: "digest" };
+            },
+            async putSession() {},
+            async ingest() { return { segments: 0, skipped: 0 }; },
+        },
+        storage: { async get(key) { return values.get(key); }, async set(key, value) { values.set(key, value); } },
+        async loadContext() { return []; },
+        async putInstruction(session, key, value) { instructions.set(`${session}/${key}`, value); },
+        jevModel: DEFAULT_JEV_MODEL, harness: "opencode", project: "p", log() {},
+    }).ensureRegistered("s");
+    expect(attempts).toBe(3);
+    expect(instructions.size).toBe(1);
 });

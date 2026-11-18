@@ -20,21 +20,30 @@ export function createSwitchController(deps: {
     const states = new Map<string, SwitchState>();
     const chains = new Map<string, Promise<void>>();
 
+    function cache(sessionID: string, state: SwitchState): void {
+        states.delete(sessionID);
+        states.set(sessionID, state);
+        if (states.size > 64) {
+            states.delete(states.keys().next().value!);
+        }
+    }
+
     async function load(sessionID: string): Promise<SwitchState> {
         const cached = states.get(sessionID);
         if (cached) {
+            cache(sessionID, cached);
             return cached;
         }
         const stored = await deps.storage.get(`memento/switch/${sessionID}`);
         const value = stored && typeof stored === "object" ? stored as Partial<SwitchState> : {};
         const state = { ...value, snapshots: value.snapshots ?? {} };
-        states.set(sessionID, state);
+        cache(sessionID, state);
         return state;
     }
 
     async function persist(sessionID: string, state: SwitchState): Promise<void> {
         await deps.storage.set(`memento/switch/${sessionID}`, state);
-        states.set(sessionID, state);
+        cache(sessionID, state);
     }
 
     function serialize(sessionID: string, action: () => Promise<void>): Promise<void> {
@@ -85,6 +94,7 @@ export function createSwitchController(deps: {
                     await deps.flush(event.sessionID);
                 } catch (error) {
                     deps.log(`Failed to flush session ${event.sessionID} before snapshot`, error);
+                    return;
                 }
                 const digest = await deps.client.digest({
                     harness: deps.harness,

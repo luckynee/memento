@@ -7,7 +7,7 @@ type Question =
 
 type Answer =
     | { type: "predicate"; name: string; probability: number }
-    | { type: "choice"; name: string; choice: string | boolean }
+    | { type: "choice"; name: string; choice: string | boolean; confidence?: number }
     | { type: "score"; name: string }
     | { type: "error"; name: string; reason: string; message?: string };
 
@@ -94,7 +94,7 @@ export function parseJevModel(option: unknown): JevModel {
     return { ...DEFAULT_JEV_MODEL };
 }
 
-export async function classifyKind(decide: DecisionsFn, model: JevModel, text: string): Promise<"decision" | "constraint" | "task" | null> {
+export async function classifyKind(decide: DecisionsFn, model: JevModel, text: string, role: "user" | "assistant" = "assistant"): Promise<"decision" | "constraint" | "task" | null> {
     try {
         const result = await decide({
             model,
@@ -102,17 +102,21 @@ export async function classifyKind(decide: DecisionsFn, model: JevModel, text: s
             questions: [{
                 type: "choice",
                 name: "kind",
-                instructions: "Classify this assistant message from a coding session.",
+                instructions: `Classify this ${role} message from a coding session.`,
                 choices: [
                     { value: "decision", description: "A design decision" },
                     { value: "constraint", description: "A requirement or constraint" },
                     { value: "task", description: "A task or next step" },
-                    { value: "note", description: "Other information" },
+                    role === "user"
+                        ? { value: "request", description: "Other user requests" }
+                        : { value: "note", description: "Other information" },
                 ],
             }],
         });
         const answer = result.answers.find((entry) => entry.name === "kind" && entry.type === "choice");
-        if (answer?.type === "choice" && (answer.choice === "decision" || answer.choice === "constraint" || answer.choice === "task")) {
+        if (answer?.type === "choice"
+            && (role === "assistant" || (typeof answer.confidence === "number" && Number.isFinite(answer.confidence) && answer.confidence >= 0.6))
+            && (answer.choice === "decision" || answer.choice === "constraint" || answer.choice === "task")) {
             return answer.choice;
         }
     } catch {

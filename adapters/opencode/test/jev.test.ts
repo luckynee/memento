@@ -5,6 +5,44 @@ import { createMemorySearchTool } from "../src/tools";
 
 const noTimer = () => () => {};
 
+test("user classification requires confidence and uses request instead of note", async () => {
+    const questions: unknown[] = [];
+    let choice = "decision";
+    let confidence: number | undefined = 0.6;
+    const decide: DecisionsFn = async (input) => {
+        questions.push(input.questions[0]);
+        return { answers: [{ type: "choice", name: "kind", choice, confidence }] };
+    };
+    expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "user text", "user")).toBe("decision");
+    expect(questions[0]).toEqual({
+        type: "choice",
+        name: "kind",
+        instructions: "Classify this user message from a coding session.",
+        choices: [
+            { value: "decision", description: "A design decision" },
+            { value: "constraint", description: "A requirement or constraint" },
+            { value: "task", description: "A task or next step" },
+            { value: "request", description: "Other user requests" },
+        ],
+    });
+    for (const kind of ["constraint", "task"] as const) {
+        choice = kind;
+        expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "user text", "user")).toBe(kind);
+    }
+    confidence = 0.599;
+    expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "user text", "user")).toBeNull();
+    confidence = undefined;
+    expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "user text", "user")).toBeNull();
+    confidence = Number.NaN;
+    expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "user text", "user")).toBeNull();
+    confidence = 1;
+    choice = "request";
+    expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "user text", "user")).toBeNull();
+    choice = "decision";
+    confidence = undefined;
+    expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "assistant text")).toBe("decision");
+});
+
 test("failure starts cooldown, expiry retries, and success permits a new cooldown", async () => {
     let now = 0;
     let calls = 0;

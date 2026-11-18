@@ -128,7 +128,7 @@ export class MementoClient {
         return this.request(`/v1/sessions/${encodeURIComponent(harness)}/${encodeURIComponent(session)}/lineage`, "GET");
     }
 
-    ingest(payload: SessionIdentity & { items: IngestItem[] }): Promise<{ segments: number; skipped: number }> {
+    ingest(payload: SessionIdentity & { items: IngestItem[] }): Promise<{ segments: number; skipped: number; duplicates?: number }> {
         return this.request("/v1/ingest", "POST", payload);
     }
 

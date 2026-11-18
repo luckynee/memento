@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { MementoClient } from "./client";
 import { frameContinuation } from "./commands";
 import { classifyKind, type DecisionsFn, type JevModel } from "./jev";
@@ -20,26 +21,40 @@ export function createIngestor(deps: {
     log(message: string, error?: unknown): void;
 }) {
     const chains = new Map<string, Promise<void>>();
-    const registered = new Set<string>();
-    const retryClaims = new Set<string>();
-    const classifications = new Map<string, Map<string, { text: string; kind: string | null }>>();
+    const sessions = new Map<string, {
+        registered: boolean;
+        retryClaim: boolean;
+        classifications: Map<string, { hash: string; kind: string | null }>;
+    }>();
+
+    function sessionState(sessionID: string) {
+        const state = sessions.get(sessionID) ?? { registered: false, retryClaim: false, classifications: new Map<string, { hash: string; kind: string | null }>() };
+        sessions.delete(sessionID);
+        sessions.set(sessionID, state);
+        if (sessions.size > 64) {
+            sessions.delete(sessions.keys().next().value!);
+        }
+        return state;
+    }
 
     async function markRegistered(sessionID: string): Promise<void> {
         await deps.storage.set(`memento/registered/${sessionID}`, true);
-        registered.add(sessionID);
+        sessionState(sessionID).registered = true;
     }
 
     async function registerSession(sessionID: string): Promise<void> {
-        if (registered.has(sessionID) && !retryClaims.has(sessionID)) {
+        const state = sessionState(sessionID);
+        if (state.registered && !state.retryClaim) {
             return;
         }
         const persistedRegistration = await deps.storage.get(`memento/registered/${sessionID}`);
-        if (!retryClaims.has(sessionID) && persistedRegistration === true) {
-            registered.add(sessionID);
+        if (!state.retryClaim && persistedRegistration === true) {
+            state.registered = true;
             return;
         }
         if (persistedRegistration === "claim-pending") {
-            registered.add(sessionID);
+            state.registered = true;
+            state.retryClaim = true;
         }
         const claimKey = `memento/claimed/${sessionID}`;
         if (await deps.storage.get(claimKey) !== true) {
@@ -53,28 +68,28 @@ export function createIngestor(deps: {
                         throw new Error("Claimed continuation is missing its parent or digest");
                     }
                 }
-                await deps.storage.set(claimKey, true);
-                retryClaims.delete(sessionID);
                 if (claim.claimed) {
                     await deps.storage.set(`memento/parent/${sessionID}`, JSON.stringify({ harness: claim.parent_harness, session: claim.parent }));
                     await deps.putInstruction(sessionID, "memento-continuation", frameContinuation(claim.parent_harness!, claim.parent!, claim.digest!));
                 }
+                await deps.storage.set(claimKey, true);
+                state.retryClaim = false;
             } catch (error) {
                 if (await deps.storage.get(claimKey) !== true) {
-                    retryClaims.add(sessionID);
+                    state.retryClaim = true;
                 }
                 deps.log(`Failed to claim continuation for session ${sessionID}`, error);
             }
         }
-        if (!registered.has(sessionID)) {
+        if (!state.registered) {
             await deps.client.putSession({ harness: deps.harness, project: deps.project, session: sessionID });
-            if (retryClaims.has(sessionID)) {
+            if (state.retryClaim) {
                 await deps.storage.set(`memento/registered/${sessionID}`, "claim-pending");
-                registered.add(sessionID);
+                state.registered = true;
             } else {
                 await markRegistered(sessionID);
             }
-        } else if (!retryClaims.has(sessionID) && persistedRegistration === "claim-pending") {
+        } else if (!state.retryClaim && persistedRegistration === "claim-pending") {
             await markRegistered(sessionID);
         }
     }
@@ -88,23 +103,23 @@ export function createIngestor(deps: {
         const items = selection.messages.flatMap(mapMessage);
         if (deps.decide) {
             const decide = deps.decide;
-            const assistantItems = items.filter((item) => item.role === "assistant");
-            let sessionClassifications = classifications.get(sessionID);
-            if (!sessionClassifications) {
-                sessionClassifications = new Map();
-                classifications.set(sessionID, sessionClassifications);
-            }
-            const cache = sessionClassifications;
+            const textItems = items.filter((item) => item.role === "assistant" || item.role === "user");
+            const cache = sessionState(sessionID).classifications;
             let index = 0;
-            await Promise.all(Array.from({ length: Math.min(4, assistantItems.length) }, async () => {
-                while (index < assistantItems.length) {
-                    const item = assistantItems[index++];
+            await Promise.all(Array.from({ length: Math.min(4, textItems.length) }, async () => {
+                while (index < textItems.length) {
+                    const item = textItems[index++];
+                    const hash = createHash("sha256").update(item.role).update("\0").update(item.text).digest("hex");
                     const cached = cache.get(item.source_id);
-                    if (cached?.text === item.text) {
+                    if (cached?.hash === hash) {
                         item.kind_hint = cached.kind;
                     } else {
-                        item.kind_hint = await classifyKind(decide, deps.jevModel, item.text);
-                        cache.set(item.source_id, { text: item.text, kind: item.kind_hint });
+                        item.kind_hint = await classifyKind(decide, deps.jevModel, item.text, item.role as "user" | "assistant");
+                    }
+                    cache.delete(item.source_id);
+                    cache.set(item.source_id, { hash, kind: item.kind_hint });
+                    if (cache.size > 500) {
+                        cache.delete(cache.keys().next().value!);
                     }
                 }
             }));
