@@ -1,10 +1,13 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::{Json, Router, extract::State, routing::get};
 use clap::{Parser, Subcommand};
-use memento_core::protocol::Health;
-use mementod::{config::Config, embed::FastEmbedder, store::Store};
+use mementod::{
+    config::Config,
+    embed::FastEmbedder,
+    routes::{AppState, router},
+    store::Store,
+};
 use qdrant_client::Qdrant;
 
 #[derive(Parser)]
@@ -40,25 +43,21 @@ async fn main() -> Result<()> {
         .ensure_schema()
         .await
         .context("ensuring Qdrant schema")?;
-    let router = Router::new()
-        .route("/health", get(health))
-        .with_state(client);
+    let router = router(AppState {
+        store: Arc::new(store),
+        config: config.clone(),
+        policy: Default::default(),
+        rerank: Default::default(),
+    });
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .context("binding HTTP listener")?;
-    tracing::info!(address = %config.bind, "serving health endpoint");
+    tracing::info!(address = %config.bind, "serving HTTP");
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown())
         .await
         .context("serving HTTP")?;
     Ok(())
-}
-
-async fn health(State(client): State<Qdrant>) -> Json<Health> {
-    Json(Health {
-        ok: true,
-        qdrant: client.health_check().await.is_ok(),
-    })
 }
 
 async fn shutdown() {

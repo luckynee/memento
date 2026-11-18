@@ -312,6 +312,18 @@ impl Store {
         Ok(count)
     }
 
+    pub async fn delete_sessions(&self, filter: &ScopeFilter) -> Result<()> {
+        self.client
+            .delete_points(
+                DeletePointsBuilder::new(&self.sessions_collection)
+                    .points(filter.to_filter()?)
+                    .wait(true),
+            )
+            .await
+            .context("deleting sessions")?;
+        Ok(())
+    }
+
     pub async fn count_by_kind(&self, filter: &ScopeFilter) -> Result<BTreeMap<String, u64>> {
         let mut counts = BTreeMap::new();
         for segment in self.scroll_segments(filter).await? {
