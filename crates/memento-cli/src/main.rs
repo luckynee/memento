@@ -11,6 +11,7 @@ use memento_core::protocol::{
 };
 use reqwest::blocking::{Client, Request};
 use reqwest::{Method, Url};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 #[derive(Debug, Parser)]
@@ -20,14 +21,26 @@ struct Cli {
         long,
         env = "MEMENTO_URL",
         default_value = "http://127.0.0.1:7377",
-        global = true
+        global = true,
+        help = "Daemon base URL"
     )]
     url: String,
-    #[arg(long, env = "MEMENTO_TOKEN", global = true, hide_env_values = true)]
+    #[arg(
+        long,
+        env = "MEMENTO_TOKEN",
+        global = true,
+        hide_env_values = true,
+        help = "Daemon bearer token"
+    )]
     token: Option<String>,
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help = "Print raw JSON response")]
     json: bool,
-    #[arg(long, default_value_t = 30, global = true)]
+    #[arg(
+        long,
+        default_value_t = 30,
+        global = true,
+        help = "Request timeout in seconds"
+    )]
     timeout_secs: u64,
     #[command(subcommand)]
     command: Command,
@@ -35,54 +48,64 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(about = "Check daemon health")]
     Health,
+    #[command(about = "Show memory counts by kind")]
     Stats(StatsArgs),
+    #[command(about = "Manage sessions and lineage")]
     Sessions {
         #[command(subcommand)]
         command: SessionsCommand,
     },
+    #[command(about = "Search stored memories")]
     Search(SearchArgs),
+    #[command(about = "Show a session digest")]
     Digest(DigestArgs),
+    #[command(about = "Delete matching memories")]
     Forget(ForgetArgs),
+    #[command(about = "Ingest transcript items")]
     Ingest(IngestArgs),
 }
 
 #[derive(Debug, Args)]
 struct StatsArgs {
-    #[arg(long)]
+    #[arg(long, help = "Harness identifier")]
     harness: String,
-    #[arg(long)]
+    #[arg(long, help = "Filter by project")]
     project: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "Filter by session")]
     session: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
 enum SessionsCommand {
+    #[command(about = "List registered sessions")]
     List {
-        #[arg(long)]
+        #[arg(long, help = "Harness identifier")]
         harness: String,
-        #[arg(long)]
+        #[arg(long, help = "Filter by project")]
         project: Option<String>,
     },
+    #[command(about = "Link a child session to a parent")]
     Link {
-        #[arg(long)]
+        #[arg(long, help = "Harness identifier")]
         harness: String,
-        #[arg(long)]
+        #[arg(long, help = "Project identifier")]
         project: String,
-        #[arg(long)]
+        #[arg(long, help = "Child session identifier")]
         child: String,
-        #[arg(long)]
+        #[arg(long, help = "Parent session identifier")]
         parent: String,
-        #[arg(long)]
+        #[arg(long, help = "Child session title")]
         title: Option<String>,
-        #[arg(long, value_enum)]
+        #[arg(long, value_enum, help = "Child session retention mode")]
         retention: Option<RetentionArg>,
     },
+    #[command(about = "Show session ancestors")]
     Lineage {
-        #[arg(long)]
+        #[arg(long, help = "Harness identifier")]
         harness: String,
-        #[arg(long)]
+        #[arg(long, help = "Session identifier")]
         session: String,
     },
 }
@@ -151,54 +174,65 @@ impl From<KindArg> for Kind {
 
 #[derive(Debug, Args)]
 struct SearchArgs {
+    #[arg(help = "Search query")]
     query: String,
-    #[arg(long)]
+    #[arg(long, help = "Harness identifier")]
     harness: String,
-    #[arg(long)]
+    #[arg(long, help = "Project identifier")]
     project: String,
-    #[arg(long)]
+    #[arg(long, help = "Session identifier")]
     session: String,
-    #[arg(long, value_enum, default_value = "lineage")]
+    #[arg(long, value_enum, default_value = "lineage", help = "Search scope")]
     scope: ScopeArg,
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 8, help = "Maximum number of results")]
     k: usize,
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, help = "Filter by memory kind")]
     kind: Vec<KindArg>,
 }
 
 #[derive(Debug, Args)]
 struct DigestArgs {
-    #[arg(long)]
+    #[arg(long, help = "Harness identifier")]
     harness: String,
-    #[arg(long)]
+    #[arg(long, help = "Project identifier")]
     project: String,
-    #[arg(long)]
+    #[arg(long, help = "Session identifier")]
     session: String,
-    #[arg(long)]
+    #[arg(long, help = "Digest character budget")]
     budget: Option<usize>,
 }
 
 #[derive(Debug, Args)]
 #[command(group(ArgGroup::new("target").required(true).args(["session", "lineage", "whole_project"])))]
 struct ForgetArgs {
-    #[arg(long)]
+    #[arg(long, help = "Harness identifier")]
     harness: String,
-    #[arg(long)]
+    #[arg(long, help = "Project identifier")]
     project: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "Forget one session")]
     session: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "Forget a session and its descendants")]
     lineage: Option<String>,
-    #[arg(long, requires = "project")]
+    #[arg(
+        long,
+        requires = "project",
+        help = "Forget all memories in the project"
+    )]
     whole_project: bool,
-    #[arg(long)]
+    #[arg(long, help = "Skip confirmation")]
     yes: bool,
 }
 
 #[derive(Debug, Args)]
 struct IngestArgs {
-    #[arg(long)]
+    #[arg(long, help = "Ingest JSON file, or - for stdin")]
     file: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct StatsResponse {
+    total: u64,
+    by_kind: std::collections::BTreeMap<String, u64>,
 }
 
 #[derive(Debug)]
@@ -515,17 +549,21 @@ fn render(command: &Command, body: &str) -> Result<String, CliError> {
             ))
         }
         Command::Stats(_) => {
-            let response: Value = parse_response(body)?;
-            match response {
-                Value::Object(counts) => Ok(counts
+            let response: StatsResponse = parse_response(body)?;
+            let width = response
+                .by_kind
+                .keys()
+                .map(|kind| kind.chars().count())
+                .max()
+                .unwrap_or(0);
+            let mut lines = vec![format!("total  {}", response.total)];
+            lines.extend(
+                response
+                    .by_kind
                     .iter()
-                    .map(|(kind, count)| format!("{kind}: {count}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")),
-                _ => Err(CliError::other(
-                    "invalid daemon response: expected stats object",
-                )),
-            }
+                    .map(|(kind, count)| format!("  {kind:<width$}  {count}")),
+            );
+            Ok(lines.join("\n"))
         }
     }
 }
@@ -580,6 +618,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use std::io::{BufRead, BufReader, Cursor};
     use std::net::TcpListener;
     use std::thread;
@@ -594,6 +633,78 @@ mod tests {
 
     fn body(request: &Request) -> Value {
         serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn help_describes_commands_and_arguments() {
+        fn assert_descriptions(command: &clap::Command) {
+            for argument in command.get_arguments() {
+                assert!(
+                    argument
+                        .get_help()
+                        .is_some_and(|help| !help.to_string().trim().is_empty()),
+                    "{}: {} has no help",
+                    command.get_name(),
+                    argument.get_id()
+                );
+            }
+            for subcommand in command.get_subcommands() {
+                assert!(
+                    subcommand
+                        .get_about()
+                        .is_some_and(|about| !about.to_string().trim().is_empty()),
+                    "{} has no description",
+                    subcommand.get_name()
+                );
+                assert_descriptions(subcommand);
+            }
+        }
+
+        let mut command = Cli::command();
+        let help = command.render_long_help().to_string();
+        for description in [
+            "Check daemon health",
+            "Show memory counts by kind",
+            "Manage sessions and lineage",
+            "Search stored memories",
+            "Show a session digest",
+            "Delete matching memories",
+            "Ingest transcript items",
+        ] {
+            assert!(help.contains(description), "missing {description}");
+        }
+        let sessions_help = command
+            .find_subcommand_mut("sessions")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        for description in [
+            "List registered sessions",
+            "Link a child session to a parent",
+            "Show session ancestors",
+        ] {
+            assert!(sessions_help.contains(description), "missing {description}");
+        }
+        assert_descriptions(&Cli::command());
+    }
+
+    #[test]
+    fn renders_sorted_stats_and_ignores_extra_fields() {
+        let cli = parse(&["stats", "--harness", "h"]);
+        let output = render(
+            &cli.command,
+            r#"{"total":12,"by_kind":{"user_request":6,"command":2,"assistant_note":4},"extra":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            output,
+            "total  12\n  assistant_note  4\n  command         2\n  user_request    6"
+        );
+        assert_eq!(
+            render(&cli.command, r#"{"total":0,"by_kind":{}}"#).unwrap(),
+            "total  0"
+        );
+        assert!(render(&cli.command, r#"{"total":0,"by_kind":[]}"#).is_err());
     }
 
     #[test]
