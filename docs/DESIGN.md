@@ -241,10 +241,13 @@ Harness ids: `opencode`, `claude-code`, `codex`, `agy`.
 - `SessionStart`: claim a pending continuation for `project-key(cwd)`; if claimed, print the `additionalContext` JSON with the framed digest (`<memento-continuation>` wrapper, reference data, not instructions).
 - `Stop`, `SessionEnd`: incremental import of `transcript_path`.
 - Any failure exits 0 with a message on stderr; hooks never block the harness.
+- Output contract: `SessionStart` prints the `hookSpecificOutput` JSON or nothing; `Stop` prints `{}` (Codex rejects plain text on `Stop`); `SessionEnd` prints nothing.
+- Codex specifics (developers.openai.com/codex/hooks, verified 2026-11-18): `~/.codex/hooks.json` (or `[hooks]` in `config.toml`), matcher groups `{ "matcher"?, "hooks": [{ "type": "command", "command", "timeout"?, "async"?, "additionalContextLimit"? }] }`; `SessionEnd` timeout is 1 s by default and at most 3 s, so imports run from `Stop` with `"async": true`; `SessionStart` sources `startup|resume|clear|compact|fork` (on `compact` the digest is re-injected); non-managed hooks need trust via `/hooks`, or `--dangerously-bypass-hook-trust` for scripted runs; default `additionalContext` spill threshold about 2500 tokens (`additionalContextLimit` raises it).
+- `memento install-hooks claude-code|codex [--project DIR | --user] [--dry-run]` prints or merges the hook entries, preserving existing configuration.
 
 ### MCP server
 
-`memento mcp --harness NAME` serves stdio MCP tools for harnesses without hooks (agy) and as an option for all: `memory_search { query, scope?, project?, session? }`, `memory_digest { project?, harness?, session? }`, `memory_continue { from_harness, from_session }` (claims nothing, returns the parent digest), and `memory_note { kind: decision|constraint|task|note, text, session? }` which stores an explicit note for harnesses whose transcripts cannot be imported (default session `<harness>-notes`, project from the server's cwd).
+`memento-mcp --harness NAME` (crate `memento-mcp`, `rmcp` 3.x) serves stdio MCP tools for harnesses without hooks (agy) and as an option for all: `memory_search { query, scope?, project?, session? }`, `memory_digest { project?, harness?, session? }`, `memory_continue { from_harness, from_session }` (claims nothing, returns the parent digest), and `memory_note { kind: decision|constraint|task|note, text, session? }` which stores an explicit note for harnesses whose transcripts cannot be imported (default session `<harness>-notes`, project from the server's cwd).
 
 ## Non-goals for v1
 
