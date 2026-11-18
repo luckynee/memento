@@ -563,7 +563,11 @@ fn render(command: &Command, body: &str) -> Result<String, CliError> {
                         "{:.3}  {}  {}  {}  {}  {}",
                         hit.score,
                         kind.as_str().unwrap_or("unknown"),
-                        hit.session,
+                        if hit.harness.is_empty() {
+                            hit.session.clone()
+                        } else {
+                            format!("{}/{}", hit.harness, hit.session)
+                        },
                         hit.ts,
                         hit.path.as_deref().unwrap_or("-"),
                         text
