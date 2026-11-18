@@ -34,9 +34,25 @@ Add the plugin to `~/.config/opencode/opencode.jsonc` (or a project `.opencode/o
 
 - Keep working; every finished step is ingested.
 - Switch models in the same session; the adapter serves the new model from a per-model snapshot.
-- New session continuing an old one: `/memento-continue <parentSessionID>`.
-- Inspect: `memento stats --harness opencode --project <id> --session <ses>` and `memento digest ...`.
-- Done with a session: `memento forget --harness opencode --project <id> --session <ses> --yes` (or `--lineage` to drop a continuation chain below it).
+- New session continuing an old one: `/memento-continue <harness>/<session>` (bare id = opencode).
+- Hand off to the next session in this project, any harness: `/memento-handoff [harness]` in OpenCode, or `memento continue --from <harness>/<session> [--to <harness>]` from a shell. The next session started in the project claims it on its first event or `SessionStart` hook.
+- Inspect: `memento stats --harness <h> --project <dir> --session <ses>`, `memento digest ...`, `memento sessions lineage --harness <h> --session <ses>`.
+- Done: `memento forget --harness <h> --project <dir> --session <ses> --yes`, `--lineage <ses>` (that session and its continuations, across harnesses), or `--whole-project` (every harness).
+
+The project key is the main checkout path (`memento project-key`), identical across harnesses.
+
+## Other harnesses
+
+| Harness | Writes memory | Reads memory | Setup |
+| --- | --- | --- | --- |
+| OpenCode | plugin (step/turn events) | digest after model switch, `memory_search`, continuation claim | plugin entry above |
+| Claude Code | `Stop`/`SessionEnd` hook imports the transcript | `SessionStart` hook injects a claimed continuation | `memento install-hooks claude-code --project DIR` (or `--user`) |
+| Codex | async `Stop` hook imports the rollout | `SessionStart` hook (also re-injects after compaction) | `memento install-hooks codex --project DIR` (or `--user`); trust the project (`codex --trust` or `/hooks`) |
+| agy | `memory_note` MCP tool | `memory_search`, `memory_digest`, `memory_continue` MCP tools | `agy mcp add memento -- /path/to/memento-mcp --harness agy` |
+
+Any harness can also run the CLI directly: `memento import claude-code|codex --transcript PATH` (incremental cursor), `memento search`, `memento digest`.
+
+Known limitation: when a model restates facts from the digest, the restatement is stored again ("memory echo"); duplicates rank together and are harmless for recall but grow the store.
 
 ## Jev
 
