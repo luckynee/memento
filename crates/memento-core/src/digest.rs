@@ -211,7 +211,7 @@ pub fn render_digest(input: &DigestInput, budget_chars: usize) -> DigestResponse
     let mut files: Vec<&Segment> = input
         .segments
         .iter()
-        .filter(|segment| segment.kind == Kind::FileChange && segment.path.is_some())
+        .filter(|segment| segment.kind == Kind::FileChange)
         .collect();
     files.sort_by(|left, right| {
         right
@@ -221,12 +221,14 @@ pub fn render_digest(input: &DigestInput, budget_chars: usize) -> DigestResponse
             .then_with(|| right.chunk_index.cmp(&left.chunk_index))
             .then_with(|| left.session.cmp(&right.session))
             .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.paths.cmp(&right.paths))
     });
     let mut seen = HashSet::new();
-    let file_items = files.into_iter().filter_map(|segment| {
-        let path = segment.path.as_deref()?;
-        seen.insert(path).then(|| list_item(path))
-    });
+    let file_items = files
+        .into_iter()
+        .flat_map(|segment| segment.paths.iter())
+        .filter(|path| seen.insert(*path))
+        .map(|path| list_item(path));
     let budget = budgets[3] + carry;
     let (used, count) = append_list_section(&mut text, "Files changed", file_items, budget, false);
     rendered += count;
@@ -271,6 +273,7 @@ mod tests {
                 + Duration::seconds(seconds),
             tool: None,
             path: None,
+            paths: Vec::new(),
         }
     }
 
@@ -295,6 +298,7 @@ mod tests {
     fn renders_all_sections_in_order_and_omits_empty_ones() {
         let mut file = segment(Kind::FileChange, "f", 4, "edit");
         file.path = Some("src/a.rs".into());
+        file.paths = vec!["src/a.rs".into()];
         let digest = render_digest(
             &input(vec![
                 segment(Kind::Decision, "d", 1, "choose\nthis"),
@@ -313,6 +317,31 @@ mod tests {
         let empty = render_digest(&input(vec![]), 1000);
         assert!(!empty.text.contains("##"));
         assert_eq!(empty.segments, 0);
+    }
+
+    #[test]
+    fn file_paths_are_distinct_and_ordered_by_latest_change() {
+        let mut old = segment(Kind::FileChange, "old", 0, "edit");
+        old.path = Some("src/old.rs".into());
+        old.paths = vec!["src/old.rs".into(), "src/shared.rs".into()];
+        let mut new = segment(Kind::FileChange, "new", 1, "apply_patch");
+        new.path = Some("src/invoice_worker.rs".into());
+        new.paths = vec![
+            "src/invoice_worker.rs".into(),
+            "src/lib.rs".into(),
+            "src/shared.rs".into(),
+        ];
+        let mut second_chunk = new.clone();
+        second_chunk.chunk_index = 1;
+        let data = input(vec![old, new, second_chunk]);
+        let digest = render_digest(&data, 1000);
+        assert!(digest.text.contains(
+            "## Files changed\n- src/invoice_worker.rs\n- src/lib.rs\n- src/shared.rs\n- src/old.rs\n"
+        ));
+        assert_eq!(digest.segments, 4);
+        let mut reversed = data;
+        reversed.segments.reverse();
+        assert_eq!(digest, render_digest(&reversed, 1000));
     }
 
     #[test]

@@ -54,6 +54,7 @@ async fn run_test(store: &Store) -> anyhow::Result<()> {
         ts: "2026-11-18T10:00:00Z".parse().unwrap(),
         tool: Some("read".into()),
         path: None,
+        paths: Vec::new(),
     };
     let lexical = segment("lexical", "s1", "read src/segment.rs");
     let semantic = segment("semantic", "s2", "semantic memory vector embedding");

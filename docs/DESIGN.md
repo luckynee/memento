@@ -88,7 +88,7 @@ Raw transcripts are not indexed. Tool output dominates coding sessions and file 
 | --- | --- | --- |
 | user text | `user_request` | full text, chunked |
 | assistant text | `kind_hint` if valid (`decision`, `constraint`, `task`), else `assistant_note` | full text, chunked |
-| tool in edit set (`edit`, `write`, `patch`, `apply_patch`, `multiedit`) | `file_change` | `<tool> <paths>` plus input/diff truncated to 2000 chars |
+| tool in edit set (`edit`, `write`, `patch`, `apply_patch`, `multiedit`) | `file_change` | `<tool> <paths>` plus rendered body truncated to 2000 chars |
 | tool in shell set (`bash`, `shell`) | `command` | command line plus output tail: last 1000 chars when `ok == false`, last 400 chars when `ok == true` |
 | tool in read set (`read`, `grep`, `glob`, `list`, `webfetch`, `websearch`) | `file_ref` | `<tool> <path or pattern>` only, no output |
 | todo tools (`todowrite`) | `task` | rendered todo list |
@@ -96,7 +96,8 @@ Raw transcripts are not indexed. Tool output dominates coding sessions and file 
 | any other tool (MCP, LSP, unknown) | dropped by default | configurable through `SegmentPolicy` |
 
 - Chunking: max 1000 chars, 150 char overlap, split on paragraph, then line, then whitespace boundaries. BGE-small-en-v1.5 truncates input at 512 tokens and code tokenizes densely, so chunks stay well under that limit. Every segment kind is chunked, including `file_change` and `command` text.
-- Path is taken from input keys `filePath`, `path`, `file`, `pattern` (first present); `webfetch` uses `url`, `websearch` uses `query`. For patch-style input (`patch`, `patchText`, `diff`, or `input` string) paths are parsed from `*** Add File: `, `*** Update File: `, `*** Delete File: `, `*** Move to: ` and `+++ b/` lines; multiple paths are joined with `, ` in text and the first path is stored in `path`.
+- Path is taken from input keys `filePath`, `path`, `file`, `pattern` (first present); `webfetch` uses `url`, `websearch` uses `query`. For patch-style input (`patch`, `patchText`, `diff`, or `input` string) paths are parsed from `*** Add File: `, `*** Update File: `, `*** Delete File: `, `*** Move to: ` and `+++ b/` lines. The deduplicated paths are stored in first-seen order in `paths`, joined with `, ` in file-change text, and the first path is stored in `path`.
+- A file-change body uses the first string in `patchText`, `patch`, `diff`, `input` order; otherwise, if both `oldString` and `newString` are strings, it renders `--- old`, the old string, `+++ new`, and the new string on separate lines. Otherwise it uses a `content` string or compact JSON as a fallback. The body is truncated before chunking.
 - Point id: UUIDv5 over `harness/session/source_id/chunk_index`, so re-ingest is idempotent.
 - Empty segments are skipped.
 
@@ -106,8 +107,8 @@ Collection `memento_segments`:
 
 - named dense vector `dense`: 384, cosine.
 - named sparse vector `bm25`: `Modifier::Idf`, filled server-side with `Document { model: "qdrant/bm25" }`.
-- payload: `harness`, `project`, `session`, `kind`, `text`, `source_id`, `chunk_index`, `ts` (RFC 3339), `tool` (optional), `path` (optional).
-- keyword indexes: `project` (`is_tenant = true`), `harness`, `session`, `kind`, `path`; datetime index on `ts`.
+- payload: `harness`, `project`, `session`, `kind`, `text`, `source_id`, `chunk_index`, `ts` (RFC 3339), `tool` (optional), `path` (optional), `paths` (keyword array). Old points without `paths` fall back to their `path`.
+- keyword indexes: `project` (`is_tenant = true`), `harness`, `session`, `kind`, `path`, `paths`; datetime index on `ts`.
 
 Collection `memento_sessions` (registry): payload-only points if the Rust client supports a collection without vectors, otherwise a 1-dim dummy dense vector. Point id: UUIDv5 over `harness/session`.
 
@@ -124,7 +125,7 @@ Lineage terms:
 Search:
 
 1. Qdrant query: prefetch dense (limit 50) and bm25 (limit 50), both under the scope filter and optional `kinds` filter, fused with RRF at the top level with an explicit `limit` of 50. No formula query: RRF scores are sums of `1/(k + rank)` and Qdrant's docs warn that an unweighted decay term dominates them.
-2. Rerank in Rust (pure, unit-tested): `normalized = rrf_score / max_rrf_score`, `final = normalized + recency_weight * exp(-ln2 * age / half_life)` where age is measured against the newest `ts` in the candidate set (not wall clock, so results are reproducible), defaults `recency_weight = 0.15`, `half_life = 24h`. Ties break on `(ts desc, source_id, chunk_index)`. Return top `k` (default 8, max 50).
+2. Rerank in Rust (pure, unit-tested): `normalized = rrf_score / max_rrf_score`, `final = normalized + recency_weight * exp(-ln2 * age / half_life) + exact_match_bonus` where age is measured against the newest `ts` in the candidate set (not wall clock, so results are reproducible), defaults `recency_weight = 0.15`, `half_life = 24h`. The default exact-match bonus of 0.5 applies only when the query has identifier-like whitespace-separated tokens and every such token occurs as a case-sensitive substring of the candidate text or first path. Surrounding punctuation is trimmed; identifiers contain `_`, `.`, `/`, `::`, or `-` between alphanumerics, mixed letters and digits, or a lowercase-to-uppercase transition. Ties break on `(ts desc, source_id, chunk_index)`. Return top `k` (default 8, max 50).
 
 ## Digest
 
@@ -136,7 +137,7 @@ Search:
 | Constraints and decisions | 35% | newest entries that fit | chronological |
 | Current tasks | 10% | latest `task` entry only | as stored |
 | User requests | 35% | newest entries that fit; an entry longer than 1500 chars is truncated deterministically | chronological |
-| Files changed | 10% | distinct paths from `file_change`, newest first | newest first |
+| Files changed | 10% | distinct paths across all `file_change` `paths`, newest change first | newest first, preserving path order within a change |
 | Recent notes | 10% | newest `assistant_note` entries that fit | chronological |
 
 Identical stored data yields byte-identical output, which keeps the injected prefix cacheable.

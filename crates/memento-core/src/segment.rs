@@ -58,6 +58,7 @@ pub struct Segment {
     pub ts: DateTime<Utc>,
     pub tool: Option<String>,
     pub path: Option<String>,
+    pub paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -105,6 +106,7 @@ pub fn segment_items(request: &IngestRequest, policy: &SegmentPolicy) -> Segment
                 ts: item.ts,
                 tool: rendered.tool.clone(),
                 path: rendered.path.clone(),
+                paths: rendered.paths.clone(),
             });
         }
     }
@@ -116,6 +118,7 @@ struct RenderedItem {
     text: String,
     tool: Option<String>,
     path: Option<String>,
+    paths: Vec<String>,
 }
 
 fn render_item(item: &IngestItem, policy: &SegmentPolicy) -> Option<RenderedItem> {
@@ -125,6 +128,7 @@ fn render_item(item: &IngestItem, policy: &SegmentPolicy) -> Option<RenderedItem
             text: item.text.clone(),
             tool: None,
             path: None,
+            paths: Vec::new(),
         }),
         Role::Assistant => Some(RenderedItem {
             kind: match item.kind_hint {
@@ -134,6 +138,7 @@ fn render_item(item: &IngestItem, policy: &SegmentPolicy) -> Option<RenderedItem
             text: item.text.clone(),
             tool: None,
             path: None,
+            paths: Vec::new(),
         }),
         Role::Tool => render_tool(item.tool.as_ref()?, policy),
     }
@@ -144,7 +149,7 @@ fn render_tool(tool: &ToolCall, policy: &SegmentPolicy) -> Option<RenderedItem> 
     let paths = tool_paths(&name, &tool.input);
     let path = paths.first().cloned();
     let (kind, text) = if policy.edit_tools.contains(&name) {
-        let input = truncate_prefix(&tool.input.to_string(), policy.edit_input_max_chars);
+        let input = truncate_prefix(&render_edit_body(&tool.input), policy.edit_input_max_chars);
         (
             Kind::FileChange,
             format!("{} {}\n{}", tool.name, paths.join(", "), input),
@@ -217,7 +222,27 @@ fn render_tool(tool: &ToolCall, policy: &SegmentPolicy) -> Option<RenderedItem> 
         text,
         tool: Some(tool.name.clone()),
         path,
+        paths,
     })
+}
+
+fn render_edit_body(input: &Value) -> String {
+    if let Some(patch) = ["patchText", "patch", "diff", "input"]
+        .iter()
+        .find_map(|key| input.get(key).and_then(Value::as_str))
+    {
+        return patch.to_owned();
+    }
+    if let (Some(old), Some(new)) = (
+        input.get("oldString").and_then(Value::as_str),
+        input.get("newString").and_then(Value::as_str),
+    ) {
+        return format!("--- old\n{old}\n+++ new\n{new}");
+    }
+    if let Some(content) = input.get("content").and_then(Value::as_str) {
+        return content.to_owned();
+    }
+    input.to_string()
 }
 
 fn tool_paths(name: &str, input: &Value) -> Vec<String> {
@@ -355,7 +380,7 @@ mod tests {
             let outcome = run(
                 vec![tool_item(
                     name,
-                    json!({"filePath": "é.rs", "path": "other", "diff": "🙂🙂🙂"}),
+                    json!({"filePath": "é.rs", "path": "other", "diff": "🙂🙂🙂🙂🙂🙂🙂🙂🙂"}),
                     Some("ignored"),
                     true,
                 )],
@@ -474,6 +499,10 @@ mod tests {
             );
             let segment = &outcome.segments[0];
             assert_eq!(segment.path.as_deref(), Some("src/a.rs"));
+            assert_eq!(
+                segment.paths,
+                ["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"]
+            );
             assert!(
                 segment
                     .text
@@ -490,11 +519,51 @@ mod tests {
             &SegmentPolicy::default(),
         );
         assert_eq!(outcome.segments[0].path.as_deref(), Some("explicit"));
+        assert_eq!(outcome.segments[0].paths, ["explicit", "unified.rs"]);
         assert!(
             outcome.segments[0]
                 .text
                 .starts_with("patch explicit, unified.rs\n")
         );
+    }
+
+    #[test]
+    fn file_change_bodies_render_raw_inputs_and_fallback_json() {
+        let policy = SegmentPolicy::default();
+        for key in ["patchText", "patch", "diff", "input"] {
+            let outcome = run(
+                vec![tool_item(
+                    "patch",
+                    json!({key: "line 1\nline 2"}),
+                    None,
+                    true,
+                )],
+                &policy,
+            );
+            assert_eq!(outcome.segments[0].text, "patch \nline 1\nline 2");
+        }
+        let cases = [
+            (
+                json!({"path": "a", "oldString": "before\nold", "newString": "after\nnew"}),
+                "edit a\n--- old\nbefore\nold\n+++ new\nafter\nnew",
+            ),
+            (
+                json!({"path": "a", "content": "first\nsecond"}),
+                "edit a\nfirst\nsecond",
+            ),
+            (
+                json!({"path": "a", "other": 42}),
+                "edit a\n{\"other\":42,\"path\":\"a\"}",
+            ),
+            (
+                json!({"path": "a", "patch": "patch", "patchText": "preferred", "content": "ignored"}),
+                "edit a\npreferred",
+            ),
+        ];
+        for (input, expected) in cases {
+            let outcome = run(vec![tool_item("edit", input, None, true)], &policy);
+            assert_eq!(outcome.segments[0].text, expected);
+        }
     }
 
     #[test]

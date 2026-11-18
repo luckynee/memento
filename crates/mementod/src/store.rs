@@ -114,7 +114,7 @@ impl Store {
                 .await
                 .context("creating session collection")?;
         }
-        for field in ["project", "harness", "session", "kind", "path"] {
+        for field in ["project", "harness", "session", "kind", "path", "paths"] {
             let mut request = CreateFieldIndexCollectionBuilder::new(
                 &self.segments_collection,
                 field,
@@ -423,6 +423,8 @@ struct SegmentPayload {
     ts: chrono::DateTime<chrono::Utc>,
     tool: Option<String>,
     path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    paths: Option<Vec<String>>,
 }
 
 fn segment_payload(segment: &Segment) -> Result<Payload> {
@@ -437,6 +439,7 @@ fn segment_payload(segment: &Segment) -> Result<Payload> {
         ts: segment.ts,
         tool: segment.tool.clone(),
         path: segment.path.clone(),
+        paths: Some(segment.paths.clone()),
     };
     Payload::try_from(serde_json::to_value(payload).context("serializing segment")?)
         .context("encoding segment payload")
@@ -455,6 +458,9 @@ fn segment_from_payload(
     let payload: SegmentPayload = Payload::from(payload)
         .deserialize()
         .context("decoding segment payload")?;
+    let paths = payload
+        .paths
+        .unwrap_or_else(|| payload.path.iter().cloned().collect());
     Ok(Segment {
         id,
         harness: payload.harness,
@@ -467,6 +473,7 @@ fn segment_from_payload(
         ts: payload.ts,
         tool: payload.tool,
         path: payload.path,
+        paths,
     })
 }
 
@@ -488,6 +495,7 @@ mod tests {
             ts: "2026-11-18T10:00:00Z".parse().unwrap(),
             tool: Some("edit".into()),
             path: Some("segment.rs".into()),
+            paths: vec!["segment.rs".into(), "other.rs".into()],
         };
         assert_eq!(
             segment,
@@ -497,6 +505,18 @@ mod tests {
             )
             .unwrap()
         );
+        let mut legacy_payload: HashMap<_, _> = segment_payload(&segment).unwrap().into();
+        legacy_payload.remove("paths");
+        let legacy =
+            segment_from_payload(Some(segment.id.to_string().into()), legacy_payload).unwrap();
+        assert_eq!(legacy.path.as_deref(), Some("segment.rs"));
+        assert_eq!(legacy.paths, ["segment.rs"]);
+        let mut no_path_payload: HashMap<_, _> = segment_payload(&segment).unwrap().into();
+        no_path_payload.remove("paths");
+        no_path_payload.remove("path");
+        let no_path =
+            segment_from_payload(Some(segment.id.to_string().into()), no_path_payload).unwrap();
+        assert!(no_path.paths.is_empty());
     }
 
     #[test]

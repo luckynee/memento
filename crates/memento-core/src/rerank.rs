@@ -13,6 +13,7 @@ pub struct Candidate {
 pub struct RerankConfig {
     pub recency_weight: f32,
     pub half_life: Duration,
+    pub exact_match_bonus: f32,
 }
 
 impl Default for RerankConfig {
@@ -20,11 +21,22 @@ impl Default for RerankConfig {
         Self {
             recency_weight: 0.15,
             half_life: Duration::hours(24),
+            exact_match_bonus: 0.5,
         }
     }
 }
 
-pub fn rerank(candidates: Vec<Candidate>, config: &RerankConfig, k: usize) -> Vec<SearchHit> {
+pub fn rerank(
+    query: &str,
+    candidates: Vec<Candidate>,
+    config: &RerankConfig,
+    k: usize,
+) -> Vec<SearchHit> {
+    let identifiers: Vec<&str> = query
+        .split_whitespace()
+        .map(|token| token.trim_matches(|ch: char| !ch.is_alphanumeric()))
+        .filter(|token| is_identifier(token))
+        .collect();
     let Some(newest) = candidates
         .iter()
         .map(|candidate| candidate.segment.ts)
@@ -56,8 +68,22 @@ pub fn rerank(candidates: Vec<Candidate>, config: &RerankConfig, k: usize) -> Ve
             } else {
                 0.0
             };
+            let exact_match = !identifiers.is_empty()
+                && identifiers.iter().all(|identifier| {
+                    candidate.segment.text.contains(identifier)
+                        || candidate
+                            .segment
+                            .path
+                            .as_deref()
+                            .is_some_and(|path| path.contains(identifier))
+                });
+            let bonus = if exact_match {
+                config.exact_match_bonus
+            } else {
+                0.0
+            };
             (
-                normalized + config.recency_weight * decay,
+                normalized + config.recency_weight * decay + bonus,
                 candidate.segment,
             )
         })
@@ -87,6 +113,23 @@ pub fn rerank(candidates: Vec<Candidate>, config: &RerankConfig, k: usize) -> Ve
             path: segment.path,
         })
         .collect()
+}
+
+fn is_identifier(token: &str) -> bool {
+    let chars: Vec<char> = token.chars().collect();
+    let mixed_digits =
+        chars.iter().any(|ch| ch.is_alphabetic()) && chars.iter().any(|ch| ch.is_numeric());
+    let camel_case = chars
+        .windows(2)
+        .any(|pair| pair[0].is_lowercase() && pair[1].is_uppercase());
+    let separated = chars.windows(3).any(|part| {
+        part[0].is_alphanumeric()
+            && matches!(part[1], '_' | '.' | '/' | '-')
+            && part[2].is_alphanumeric()
+    }) || chars.windows(4).any(|part| {
+        part[0].is_alphanumeric() && part[1] == ':' && part[2] == ':' && part[3].is_alphanumeric()
+    });
+    mixed_digits || camel_case || separated
 }
 
 fn kind_order(kind: Kind) -> u8 {
@@ -125,6 +168,7 @@ mod tests {
                     + Duration::hours(hours),
                 tool: None,
                 path: None,
+                paths: Vec::new(),
             },
             fused_score: score,
         }
@@ -133,6 +177,7 @@ mod tests {
     #[test]
     fn normalization_and_recency_use_newest_candidate() {
         let hits = rerank(
+            "search",
             vec![candidate("old", 0, 2.0), candidate("new", 24, 1.0)],
             &RerankConfig::default(),
             10,
@@ -153,21 +198,22 @@ mod tests {
             candidate("a", 1, 1.0),
             candidate("old", 0, 1.0),
         ];
-        let hits = rerank(candidates.clone(), &config, 2);
+        let hits = rerank("search", candidates.clone(), &config, 2);
         assert_eq!(
             hits.iter().map(|hit| hit.text.as_str()).collect::<Vec<_>>(),
             ["a", "b"]
         );
         let mut reversed = candidates;
         reversed.reverse();
-        assert_eq!(hits, rerank(reversed, &config, 2));
-        assert!(rerank(Vec::new(), &config, 3).is_empty());
-        assert!(rerank(vec![candidate("a", 0, 1.0)], &config, 0).is_empty());
+        assert_eq!(hits, rerank("search", reversed, &config, 2));
+        assert!(rerank("search", Vec::new(), &config, 3).is_empty());
+        assert!(rerank("search", vec![candidate("a", 0, 1.0)], &config, 0).is_empty());
     }
 
     #[test]
     fn zero_scores_only_get_recency() {
         let hits = rerank(
+            "search",
             vec![candidate("old", 0, 0.0), candidate("new", 24, 0.0)],
             &RerankConfig::default(),
             2,
@@ -175,5 +221,62 @@ mod tests {
         assert_eq!(hits[0].text, "new");
         assert!((hits[0].score - 0.15).abs() < 0.00001);
         assert!((hits[1].score - 0.075).abs() < 0.00001);
+    }
+
+    #[test]
+    fn exact_identifier_beats_newer_semantic_neighbour() {
+        let mut task = candidate("task", 24, 1.0);
+        task.segment.kind = Kind::Task;
+        task.segment.text = "fix retry deadline".into();
+        let mut command = candidate("command", 0, 1.0);
+        command.segment.kind = Kind::Command;
+        command.segment.text = "deadline_exceeded_in_retry_loop".into();
+        let hits = rerank(
+            "deadline_exceeded_in_retry_loop",
+            vec![task, command],
+            &RerankConfig::default(),
+            2,
+        );
+        assert_eq!(hits[0].kind, Kind::Command);
+        assert!((hits[0].score - 1.575).abs() < 0.00001);
+    }
+
+    #[test]
+    fn identifiers_require_all_case_sensitive_matches_in_text_or_path() {
+        let mut matched = candidate("match", 0, 1.0);
+        matched.segment.text = "run camelCase with item2 and mod::name".into();
+        matched.segment.path = Some("src/invoice-worker.rs".into());
+        let mut partial = matched.clone();
+        partial.segment.text = "run camelcase with item2 and mod::name".into();
+        let query = r#""camelCase", (src/invoice-worker.rs) item2 mod::name"#;
+        let hits = rerank(query, vec![partial, matched], &RerankConfig::default(), 2);
+        assert!((hits[0].score - 1.65).abs() < 0.00001);
+        assert!((hits[1].score - 1.15).abs() < 0.00001);
+        assert!(hits[0].text.contains("camelCase"));
+    }
+
+    #[test]
+    fn plain_queries_do_not_get_identifier_bonus() {
+        let hits = rerank(
+            "fix retry deadline 123",
+            vec![candidate("fix retry deadline 123", 0, 1.0)],
+            &RerankConfig::default(),
+            1,
+        );
+        assert!((hits[0].score - 1.15).abs() < 0.00001);
+        for token in ["hello", "123", "foo-", "-foo", "FOO", "foo:bar"] {
+            assert!(!is_identifier(token), "{token}");
+        }
+        for token in [
+            "foo_bar",
+            "foo.bar",
+            "foo/bar",
+            "foo::bar",
+            "foo-bar",
+            "foo2",
+            "camelCase",
+        ] {
+            assert!(is_identifier(token), "{token}");
+        }
     }
 }

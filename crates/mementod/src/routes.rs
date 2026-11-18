@@ -427,7 +427,7 @@ async fn search(
         })
         .collect();
     Ok(Json(SearchResponse {
-        hits: rerank(candidates, &state.app.rerank, request.k),
+        hits: rerank(&request.query, candidates, &state.app.rerank, request.k),
     }))
 }
 
