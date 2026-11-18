@@ -7,7 +7,6 @@ export function createMemorySearchTool(deps: {
     jevModel: JevModel;
     harness: string;
     project: string;
-    jevTimeoutMs?: number;
 }) {
     return {
         name: "memory_search",
@@ -50,30 +49,20 @@ export function createMemorySearchTool(deps: {
                 if (deps.decide) {
                     const decide = deps.decide;
                     const proseKinds = new Set(["user_request", "assistant_note", "decision", "constraint", "task"]);
-                    let timer: ReturnType<typeof setTimeout> | undefined;
                     try {
-                        const judgments = await Promise.race([
-                            Promise.all(hits.map(async (hit) => {
-                                if (!proseKinds.has(hit.kind)) {
-                                    return true;
-                                }
-                                const probability = await judgeRelevance(decide, deps.jevModel, query, hit.text);
-                                if (probability === undefined) {
-                                    throw new Error("Jev relevance judgment failed");
-                                }
-                                return probability >= 0.5;
-                            })),
-                            new Promise<never>((_, reject) => {
-                                timer = setTimeout(() => reject(new Error("Jev relevance judgment timed out")), deps.jevTimeoutMs ?? 3000);
-                            }),
-                        ]);
+                        const judgments = await Promise.all(hits.map(async (hit) => {
+                            if (!proseKinds.has(hit.kind)) {
+                                return true;
+                            }
+                            const probability = await judgeRelevance(decide, deps.jevModel, query, hit.text);
+                            if (probability === undefined) {
+                                throw new Error("Jev relevance judgment failed");
+                            }
+                            return probability >= 0.5;
+                        }));
                         hits = hits.filter((_, index) => judgments[index]);
                     } catch {
                         hits = result.hits;
-                    } finally {
-                        if (timer !== undefined) {
-                            clearTimeout(timer);
-                        }
                     }
                 }
                 hits = [...hits].sort((a, b) => b.score - a.score).slice(0, 6);

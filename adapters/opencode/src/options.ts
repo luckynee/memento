@@ -13,6 +13,8 @@ export function resolveOptions(raw: Record<string, unknown>) {
         ? raw.digestBudget : 12000;
     const tailCharBudget = typeof raw.tailCharBudget === "number" && Number.isInteger(raw.tailCharBudget) && raw.tailCharBudget > 0
         ? raw.tailCharBudget : 40000;
+    const jevCooldownMs = typeof raw.jevCooldownMs === "number" && Number.isSafeInteger(raw.jevCooldownMs) && raw.jevCooldownMs >= 0
+        ? raw.jevCooldownMs : 600000;
     return {
         url,
         token,
@@ -21,6 +23,7 @@ export function resolveOptions(raw: Record<string, unknown>) {
         digestBudget,
         enabled: typeof raw.enabled === "boolean" ? raw.enabled : true,
         jev: typeof raw.jev === "boolean" ? raw.jev : true,
+        jevCooldownMs,
         jevModel: parseJevModel(raw.jevModel),
         harness: typeof raw.harness === "string" && raw.harness.trim() ? raw.harness : "opencode",
     };

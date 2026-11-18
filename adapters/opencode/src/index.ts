@@ -2,7 +2,7 @@ import { Plugin } from "@opencode/plugin";
 import { MementoClient } from "./client";
 import { createContinueCommand } from "./commands";
 import { createIngestor } from "./ingest";
-import type { DecisionsFn } from "./jev";
+import { createJevGate, type DecisionsFn } from "./jev";
 import { resolveOptions } from "./options";
 import { createSwitchController } from "./switch-controller";
 import { createMemorySearchTool } from "./tools";
@@ -32,10 +32,14 @@ export default Plugin.define({
         }
         const project = ctx.location.project.id;
         const client = new MementoClient({ url: options.url, token: options.token });
-        const decide: DecisionsFn | undefined = options.jev
-            ? (input) => ctx.experimental.generate.decisions(input)
-            : undefined;
         const log = (message: string, error?: unknown) => console.warn("[memento] " + message, error ?? "");
+        const decide: DecisionsFn | undefined = options.jev
+            ? createJevGate({
+                decide: (input) => ctx.experimental.generate.decisions(input),
+                cooldownMs: options.jevCooldownMs,
+                log,
+            })
+            : undefined;
         const ingestor = createIngestor({
             client,
             storage: ctx.storage,

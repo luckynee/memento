@@ -17,6 +17,63 @@ export type DecisionsFn = (input: {
     questions: Question[];
 }) => Promise<{ answers: ReadonlyArray<Answer> }>;
 
+export function createJevGate(deps: {
+    decide: DecisionsFn;
+    cooldownMs: number;
+    log(message: string): void;
+    now?: () => number;
+    timeoutMs?: number;
+    scheduleTimeout?: (callback: () => void, delay: number) => () => void;
+}) {
+    const now = deps.now ?? Date.now;
+    const scheduleTimeout = deps.scheduleTimeout ?? ((callback, delay) => {
+        const timer = setTimeout(callback, delay);
+        return () => clearTimeout(timer);
+    });
+    let retryAt = 0;
+    let generation = 0;
+
+    const decide: DecisionsFn = async (input) => {
+        if (now() < retryAt) {
+            throw new Error("Jev cooldown active");
+        }
+        const callGeneration = generation;
+        let cancelTimeout: (() => void) | undefined;
+        try {
+            const result = await Promise.race([
+                deps.decide(input),
+                new Promise<never>((_, reject) => {
+                    cancelTimeout = scheduleTimeout(() => reject(new Error("Jev request timed out")), deps.timeoutMs ?? 3000);
+                }),
+            ]);
+            const errors = result.answers.filter((answer) => answer.type === "error");
+            if (input.questions.length > 0 && input.questions.every((question) => errors.some((answer) => answer.name === question.name))) {
+                const error = errors[0];
+                throw new Error(error.message ?? error.reason);
+            }
+            if (callGeneration === generation) {
+                retryAt = 0;
+            }
+            return result;
+        } catch (error) {
+            if (callGeneration === generation) {
+                retryAt = now() + deps.cooldownMs;
+                generation++;
+                const message = error instanceof Error ? error.message : String(error);
+                const safeMessage = message
+                    .replace(/\bBearer\s+\S+/gi, "Bearer [redacted]")
+                    .replace(/\b(api[_-]?key|token|secret|password|authorization)\b\s*[:=]\s*["']?[^\s,"']+/gi, "$1=[redacted]")
+                    .replace(/\b(sk|pk|key|token)[-_][a-z0-9_-]{8,}\b/gi, "[redacted]");
+                deps.log(`Jev cooldown started: ${safeMessage}`);
+            }
+            throw error;
+        } finally {
+            cancelTimeout?.();
+        }
+    };
+    return decide;
+}
+
 export function parseJevModel(option: unknown): JevModel {
     if (typeof option === "string") {
         const parts = option.split("/");

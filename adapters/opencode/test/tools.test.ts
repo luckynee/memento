@@ -15,11 +15,11 @@ const hits: SearchHit[] = [
 ];
 const context = { sessionID: "s", signal: new AbortController().signal };
 
-function setup(decide?: DecisionsFn, jevTimeoutMs?: number) {
+function setup(decide?: DecisionsFn) {
     const calls: unknown[] = [];
     const tool = createMemorySearchTool({
         client: { async search(payload, signal) { calls.push({ payload, signal }); return { hits }; } },
-        decide, jevModel: DEFAULT_JEV_MODEL, harness: "opencode", project: "p", jevTimeoutMs,
+        decide, jevModel: DEFAULT_JEV_MODEL, harness: "opencode", project: "p",
     });
     return { tool, calls };
 }
@@ -55,13 +55,6 @@ describe("memory search", () => {
             expect(result.content).toContain("\nkeep");
             expect(result.content).not.toContain("\nreject");
         }
-    });
-
-    test("falls back on whole-phase timeout", async () => {
-        const fake = setup(async () => new Promise(() => {}), 5);
-        const result = await fake.tool.execute({ query: "q" }, context);
-        expect(result.content).toContain("\nfile");
-        expect(result.content).toContain("Found 6 memories");
     });
 
     test("validates input and reports daemon errors", async () => {
