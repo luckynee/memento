@@ -148,6 +148,21 @@ pub(crate) fn strip_scaffolding(text: &str, policy: &SegmentPolicy) -> String {
     }
 }
 
+pub fn strip_default_scaffolding(text: &str) -> String {
+    strip_scaffolding(text, &SegmentPolicy::default())
+}
+
+pub(crate) fn command_exit_header(line: &str) -> Option<&str> {
+    let line = line.trim();
+    if line == "Exit status: failed" {
+        return Some(line);
+    }
+    let value = line
+        .strip_prefix("Process exited with code ")
+        .or_else(|| line.strip_prefix("Exit code:"))?;
+    value.trim().parse::<i64>().ok().map(|_| line)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Segment {
     pub id: Uuid,
@@ -285,11 +300,27 @@ fn render_tool(tool: &ToolCall, policy: &SegmentPolicy) -> Option<RenderedItem> 
         } else {
             policy.failed_output_max_chars
         };
-        let output = tool
+        let original_output = tool.output.as_deref().unwrap_or_default();
+        let mut output = tool
             .output
             .as_deref()
             .map(|output| truncate_suffix(output, output_limit))
             .unwrap_or_default();
+        if !tool.ok
+            && !output
+                .lines()
+                .any(|line| command_exit_header(line).is_some())
+        {
+            let header = original_output
+                .lines()
+                .find_map(command_exit_header)
+                .unwrap_or("Exit status: failed");
+            output = if output.is_empty() {
+                header.to_string()
+            } else {
+                format!("{header}\n{output}")
+            };
+        }
         let text = if output.is_empty() {
             command.to_owned()
         } else if command.is_empty() {
@@ -562,7 +593,10 @@ mod tests {
                 )],
                 &policy,
             );
-            assert_eq!(failure.segments[0].text, "run\nabc...[truncated 3 chars]");
+            assert_eq!(
+                failure.segments[0].text,
+                "run\nExit status: failed\nabc...[truncated 3 chars]"
+            );
             for output in [None, Some("")] {
                 let outcome = run(
                     vec![tool_item(name, json!({"command": "run"}), output, true)],
@@ -571,6 +605,37 @@ mod tests {
                 assert_eq!(outcome.segments[0].text, "run");
             }
         }
+    }
+
+    #[test]
+    fn failed_commands_preserve_or_add_exit_status_after_truncation() {
+        let policy = SegmentPolicy {
+            failed_output_max_chars: 10,
+            ..SegmentPolicy::default()
+        };
+        for (output, expected) in [
+            (None, "run\nExit status: failed".to_string()),
+            (
+                Some("Exit code: 7\nlong output tail"),
+                "run\nExit code: 7\nutput tail...[truncated 19 chars]".to_string(),
+            ),
+        ] {
+            let outcome = run(
+                vec![tool_item("bash", json!({"command": "run"}), output, false)],
+                &policy,
+            );
+            assert_eq!(outcome.segments[0].text, expected);
+        }
+        let outcome = run(
+            vec![tool_item(
+                "bash",
+                json!({"command": "run"}),
+                Some("Exit code: 7"),
+                false,
+            )],
+            &SegmentPolicy::default(),
+        );
+        assert_eq!(outcome.segments[0].text, "run\nExit code: 7");
     }
 
     #[test]
