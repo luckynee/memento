@@ -6,19 +6,22 @@ pub fn chunk_text(text: &str, max_chars: usize, overlap_chars: usize) -> Vec<Str
     let chars: Vec<char> = text.chars().collect();
     let mut chunks = Vec::new();
     let mut start = 0;
+    let mut previous_end = 0;
 
     while start < chars.len() {
         let limit = (start + max_chars).min(chars.len());
         let end = if limit == chars.len() {
             limit
         } else {
-            preferred_boundary(&chars, start, limit)
+            preferred_boundary(&chars, start.max(previous_end), limit)
         };
+        previous_end = end;
         chunks.push(chars[start..end].iter().collect());
         if end == chars.len() {
             break;
         }
-        start = end.saturating_sub(overlap_chars).max(start + 1);
+        let overlap = overlap_chars.min((end - start) / 2);
+        start = (end - overlap).max(start + 1);
     }
 
     chunks
@@ -66,6 +69,26 @@ mod tests {
         assert_eq!(chunk_text("one\n\ntwo\nthree four", 14, 0)[0], "one\n\n");
         assert_eq!(chunk_text("one\ntwo three four", 10, 0)[0], "one\n");
         assert_eq!(chunk_text("one two three", 7, 0)[0], "one ");
+    }
+
+    #[test]
+    fn short_leading_paragraph_does_not_produce_sliding_duplicates() {
+        let text = format!(
+            "{}\n\n{}",
+            "intro sentence ".repeat(7),
+            (0..300)
+                .map(|index| format!("word{index} "))
+                .collect::<String>()
+        );
+        let chunks = chunk_text(&text, 1000, 150);
+        assert!(chunks.len() <= 5, "{} chunks", chunks.len());
+        assert!(chunks.last().unwrap().ends_with("word299 "));
+        let mut previous_end_offset = 0;
+        for chunk in &chunks {
+            let offset = text.find(chunk.as_str()).unwrap() + chunk.len();
+            assert!(offset > previous_end_offset);
+            previous_end_offset = offset;
+        }
     }
 
     #[test]
