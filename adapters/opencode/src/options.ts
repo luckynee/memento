@@ -22,6 +22,7 @@ export function resolveOptions(raw: Record<string, unknown>) {
         tailCharBudget,
         digestBudget,
         enabled: typeof raw.enabled === "boolean" ? raw.enabled : true,
+        reconcile: typeof raw.reconcile === "boolean" ? raw.reconcile : true,
         jev: typeof raw.jev === "boolean" ? raw.jev : true,
         jevCooldownMs,
         jevModel: parseJevModel(raw.jevModel),

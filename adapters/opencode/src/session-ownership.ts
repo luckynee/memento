@@ -1,12 +1,13 @@
 export function createSessionOwnership(deps: {
-    getSessionProjectID(sessionID: string): Promise<string>;
+    getSession(sessionID: string): Promise<{ projectID: string; parentID?: string }>;
     projectID: string;
     log(message: string, error?: unknown): void;
 }) {
-    const sessions = new Map<string, boolean>();
-    const pending = new Map<string, Promise<boolean>>();
+    type SessionOwnership = { owned: boolean; parentID?: string };
+    const sessions = new Map<string, SessionOwnership>();
+    const pending = new Map<string, Promise<SessionOwnership | undefined>>();
 
-    const ownsSession = async (sessionID: string): Promise<boolean> => {
+    const lookupSession = async (sessionID: string): Promise<SessionOwnership | undefined> => {
         const cached = sessions.get(sessionID);
         if (cached !== undefined) {
             sessions.delete(sessionID);
@@ -19,22 +20,25 @@ export function createSessionOwnership(deps: {
         }
         const lookup = Promise.resolve().then(async () => {
             try {
-                const projectID = await deps.getSessionProjectID(sessionID);
-                if (typeof projectID !== "string" || !projectID) {
+                const session = await deps.getSession(sessionID);
+                if (typeof session.projectID !== "string" || !session.projectID) {
                     throw new Error("Session project ID is missing");
                 }
-                const owned = projectID === deps.projectID;
+                if (session.parentID !== undefined && (typeof session.parentID !== "string" || !session.parentID)) {
+                    throw new Error("Session parent ID is invalid");
+                }
+                const ownership = { owned: session.projectID === deps.projectID, parentID: session.parentID };
                 if (pending.get(sessionID) === lookup) {
                     sessions.delete(sessionID);
-                    sessions.set(sessionID, owned);
+                    sessions.set(sessionID, ownership);
                     if (sessions.size > 64) {
                         sessions.delete(sessions.keys().next().value!);
                     }
                 }
-                return owned;
+                return ownership;
             } catch (error) {
                 deps.log(`Failed to determine project for session ${sessionID}`, error);
-                return false;
+                return undefined;
             }
         });
         pending.set(sessionID, lookup);
@@ -47,6 +51,28 @@ export function createSessionOwnership(deps: {
         }
     };
 
+    const ownsSession = async (sessionID: string): Promise<boolean> => {
+        const ownership = await lookupSession(sessionID);
+        return ownership?.owned === true && ownership.parentID === undefined;
+    };
+
+    ownsSession.lookup = lookupSession;
+    ownsSession.root = async (sessionID: string): Promise<string | undefined> => {
+        const visited = new Set<string>();
+        let current = sessionID;
+        while (visited.size < 64 && !visited.has(current)) {
+            visited.add(current);
+            const ownership = await lookupSession(current);
+            if (!ownership?.owned) {
+                return undefined;
+            }
+            if (ownership.parentID === undefined) {
+                return current;
+            }
+            current = ownership.parentID;
+        }
+        return undefined;
+    };
     ownsSession.forget = (sessionID: string): void => {
         sessions.delete(sessionID);
         pending.delete(sessionID);

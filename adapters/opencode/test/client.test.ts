@@ -25,6 +25,23 @@ describe("daemon client", () => {
         expect(url.searchParams.get("session")).toBe("x/y");
     });
 
+    test("lists sessions with encoded harness and project", async () => {
+        let request = "";
+        const client = new MementoClient({
+            fetch: (async (url) => {
+                request = String(url);
+                return Response.json({ sessions: [{ harness: "open/code", project: "a & b", session: "s" }] });
+            }) as typeof fetch,
+        });
+        expect(await client.listSessions("open/code", "a & b")).toEqual({
+            sessions: [{ harness: "open/code", project: "a & b", session: "s" }],
+        });
+        const url = new URL(request);
+        expect(url.pathname).toBe("/v1/sessions");
+        expect(url.searchParams.get("harness")).toBe("open/code");
+        expect(url.searchParams.get("project")).toBe("a & b");
+    });
+
     test("sends continuation requests and reads pair-based lineage", async () => {
         const calls: { path: string; method: string | undefined; body: unknown }[] = [];
         const fetcher = (async (url, init) => {

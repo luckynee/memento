@@ -28,7 +28,7 @@ test("step ended dispatches ingestion and cleanup stops the subscription", async
     }) as typeof fetch;
     const registration = () => ({ async dispose() {} });
     const ctx = {
-        options: { jev: false },
+        options: { jev: false, reconcile: false },
         location: { project: { id: "p" } },
         storage: {
             async get(key: string) { return values.get(key); },
@@ -93,7 +93,7 @@ test("foreign sessions cannot ingest, rewrite, compact, use commands, or search"
     }) as typeof fetch;
     const registration = () => ({ async dispose() {} });
     const ctx = {
-        options: { jev: false },
+        options: { jev: false, reconcile: false },
         location: { project: { id: "p" } },
         storage: {
             async get() { throw new Error("foreign session accessed storage"); },
@@ -177,7 +177,7 @@ test("deletion waits for ingest, releases without ownership lookup, and clears s
     }) as typeof fetch;
     const registration = () => ({ async dispose() {} });
     const ctx = {
-        options: { jev: false, harness: "custom" },
+        options: { jev: false, reconcile: false, harness: "custom" },
         location: { project: { id: "p", canonical: "/project" } },
         storage: {
             async get(key: string) { return values.get(key); },
@@ -256,7 +256,7 @@ test("release failure is logged and later events are processed", async () => {
     }) as typeof fetch;
     const registration = () => ({ async dispose() {} });
     const ctx = {
-        options: { jev: false },
+        options: { jev: false, reconcile: false },
         location: { project: { id: "p" } },
         storage: {
             async get(key: string) { return values.get(key); },
@@ -307,4 +307,211 @@ test("disabled plugin registers nothing", async () => {
     const cleanup = await plugin.setup(ctx);
     expect(typeof cleanup).toBe("function");
     if (cleanup) { await cleanup(); }
+});
+
+test("subagents skip session processing while search uses the root and forks remain enabled", async () => {
+    const values = new Map<string, unknown>();
+    const requests: { path: string; body: any }[] = [];
+    const hooks = new Map<string, (event: any) => Promise<void>>();
+    const commands = new Map<string, any>();
+    let tool: any;
+    let finished!: () => void;
+    const done = new Promise<void>((resolve) => { finished = resolve; });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url, init) => {
+        const path = new URL(String(url)).pathname;
+        requests.push({ path, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+        if (path === "/v1/continuations/claim") { return Response.json({ claimed: false }); }
+        if (path === "/v1/search") { return Response.json({ hits: [] }); }
+        return Response.json({});
+    }) as typeof fetch;
+    const registration = () => ({ async dispose() {} });
+    const ctx = {
+        options: { jev: false, reconcile: false },
+        location: { project: { id: "p" } },
+        storage: {
+            async get(key: string) { return values.get(key); },
+            async set(key: string, value: unknown) { values.set(key, value); },
+            async remove(key: string) { values.delete(key); },
+        },
+        session: {
+            async get({ sessionID }: { sessionID: string }) {
+                if (sessionID === "child") { return { projectID: "p", parentID: "middle" }; }
+                if (sessionID === "middle") { return { projectID: "p", parentID: "root" }; }
+                if (sessionID === "fork") { return { projectID: "p", fork: { sessionID: "root" }, time: { created: 1 } }; }
+                return { projectID: "p", time: { created: 0 } };
+            },
+            async context() { return []; },
+            async hook(name: string, handler: (event: any) => Promise<void>) { hooks.set(name, handler); return registration(); },
+            instructions: { entry: { async put() {} } },
+        },
+        tool: { async transform(callback: (editor: any) => void) { callback({ add(value: unknown) { tool = value; } }); return registration(); } },
+        command: { async transform(callback: (editor: any) => void) { callback({ add(value: any) { commands.set(value.name, value); } }); return registration(); } },
+        event: {
+            async *subscribe(input: { signal: AbortSignal }) {
+                yield { type: "session.step.ended", data: { sessionID: "child" } };
+                yield { type: "session.execution.succeeded", data: { sessionID: "child" } };
+                yield { type: "session.model.selected", data: { sessionID: "child", model: { providerID: "p", id: "m" } } };
+                finished();
+                if (!input.signal.aborted) {
+                    await new Promise<void>((resolve) => input.signal.addEventListener("abort", () => resolve(), { once: true }));
+                }
+            },
+        },
+    } as unknown as Plugin.Context;
+    let cleanup: void | (() => void | Promise<void>) = undefined;
+    try {
+        cleanup = await plugin.setup(ctx);
+        await done;
+        const context = { sessionID: "child", system: [], messages: [], model: { providerID: "p", id: "m" } };
+        const compaction = { ...context };
+        await hooks.get("context")!(context);
+        await hooks.get("compaction")!(compaction);
+        expect(context).toEqual({ sessionID: "child", system: [], messages: [], model: { providerID: "p", id: "m" } });
+        expect(compaction).toEqual(context);
+        expect(values.size).toBe(0);
+        expect(requests).toEqual([]);
+        for (const name of ["memento-continue", "memento-handoff"]) {
+            await expect(commands.get(name).execute({ sessionID: "child", prompt: { text: "parent" } })).rejects.toThrow("subagent");
+        }
+        await tool.execute({ query: "test" }, { sessionID: "child", signal: new AbortController().signal });
+        expect(requests).toEqual([{ path: "/v1/search", body: { harness: "opencode", project: "p", session: "root", query: "test", k: 12 } }]);
+        await hooks.get("context")!({ ...context, sessionID: "fork" });
+        expect(requests.some((request) => request.path === "/v1/sessions" && request.body?.parent === "root")).toBe(true);
+        expect(values.has("memento/registered/fork")).toBe(true);
+    } finally {
+        await cleanup?.();
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test("startup and periodic reconciliation release deleted sessions and subagents, then dispose the timer", async () => {
+    const keys = ["ingest", "registered", "fork", "claimed", "parent", "switch"];
+    const values = new Map<string, unknown>();
+    for (const session of ["missing", "tagged", "child", "unknown", "fork"]) {
+        for (const key of keys) { values.set(`memento/${key}/${session}`, true); }
+    }
+    const releases: any[] = [];
+    const requests: string[] = [];
+    let done!: () => void;
+    const completed = new Promise<void>((resolve) => { done = resolve; });
+    let periodic!: () => void;
+    let cleared: unknown;
+    const timer = {} as ReturnType<typeof setInterval>;
+    const originalFetch = globalThis.fetch;
+    const originalSetInterval = globalThis.setInterval;
+    const originalClearInterval = globalThis.clearInterval;
+    globalThis.setInterval = ((callback: () => void, delay: number) => {
+        expect(delay).toBe(24 * 60 * 60 * 1000);
+        periodic = callback;
+        return timer;
+    }) as typeof setInterval;
+    globalThis.clearInterval = ((handle: unknown) => { cleared = handle; }) as typeof clearInterval;
+    globalThis.fetch = (async (url, init) => {
+        const request = new URL(String(url));
+        requests.push(request.pathname);
+        if (request.pathname === "/v1/sessions") {
+            expect(request.searchParams.get("harness")).toBe("opencode");
+            expect(request.searchParams.get("project")).toBe("/project");
+            return Response.json({ sessions: ["missing", "tagged", "child", "unknown", "fork"].map((session) => ({ harness: "opencode", project: "/project", session })) });
+        }
+        if (request.pathname === "/v1/sessions/release") {
+            releases.push(JSON.parse(String(init?.body)));
+            return Response.json({ released: true, removed: [] });
+        }
+        return Response.json({});
+    }) as typeof fetch;
+    const registration = () => ({ async dispose() {} });
+    const ctx = {
+        options: { jev: false, harness: "custom" },
+        location: { project: { id: "p", canonical: "/project" } },
+        storage: {
+            async get(key: string) { return values.get(key); },
+            async set(key: string, value: unknown) { values.set(key, value); },
+            async remove(key: string) { values.delete(key); },
+        },
+        session: {
+            async get({ sessionID }: { sessionID: string }) {
+                if (sessionID === "missing") { throw new Error("Session.NotFoundError"); }
+                if (sessionID === "tagged") { throw { _tag: "SessionNotFoundError" }; }
+                if (sessionID === "unknown") { throw new Error("server unavailable"); }
+                if (sessionID === "child") { return { projectID: "p", parentID: "root" }; }
+                done();
+                return { projectID: "p", fork: { sessionID: "root" } };
+            },
+            async context() { return []; },
+            async hook() { return registration(); },
+            instructions: { entry: { async put() {} } },
+        },
+        tool: { async transform() { return registration(); } },
+        command: { async transform() { return registration(); } },
+        event: {
+            async *subscribe(input: { signal: AbortSignal }) {
+                if (!input.signal.aborted) {
+                    await new Promise<void>((resolve) => input.signal.addEventListener("abort", () => resolve(), { once: true }));
+                }
+            },
+        },
+    } as unknown as Plugin.Context;
+    let cleanup: void | (() => void | Promise<void>) = undefined;
+    try {
+        cleanup = await plugin.setup(ctx);
+        await completed;
+        expect(releases).toEqual([
+            { harness: "opencode", project: "/project", session: "missing", reason: "deleted" },
+            { harness: "opencode", project: "/project", session: "tagged", reason: "deleted" },
+            { harness: "opencode", project: "/project", session: "child", reason: "subagent" },
+        ]);
+        for (const session of ["missing", "tagged", "child"]) {
+            expect(keys.every((key) => !values.has(`memento/${key}/${session}`))).toBe(true);
+        }
+        for (const session of ["unknown", "fork"]) {
+            expect(keys.every((key) => values.has(`memento/${key}/${session}`))).toBe(true);
+        }
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        periodic();
+        await Promise.resolve();
+        expect(requests.filter((path) => path === "/v1/sessions")).toHaveLength(2);
+    } finally {
+        await cleanup?.();
+        expect(cleared).toBe(timer);
+        globalThis.fetch = originalFetch;
+        globalThis.setInterval = originalSetInterval;
+        globalThis.clearInterval = originalClearInterval;
+    }
+});
+
+test("disabled reconciliation creates no timer or startup request", async () => {
+    const originalFetch = globalThis.fetch;
+    const originalSetInterval = globalThis.setInterval;
+    let requests = 0;
+    let timers = 0;
+    globalThis.fetch = (async () => { requests++; return Response.json({ sessions: [] }); }) as unknown as typeof fetch;
+    globalThis.setInterval = ((..._args: unknown[]) => { timers++; return {} as ReturnType<typeof setInterval>; }) as unknown as typeof setInterval;
+    const registration = () => ({ async dispose() {} });
+    const ctx = {
+        options: { reconcile: false, jev: false },
+        location: { project: { id: "p" } },
+        storage: {},
+        session: { async hook() { return registration(); } },
+        tool: { async transform() { return registration(); } },
+        command: { async transform() { return registration(); } },
+        event: {
+            async *subscribe(input: { signal: AbortSignal }) {
+                if (!input.signal.aborted) {
+                    await new Promise<void>((resolve) => input.signal.addEventListener("abort", () => resolve(), { once: true }));
+                }
+            },
+        },
+    } as unknown as Plugin.Context;
+    let cleanup: void | (() => void | Promise<void>) = undefined;
+    try {
+        cleanup = await plugin.setup(ctx);
+        expect(requests).toBe(0);
+        expect(timers).toBe(0);
+    } finally {
+        await cleanup?.();
+        globalThis.fetch = originalFetch;
+        globalThis.setInterval = originalSetInterval;
+    }
 });

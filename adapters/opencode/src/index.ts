@@ -28,6 +28,11 @@ export function projectKey(project: { id: string; canonical?: unknown }): string
     return typeof project.canonical === "string" && project.canonical.length > 0 ? project.canonical : project.id;
 }
 
+function isSessionNotFound(error: unknown): boolean {
+    return Boolean(error && typeof error === "object" && "_tag" in error && error._tag === "SessionNotFoundError")
+        || String(error).includes("NotFoundError");
+}
+
 export default Plugin.define({
     id: "memento",
     async setup(ctx) {
@@ -39,7 +44,7 @@ export default Plugin.define({
         const client = new MementoClient({ url: options.url, token: options.token });
         const log = (message: string, error?: unknown) => console.warn("[memento] " + message, error ?? "");
         const ownsSession = createSessionOwnership({
-            getSessionProjectID: async (sessionID) => (await ctx.session.get({ sessionID })).projectID,
+            getSession: (sessionID) => ctx.session.get({ sessionID }),
             projectID: ctx.location.project.id,
             log,
         });
@@ -93,10 +98,11 @@ export default Plugin.define({
         const toolRegistration = await ctx.tool.transform((editor) => editor.add({
             ...tool,
             async execute(input, context) {
-                if (!await ownsSession(context.sessionID)) {
+                const sessionID = await ownsSession.root(context.sessionID);
+                if (!sessionID) {
                     return { content: "memory_search: memento is not enabled for this project." };
                 }
-                return tool.execute(input, context);
+                return tool.execute(input, { ...context, sessionID });
             },
         }));
         const commandRegistration = await ctx.command.transform((editor) => {
@@ -104,8 +110,12 @@ export default Plugin.define({
                 editor.add({
                     ...entry,
                     async execute(input) {
-                        if (!await ownsSession(input.sessionID)) {
+                        const ownership = await ownsSession.lookup(input.sessionID);
+                        if (!ownership?.owned) {
                             throw new Error("memento is not enabled for this project");
+                        }
+                        if (ownership.parentID !== undefined) {
+                            throw new Error(`${entry.name} is not available in subagent sessions`);
                         }
                         await entry.execute(input);
                     },
@@ -133,6 +143,65 @@ export default Plugin.define({
             await switchController.onCompaction(event);
         });
         const controller = new AbortController();
+        const releaseSession = async (sessionID: string, reason?: string, harness = options.harness) => {
+            try {
+                await switchController.forget(sessionID);
+                await ingestor.forget(sessionID);
+                await client.releaseSession({ harness, project, session: sessionID, ...(reason ? { reason } : {}) });
+            } catch (error) {
+                log(`Failed to release session ${sessionID}`, error);
+            } finally {
+                for (const key of ["ingest", "registered", "fork", "claimed", "parent", "switch"]) {
+                    try {
+                        await ctx.storage.remove(`memento/${key}/${sessionID}`);
+                    } catch (error) {
+                        log(`Failed to delete ${key} state for session ${sessionID}`, error);
+                    }
+                }
+                ownsSession.forget(sessionID);
+            }
+        };
+        const reconcileSessions = async () => {
+            try {
+                const { sessions } = await client.listSessions("opencode", project);
+                for (const session of sessions) {
+                    if (controller.signal.aborted) {
+                        return;
+                    }
+                    if (session.harness !== "opencode" || session.project !== project || typeof session.session !== "string") {
+                        continue;
+                    }
+                    let reason: string | undefined;
+                    try {
+                        const current = await ctx.session.get({ sessionID: session.session });
+                        if (current.projectID === ctx.location.project.id && current.parentID !== undefined) {
+                            reason = "subagent";
+                        }
+                    } catch (error) {
+                        if (isSessionNotFound(error)) {
+                            reason = "deleted";
+                        }
+                    }
+                    if (reason && !controller.signal.aborted) {
+                        await releaseSession(session.session, reason, "opencode");
+                    }
+                }
+            } catch (error) {
+                if (!controller.signal.aborted) {
+                    log("Failed to reconcile sessions", error);
+                }
+            }
+        };
+        let reconciliation: Promise<void> | undefined;
+        const startReconciliation = () => {
+            if (!reconciliation && !controller.signal.aborted) {
+                reconciliation = reconcileSessions().finally(() => { reconciliation = undefined; });
+            }
+        };
+        const reconcileTimer = options.reconcile ? setInterval(startReconciliation, 24 * 60 * 60 * 1000) : undefined;
+        if (options.reconcile) {
+            startReconciliation();
+        }
         const eventLoop = (async () => {
             while (!controller.signal.aborted) {
                 try {
@@ -142,22 +211,7 @@ export default Plugin.define({
                     })) {
                         if (event.type === "session.deleted") {
                             const sessionID = event.data.sessionID;
-                            try {
-                                await switchController.forget(sessionID);
-                                await ingestor.forget(sessionID);
-                                await client.releaseSession({ harness: options.harness, project, session: sessionID });
-                            } catch (error) {
-                                log(`Failed to release session ${sessionID}`, error);
-                            } finally {
-                                for (const key of ["ingest", "registered", "fork", "claimed", "parent", "switch"]) {
-                                    try {
-                                        await ctx.storage.remove(`memento/${key}/${sessionID}`);
-                                    } catch (error) {
-                                        log(`Failed to delete ${key} state for session ${sessionID}`, error);
-                                    }
-                                }
-                                ownsSession.forget(sessionID);
-                            }
+                            await releaseSession(sessionID);
                             continue;
                         }
                         if (!await ownsSession(event.data.sessionID)) {
@@ -183,8 +237,12 @@ export default Plugin.define({
         })();
         return async () => {
             controller.abort();
+            if (reconcileTimer !== undefined) {
+                clearInterval(reconcileTimer);
+            }
             const disposals = Promise.allSettled([hookRegistration.dispose(), compactionRegistration.dispose(), toolRegistration.dispose(), commandRegistration.dispose()]);
             await eventLoop;
+            await reconciliation;
             await ingestor.idle();
             const results = await disposals;
             const failure = results.find((result) => result.status === "rejected");

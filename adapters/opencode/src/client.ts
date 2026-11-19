@@ -117,7 +117,12 @@ export class MementoClient {
         return this.request("/v1/sessions", "PUT", payload);
     }
 
-    releaseSession(payload: SessionIdentity): Promise<{ released: boolean; removed: { harness: string; session: string }[] }> {
+    listSessions(harness: string, project: string): Promise<{ sessions: SessionIdentity[] }> {
+        const query = new URLSearchParams({ harness, project });
+        return this.request(`/v1/sessions?${query}`, "GET");
+    }
+
+    releaseSession(payload: SessionIdentity & { reason?: string }): Promise<{ released: boolean; removed: { harness: string; session: string }[] }> {
         return this.request("/v1/sessions/release", "POST", payload);
     }
 
