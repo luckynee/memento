@@ -380,6 +380,71 @@ async fn regression_workflow(address: &str, store: &Store) {
         .1["segments"],
         1
     );
+    let unlinked = call(
+        "POST",
+        "/v1/ingest",
+        content("dedupe", "unlinked", "unlinked-source", phrase),
+    )
+    .await;
+    assert_eq!(unlinked.0, 200);
+    assert_eq!(unlinked.1["segments"], 1);
+    assert_eq!(unlinked.1["duplicates"], 0);
+    let unlinked_digest = call(
+        "GET",
+        "/v1/digest?harness=reg&project=dedupe&session=unlinked",
+        json!(null),
+    )
+    .await;
+    assert!(unlinked_digest.1["text"].as_str().unwrap().contains(phrase));
+    assert_eq!(
+        call(
+            "PUT",
+            "/v1/sessions",
+            json!({"harness":"other","project":"dedupe","session":"echo-child","parent_harness":"reg","parent":"dedupe-session"})
+        )
+        .await
+        .0,
+        200
+    );
+    let echo = json!({"harness":"other","project":"dedupe","session":"echo-child","items":[
+        {"source_id":"echo","ts":"2026-11-18T10:00:00Z","role":"user","text":phrase}
+    ]});
+    let child_echo = call("POST", "/v1/ingest", echo).await;
+    assert_eq!(child_echo.0, 200);
+    assert_eq!(child_echo.1["segments"], 0);
+    assert_eq!(child_echo.1["duplicates"], 1);
+    for scope in ["session", "lineage"] {
+        let search = call(
+            "POST",
+            "/v1/search",
+            json!({"harness":"reg","project":"other-project","session":"unlinked","query":phrase,"scope":scope}),
+        )
+        .await;
+        assert_eq!(search.0, 200);
+        assert_eq!(search.1["hits"], json!([]));
+        let forgotten = call(
+            "POST",
+            "/v1/forget",
+            json!({"harness":"reg","project":"other-project","session":"unlinked","scope":scope}),
+        )
+        .await;
+        assert_eq!(forgotten.0, 200);
+        assert_eq!(forgotten.1["deleted"], 0);
+    }
+    assert!(
+        store
+            .get_session("reg", "unlinked")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let unlinked_digest = call(
+        "GET",
+        "/v1/digest?harness=reg&project=dedupe&session=unlinked",
+        json!(null),
+    )
+    .await;
+    assert!(unlinked_digest.1["text"].as_str().unwrap().contains(phrase));
     let assistant = json!({"harness":"reg","project":"dedupe","session":"dedupe-session","items":[
         {"source_id":"assistant","ts":"2026-11-18T10:00:00Z","role":"assistant","kind_hint":"decision","text":phrase}
     ]});
