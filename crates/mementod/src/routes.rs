@@ -656,6 +656,7 @@ async fn ingest(
             .await;
         store_result(&state, result).await?;
     }
+    let lineage = ancestors(&state, &request.harness, &request.session).await?;
     drop(_guard);
     let outcome = segment_items(&request, &state.app.policy);
     let source_roles = request
@@ -669,6 +670,7 @@ async fn ingest(
         .ingest_segments(
             &outcome.segments,
             &source_roles,
+            &lineage,
             state.app.config.duplicate_cosine_threshold,
             state.app.config.duplicate_jaccard_threshold,
         )
@@ -718,7 +720,7 @@ async fn search(
     };
     let filter = ScopeFilter {
         harness: None,
-        project: (request.scope == Scope::Project).then_some(request.project),
+        project: (request.scope != Scope::Global).then_some(request.project),
         sessions,
         kinds: request.kinds,
     };
@@ -840,9 +842,7 @@ async fn forget(
     };
     let filter = ScopeFilter {
         harness: None,
-        project: (request.scope == ForgetScope::Project)
-            .then_some(request.project)
-            .flatten(),
+        project: request.project,
         sessions,
         ..Default::default()
     };

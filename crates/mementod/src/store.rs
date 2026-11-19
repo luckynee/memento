@@ -241,9 +241,16 @@ impl Store {
         &self,
         segments: &[Segment],
         source_roles: &HashMap<String, Role>,
+        lineage: &[SessionKey],
         cosine_threshold: f32,
         jaccard_threshold: f32,
     ) -> Result<(usize, usize)> {
+        let lineage_filter = ScopeFilter {
+            sessions: Some(lineage.to_vec()),
+            ..Default::default()
+        }
+        .to_filter()
+        .context("building duplicate lineage filter")?;
         let mut stored = 0;
         let mut duplicates = 0;
         for batch in segments.chunks(64) {
@@ -267,6 +274,7 @@ impl Store {
                             segment,
                             source_roles.get(&segment.source_id).copied(),
                             &vector,
+                            &lineage_filter,
                             cosine_threshold,
                             jaccard_threshold,
                         )
@@ -317,6 +325,7 @@ impl Store {
         segment: &Segment,
         source_role: Option<Role>,
         vector: &[f32],
+        lineage_filter: &Filter,
         cosine_threshold: f32,
         jaccard_threshold: f32,
     ) -> Result<bool> {
@@ -326,6 +335,7 @@ impl Store {
                 Condition::matches("kind", kind_name(&segment.kind)?),
                 Condition::matches("source_role", role_name(source_role).to_owned()),
                 Condition::matches("provenance", segment.tool.clone().unwrap_or_default()),
+                Condition::from(lineage_filter.clone()),
             ],
             must_not: vec![Condition::matches("source_id", segment.source_id.clone())],
             ..Default::default()
