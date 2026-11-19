@@ -11,11 +11,11 @@ export function createMemorySearchTool(deps: {
 }) {
     return {
         name: "memory_search",
-        description: "Search memento's stored memory of this session and earlier sessions.",
+        description: "Search memento's stored memory of this session and earlier sessions. Search one topic per call (for example \"retry limit\", then \"deploy window\") and call it several times for several facts; a query listing many topics returns only the 6 best hits overall. Use scope \"project\" for notes from other sessions or harnesses.",
         input: {
             type: "object",
             properties: {
-                query: { type: "string", description: "What to recall from stored memory." },
+                query: { type: "string", description: "One topic to recall from stored memory." },
                 scope: { type: "string", enum: ["session", "lineage", "project", "global"], description: "Which sessions to search." },
             },
             required: ["query"],
