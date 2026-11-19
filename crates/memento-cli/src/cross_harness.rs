@@ -13,7 +13,8 @@ use clap::{Args, ValueEnum};
 use memento_core::lineage::SessionKey;
 use memento_core::protocol::{
     ClaimRequest, ClaimResponse, ContinuationRecord, ContinuationRequest, DigestResponse,
-    IngestItem, IngestRequest, Kind, Role, ToolCall,
+    IngestItem, IngestRequest, Kind, ReleaseRequest, ReleaseResponse, Role, SessionRecord,
+    ToolCall,
 };
 use memento_core::segment::strip_default_scaffolding;
 use reqwest::Method;
@@ -60,6 +61,14 @@ pub struct ContinueArgs {
     project: Option<PathBuf>,
     #[arg(long, help = "Target harness identifier")]
     to: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct GcArgs {
+    #[arg(long, help = "Project directory")]
+    project: Option<PathBuf>,
+    #[arg(long, help = "Report without changing sessions or cursors")]
+    dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -995,6 +1004,347 @@ fn pending_marker(state: &Path, harness: &str, session: &str) -> PathBuf {
         .join(format!("{}-{}", sanitize(harness), sanitize(session)))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SessionPresence {
+    Alive,
+    Deleted,
+    Unknown(String),
+}
+
+fn contains_transcript(root: &Path, session: &str, recursive: bool) -> io::Result<bool> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_dir() && recursive && contains_transcript(&entry.path(), session, true)? {
+            return Ok(true);
+        }
+        if kind.is_file()
+            && entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(&format!("{session}.jsonl"))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn contains_claude_transcript(root: &Path, session: &str) -> io::Result<bool> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            match fs::metadata(entry.path().join(format!("{session}.jsonl"))) {
+                Ok(metadata) if metadata.is_file() => return Ok(true),
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn detect_session(
+    record: &SessionRecord,
+    cursors: &BTreeMap<String, Cursor>,
+    claude: &Path,
+    codex: &Path,
+    opencode: &std::ffi::OsStr,
+) -> SessionPresence {
+    if matches!(record.harness.as_str(), "claude-code" | "codex")
+        && (record.session.contains('/')
+            || record.session.contains('\\')
+            || record.session == "."
+            || record.session == "..")
+    {
+        return SessionPresence::Unknown("invalid transcript session identifier".into());
+    }
+    let result = match record.harness.as_str() {
+        "agy" => return SessionPresence::Alive,
+        "opencode" => {
+            return match Command::new(opencode)
+                .args(["api", "GET", &format!("/api/session/{}", record.session)])
+                .output()
+            {
+                Ok(output) if output.status.success() => SessionPresence::Alive,
+                Ok(output) => {
+                    let text = format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    if text.contains("HTTP 404") || text.contains("SessionNotFoundError") {
+                        SessionPresence::Deleted
+                    } else {
+                        SessionPresence::Unknown(text.trim().to_owned())
+                    }
+                }
+                Err(error) => SessionPresence::Unknown(format!("cannot run opencode: {error}")),
+            };
+        }
+        "claude-code" => {
+            let paths = cursors
+                .iter()
+                .filter(|(_, cursor)| cursor.session == record.session)
+                .map(|(path, _)| Path::new(path))
+                .collect::<Vec<_>>();
+            if paths.is_empty() {
+                match fs::metadata(claude) {
+                    Ok(metadata) if metadata.is_dir() => {
+                        contains_claude_transcript(claude, &record.session)
+                    }
+                    Ok(_) => Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "Claude projects path is not a directory",
+                    )),
+                    Err(error) => Err(error),
+                }
+            } else {
+                let mut found = false;
+                let mut failure = None;
+                for path in paths {
+                    match fs::metadata(path) {
+                        Ok(metadata) if metadata.is_file() => found = true,
+                        Ok(_) => {}
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => failure = Some(error),
+                    }
+                }
+                if found {
+                    Ok(true)
+                } else if let Some(error) = failure {
+                    Err(error)
+                } else {
+                    Ok(false)
+                }
+            }
+        }
+        "codex" => match fs::metadata(codex) {
+            Ok(metadata) if metadata.is_dir() => {
+                match contains_transcript(&codex.join("sessions"), &record.session, true) {
+                    Ok(true) => Ok(true),
+                    Ok(false) => {
+                        contains_transcript(&codex.join("archived_sessions"), &record.session, true)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Codex home is not a directory",
+            )),
+            Err(error) => Err(error),
+        },
+        _ => return SessionPresence::Unknown("unsupported harness".into()),
+    };
+    match result {
+        Ok(true) => SessionPresence::Alive,
+        Ok(false) => SessionPresence::Deleted,
+        Err(error) => SessionPresence::Unknown(format!("cannot inspect transcripts: {error}")),
+    }
+}
+
+fn read_cursors(state: &Path) -> Result<BTreeMap<String, Cursor>, CliError> {
+    let path = state.join("cursors.json");
+    match fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
+            CliError::other(format!("invalid cursor state {}: {error}", path.display()))
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(error) => Err(CliError::other(format!(
+            "cannot read cursor state {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn prune_cursors(state: &Path, session: &str) -> Result<(), CliError> {
+    fs::create_dir_all(state)
+        .map_err(|error| CliError::other(format!("cannot create {}: {error}", state.display())))?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(state.join("cursors.lock"))
+        .map_err(|error| CliError::other(format!("cannot open cursor lock: {error}")))?;
+    lock.lock()
+        .map_err(|error| CliError::other(format!("cannot lock cursor state: {error}")))?;
+    let mut cursors = read_cursors(state)?;
+    let before = cursors.len();
+    cursors.retain(|_, cursor| cursor.session != session);
+    if cursors.len() != before {
+        let bytes = serde_json::to_vec_pretty(&cursors)
+            .map_err(|error| CliError::other(format!("cannot serialize cursor state: {error}")))?;
+        save_atomic(&state.join("cursors.json"), &bytes)?;
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct GcEntry {
+    harness: String,
+    session: String,
+    status: String,
+    detail: Option<String>,
+}
+
+fn gc(cli: &Cli, args: &GcArgs) -> Result<(), CliError> {
+    let project = project_key(args.project.as_deref())?;
+    let state = state_dir()?;
+    let home = home_dir()?;
+    let claude = env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".claude"))
+        .join("projects");
+    let codex = env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".codex"));
+    let opencode = env::var_os("MEMENTO_OPENCODE_BIN").unwrap_or_else(|| "opencode".into());
+    let cursors = read_cursors(&state)?;
+    let client = client(cli, false)?;
+    let mut entries = Vec::new();
+    for harness in ["opencode", "claude-code", "codex", "agy"] {
+        let response = http::<Value>(
+            &client,
+            cli,
+            Method::GET,
+            &["v1", "sessions"],
+            None,
+            &[
+                ("harness", harness),
+                ("project", &project),
+                ("include_deleted", "false"),
+            ],
+        )?;
+        let value: Value = parse_response(&response)?;
+        let records: Vec<SessionRecord> = serde_json::from_value(
+            value
+                .get("sessions")
+                .cloned()
+                .ok_or_else(|| CliError::other("missing sessions in daemon response"))?,
+        )
+        .map_err(|error| CliError::other(format!("invalid daemon sessions: {error}")))?;
+        for record in records {
+            let marker = pending_marker(&state, harness, &record.session);
+            let presence = match fs::read_to_string(&marker) {
+                Ok(contents) => match contents.trim().parse::<u64>() {
+                    Ok(created)
+                        if SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs()
+                            .saturating_sub(created)
+                            < 60 =>
+                    {
+                        SessionPresence::Unknown("pending import".into())
+                    }
+                    Ok(_) => detect_session(&record, &cursors, &claude, &codex, &opencode),
+                    Err(_) => SessionPresence::Unknown("invalid pending marker".into()),
+                },
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    detect_session(&record, &cursors, &claude, &codex, &opencode)
+                }
+                Err(error) => {
+                    SessionPresence::Unknown(format!("cannot read pending marker: {error}"))
+                }
+            };
+            let (status, detail) = match presence {
+                SessionPresence::Alive => ("alive", None),
+                SessionPresence::Unknown(detail) => ("unknown", Some(detail)),
+                SessionPresence::Deleted if args.dry_run => ("deleted", None),
+                SessionPresence::Deleted => {
+                    let request = ReleaseRequest {
+                        harness: harness.into(),
+                        project: project.clone(),
+                        session: record.session.clone(),
+                    };
+                    let response: ReleaseResponse = parse_response(&http(
+                        &client,
+                        cli,
+                        Method::POST,
+                        &["v1", "sessions", "release"],
+                        Some(&request),
+                        &[],
+                    )?)?;
+                    if response.released {
+                        prune_cursors(&state, &record.session)?;
+                        if response
+                            .removed
+                            .iter()
+                            .any(|key| key.harness == harness && key.session == record.session)
+                        {
+                            ("deleted+released", None)
+                        } else {
+                            (
+                                "retained-for-children",
+                                Some(
+                                    "retained by a dependent, continuation, or keep retention"
+                                        .into(),
+                                ),
+                            )
+                        }
+                    } else {
+                        (
+                            "unknown",
+                            Some("session no longer exists in project".into()),
+                        )
+                    }
+                }
+            };
+            entries.push(GcEntry {
+                harness: harness.into(),
+                session: record.session,
+                status: status.into(),
+                detail,
+            });
+        }
+    }
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&entries).map_err(|error| CliError::other(format!(
+                "cannot serialize gc summary: {error}"
+            )))?
+        );
+    } else {
+        for entry in &entries {
+            println!(
+                "{}  {}/{}{}",
+                entry.status,
+                entry.harness,
+                entry.session,
+                entry
+                    .detail
+                    .as_ref()
+                    .map(|detail| format!("  {detail}"))
+                    .unwrap_or_default()
+            );
+        }
+        for status in [
+            "alive",
+            "deleted",
+            "deleted+released",
+            "retained-for-children",
+            "unknown",
+        ] {
+            println!(
+                "{status}: {}",
+                entries
+                    .iter()
+                    .filter(|entry| entry.status == status)
+                    .count()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn write_pending_marker(path: &Path) -> Result<(), CliError> {
     let parent = path
         .parent()
@@ -1734,6 +2084,7 @@ fn install(args: &InstallArgs, home: &Path, executable: &Path) -> Result<Option<
 
 pub fn run(cli: &Cli) -> Result<(), CliError> {
     match &cli.command {
+        crate::Command::Gc(args) => gc(cli, args)?,
         crate::Command::ProjectKey { dir } => println!("{}", project_key(dir.as_deref())?),
         crate::Command::Import(args) => {
             let response = import(cli, args, &client(cli, false)?, &state_dir()?)?;
@@ -1875,6 +2226,66 @@ mod tests {
     use std::io::{BufReader, Write};
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    #[cfg(unix)]
+    fn gc_detects_harness_presence_in_isolated_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let claude = temp.path().join("claude/projects");
+        let codex = temp.path().join("codex");
+        let binary = temp.path().join("opencode");
+        fs::write(&binary, "#!/bin/sh\nprintf 'HTTP 404'\nexit 1\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut record = SessionRecord {
+            harness: "opencode".into(),
+            project: "project".into(),
+            session: "abc".into(),
+            parent: None,
+            parent_harness: None,
+            retention: Default::default(),
+            title: None,
+            created: None,
+            deleted_at: None,
+            collected_at: None,
+        };
+        let cursors = BTreeMap::new();
+        assert_eq!(
+            detect_session(&record, &cursors, &claude, &codex, binary.as_os_str()),
+            SessionPresence::Deleted
+        );
+        fs::write(
+            &binary,
+            "#!/bin/sh\nprintf 'Could not reach server'\nexit 1\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            detect_session(&record, &cursors, &claude, &codex, binary.as_os_str()),
+            SessionPresence::Unknown(_)
+        ));
+        record.harness = "claude-code".into();
+        assert!(matches!(
+            detect_session(&record, &cursors, &claude, &codex, binary.as_os_str()),
+            SessionPresence::Unknown(_)
+        ));
+        fs::create_dir_all(claude.join("slug")).unwrap();
+        assert_eq!(
+            detect_session(&record, &cursors, &claude, &codex, binary.as_os_str()),
+            SessionPresence::Deleted
+        );
+        fs::write(claude.join("slug/abc.jsonl"), "").unwrap();
+        assert_eq!(
+            detect_session(&record, &cursors, &claude, &codex, binary.as_os_str()),
+            SessionPresence::Alive
+        );
+        record.harness = "codex".into();
+        fs::create_dir_all(codex.join("archived_sessions")).unwrap();
+        fs::write(codex.join("archived_sessions/rollout-abc.jsonl"), "").unwrap();
+        assert_eq!(
+            detect_session(&record, &cursors, &claude, &codex, binary.as_os_str()),
+            SessionPresence::Alive
+        );
+    }
 
     fn fixture(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))

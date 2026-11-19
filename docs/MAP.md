@@ -33,6 +33,7 @@
 | `crates/memento-cli/tests/fixtures/` | Synthetic Claude and Codex transcripts |
 | `crates/memento-mcp/src/main.rs` | stdio MCP server (`rmcp` 3.11): `memory_search`, `memory_digest`, `memory_continue`, `memory_note` |
 | CLI state | `${XDG_STATE_HOME:-~/.local/state}/memento/cursors.json` (+ `cursors.lock`) |
+| Session cleanup | `POST /v1/sessions/release` and `memento gc` collect deleted sessions while preserving dependent lineage |
 
 ## Verified runtime facts
 

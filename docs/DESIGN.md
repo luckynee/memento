@@ -126,7 +126,7 @@ Collection `memento_segments`:
 
 Collection `memento_sessions` (registry): payload-only points if the Rust client supports a collection without vectors, otherwise a 1-dim dummy dense vector. Point id: UUIDv5 over `harness/session`.
 
-- payload: `harness`, `project`, `session`, `parent` (optional), `retention`, `created`, `title` (optional).
+- payload: `harness`, `project`, `session`, `parent` and `parent_harness` (optional), `retention`, `created`, `title`, `deleted_at`, `collected_at` (optional).
 - keyword indexes: `harness`, `project`, `session`, `parent`.
 - Linking rejects cycles and self-parenting (409).
 
@@ -167,8 +167,9 @@ All routes under `http://127.0.0.1:7377`. Optional bearer token via `MEMENTO_TOK
 | Method and path | Body or query | Response |
 | --- | --- | --- |
 | `GET /health` | | `{ "ok": true, "qdrant": true }` |
-| `PUT /v1/sessions` | `{ harness, project, session, parent?, retention?, title? }`; merge semantics: absent fields keep stored values, `created` is set once | session record |
-| `GET /v1/sessions` | `?harness&project` | `{ sessions: [...] }` |
+| `PUT /v1/sessions` | `{ harness, project, session, parent?, parent_harness?, require_parent?, retention?, title? }`; merge semantics: absent fields keep stored values, `created` is set once | session record |
+| `GET /v1/sessions` | `?harness&project&include_deleted` | `{ sessions: [...] }` |
+| `POST /v1/sessions/release` | `{ harness, project, session }` | `{ released, removed: [{ harness, session }] }` |
 | `GET /v1/sessions/{harness}/{session}/lineage` | | `{ lineage: ["ses_child", "ses_parent", ...] }` |
 | `POST /v1/ingest` | neutral ingest schema | `{ segments: n, skipped: n }` |
 | `POST /v1/search` | `{ harness, project, session, query, scope?, k?, kinds? }` | `{ hits: [{ id, score, kind, text, session, ts, path? }] }` |
@@ -190,6 +191,7 @@ Errors: `{ "error": { "code": "...", "message": "..." } }` with 4xx/5xx.
 - `search <query> --harness H --project P --session S [--scope lineage] [--k 8] [--kind KIND]...`
 - `digest --harness H --project P --session S [--budget N]`
 - `forget --harness H [--project P] (--session S | --lineage S | --whole-project) [--yes]` (`--whole-project` requires `--project`; without `--yes` it asks on a TTY and refuses otherwise)
+- `gc [--project DIR] [--dry-run] [--json]` releases sessions whose harness data is gone.
 - `ingest --file turns.json|-` (neutral schema, for harnesses without a plugin)
 - Global: `--url`, `--token`, `--json`, `--timeout-secs`.
 
@@ -237,6 +239,14 @@ Harness ids: `opencode`, `claude-code`, `codex`, `agy`.
 ### Pending continuations
 
 `PUT /v1/continuations { project, parent_harness, parent_session, target_harness? }` stores one pending continuation per `(project, target_harness)` slot; an absent target is a separate any-harness slot. A put replaces only its slot. `POST /v1/continuations/claim { project, harness, session }` first returns an existing unexpired claim by that caller, then tries the caller's targeted slot followed by the any-harness slot. Expired slots are deleted; a slot claimed by another caller is skipped. A successful claim records `claimed_by` and `claimed_at`, links the session (`parent_harness`, `parent`), and returns `{ claimed: bool, parent_harness?, parent?, digest? }` with the lineage digest. Claims are idempotent per caller for 24 h; unclaimed slots expire 24 h after creation, and claimed slots expire 24 h after claiming. Legacy project-only-ID records remain claimable until expiry or replacement. Project-scope forget removes all continuation slots for the project. Links, continuations and claims are rejected with 409 `cross_project` when parent and child projects differ, and with 409 `too_deep` when the lineage would exceed 64. CLI: `memento continue --from <harness>/<session> [--project DIR] [--to HARNESS]`. Every adapter claims on its first event for a new session.
+
+### Session deletion and gc
+
+`POST /v1/sessions/release` marks a matching session deleted under the operation write lock and registry lock, then collects eligible deleted sessions throughout the project to a fixpoint. A missing or project-mismatched session returns `released: false`. A deleted session is collectible only when it is not `keep`, has no uncollected child in any harness, and is not the parent of an unexpired unclaimed continuation. Collection deletes its segments and slots referencing it as parent or claimant, and preserves a tombstone with `collected_at`. Collected tombstones older than seven days are pruned during collection. Explicit `forget` runs collection afterwards, allowing deleted ancestors to cascade.
+
+Deleted records reject resurrection: ingest stores nothing and session updates return the existing record. A continuation put against a deleted parent returns 409 `parent_deleted`; strict links with `require_parent: true` return 409 `parent_unavailable` if the parent is missing or deleted. Deleted but uncollected ancestors remain visible in descendant lineage search and digest, but not project or global search. Collected tombstones never appear in search or digest. Session listing excludes deleted records unless `include_deleted=true`.
+
+`memento gc` uses the canonical project key for its directory, skips fresh pending imports, and reports alive, deleted and released, retained, and unknown sessions. OpenCode's API reports missing sessions with `HTTP 404` or `SessionNotFoundError`; other failures, including an unreachable server, are unknown. `MEMENTO_OPENCODE_BIN` overrides the executable. Claude Code silently deletes transcripts after `cleanupPeriodDays` (default 30); gc checks cursor paths or searches `~/.claude/projects` (or `CLAUDE_CONFIG_DIR/projects`), treating a missing projects directory as unknown. Codex rollouts live under `~/.codex/sessions`; archive moves them to `archived_sessions`, while `codex delete --force` removes them. Both locations are checked under `CODEX_HOME` when set. agy has no transcript-based deletion detection. Successful releases prune cursor entries under the cursor lock; dry runs do not mutate anything.
 
 ### Transcript importers (CLI)
 

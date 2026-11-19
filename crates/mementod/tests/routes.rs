@@ -213,6 +213,81 @@ async fn run_workflow(address: &str, store: &Store) {
     cross_harness_workflow(address, store).await;
     regression_workflow(address, store).await;
     continuation_slots_workflow(address, store).await;
+    release_workflow(address).await;
+}
+
+async fn release_workflow(address: &str) {
+    let call = |method: &'static str, path: &'static str, body: Value| async move {
+        request(address, method, path, Some("test-token"), &body.to_string()).await
+    };
+    let parent = json!({"harness":"opencode","project":"gc-project","session":"parent"});
+    let child = json!({"harness":"codex","project":"gc-project","session":"child","parent":"parent","parent_harness":"opencode","require_parent":true});
+    assert_eq!(call("PUT", "/v1/sessions", parent.clone()).await.0, 200);
+    assert_eq!(call("PUT", "/v1/sessions", child).await.0, 200);
+    let ingest = json!({"harness":"opencode","project":"gc-project","session":"parent","items":[{"source_id":"item","ts":"2026-11-18T10:00:00Z","role":"user","text":"unique parent memory"}]});
+    assert_eq!(call("POST", "/v1/ingest", ingest.clone()).await.0, 200);
+    let release = call("POST", "/v1/sessions/release", parent.clone()).await;
+    assert_eq!(release.1["released"], true);
+    assert_eq!(release.1["removed"], json!([]));
+    let digest = request(
+        address,
+        "GET",
+        "/v1/digest?harness=codex&project=gc-project&session=child",
+        Some("test-token"),
+        "",
+    )
+    .await;
+    assert!(
+        digest.1["text"]
+            .as_str()
+            .unwrap()
+            .contains("unique parent memory")
+    );
+    let list = request(
+        address,
+        "GET",
+        "/v1/sessions?harness=opencode&project=gc-project",
+        Some("test-token"),
+        "",
+    )
+    .await;
+    assert_eq!(list.1["sessions"], json!([]));
+    let update = call(
+        "PUT",
+        "/v1/sessions",
+        json!({"harness":"opencode","project":"gc-project","session":"parent","title":"changed"}),
+    )
+    .await;
+    assert!(update.1["title"].is_null());
+    assert_eq!(call("POST", "/v1/ingest", ingest).await.1["segments"], 0);
+    let strict = call("PUT", "/v1/sessions", json!({"harness":"opencode","project":"gc-project","session":"fork","parent":"parent","require_parent":true})).await;
+    assert_eq!(strict.0, 409);
+    assert_eq!(strict.1["error"]["code"], "parent_unavailable");
+    let continuation = call(
+        "PUT",
+        "/v1/continuations",
+        json!({"project":"gc-project","parent_harness":"opencode","parent_session":"parent"}),
+    )
+    .await;
+    assert_eq!(continuation.1["error"]["code"], "parent_deleted");
+    let search = call("POST", "/v1/search", json!({"harness":"codex","project":"gc-project","session":"child","query":"unique parent memory","scope":"project"})).await;
+    assert_eq!(search.1["hits"], json!([]));
+    let forget = call(
+        "POST",
+        "/v1/forget",
+        json!({"harness":"codex","project":"gc-project","session":"child","scope":"session"}),
+    )
+    .await;
+    assert_eq!(forget.0, 200);
+    let list = request(
+        address,
+        "GET",
+        "/v1/sessions?harness=opencode&project=gc-project&include_deleted=true",
+        Some("test-token"),
+        "",
+    )
+    .await;
+    assert!(list.1["sessions"][0]["collected_at"].is_string());
 }
 
 async fn regression_workflow(address: &str, store: &Store) {

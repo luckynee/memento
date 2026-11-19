@@ -21,7 +21,8 @@ use memento_core::{
     protocol::{
         ClaimRequest, ClaimResponse, ContinuationRecord, ContinuationRequest, DigestResponse,
         ErrorBody, ErrorDetail, ForgetRequest, ForgetResponse, ForgetScope, Health, IngestRequest,
-        IngestResponse, Retention, Scope, SearchRequest, SearchResponse, SessionRecord,
+        IngestResponse, ReleaseRequest, ReleaseResponse, Retention, Scope, SearchRequest,
+        SearchResponse, SessionRecord,
     },
     rerank::{Candidate, RerankConfig, rerank},
     segment::{SegmentPolicy, segment_items},
@@ -92,6 +93,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/sessions", get(list_sessions).put(put_session))
+        .route("/v1/sessions/release", post(release_session))
         .route("/v1/continuations", axum::routing::put(put_continuation))
         .route("/v1/continuations/claim", post(claim_continuation))
         .route(
@@ -289,6 +291,8 @@ struct SessionUpdate {
     parent_harness: Option<String>,
     retention: Option<Retention>,
     title: Option<String>,
+    #[serde(default)]
+    require_parent: bool,
 }
 
 async fn put_session(
@@ -310,6 +314,152 @@ async fn put_session(
     Ok(Json(record))
 }
 
+fn session_key(record: &SessionRecord) -> SessionKey {
+    SessionKey {
+        harness: record.harness.clone(),
+        session: record.session.clone(),
+    }
+}
+
+fn collectible(
+    record: &SessionRecord,
+    records: &[SessionRecord],
+    continuations: &[ContinuationRecord],
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    let key = session_key(record);
+    record.deleted_at.is_some()
+        && record.collected_at.is_none()
+        && record.retention != Retention::Keep
+        && !records.iter().any(|child| {
+            child.collected_at.is_none()
+                && child.parent.as_deref() == Some(&key.session)
+                && child.parent_harness.as_deref().unwrap_or(&child.harness) == key.harness
+        })
+        && !continuations.iter().any(|slot| {
+            slot.parent_harness == key.harness
+                && slot.parent_session == key.session
+                && slot.claimed_by.is_none()
+                && now.signed_duration_since(slot.created) < chrono::Duration::hours(24)
+        })
+}
+
+async fn collect_project(state: &RouterState, project: &str) -> Result<Vec<SessionKey>, ApiError> {
+    let records = state
+        .app
+        .store
+        .list_sessions_filtered(ScopeFilter {
+            project: Some(project.to_owned()),
+            ..Default::default()
+        })
+        .await;
+    let mut records = store_result(state, records).await?;
+    let slots = state.app.store.list_continuations(project).await;
+    let mut slots = store_result(state, slots).await?;
+    let now = Utc::now();
+    let mut removed = Vec::new();
+    loop {
+        let continuation_records = slots
+            .iter()
+            .map(|(_, slot)| slot.clone())
+            .collect::<Vec<_>>();
+        let Some(index) = records
+            .iter()
+            .position(|record| collectible(record, &records, &continuation_records, now))
+        else {
+            break;
+        };
+        let key = session_key(&records[index]);
+        let result = state
+            .app
+            .store
+            .delete_segments(&ScopeFilter {
+                project: Some(project.to_owned()),
+                sessions: Some(vec![key.clone()]),
+                ..Default::default()
+            })
+            .await;
+        store_result(state, result).await?;
+        let mut remaining = Vec::new();
+        for (id, slot) in slots {
+            if (slot.parent_harness == key.harness && slot.parent_session == key.session)
+                || slot.claimed_by.as_ref() == Some(&key)
+            {
+                let result = state.app.store.delete_continuation(id).await;
+                store_result(state, result).await?;
+            } else {
+                remaining.push((id, slot));
+            }
+        }
+        slots = remaining;
+        records[index].collected_at = Some(now);
+        let result = state.app.store.upsert_session(records[index].clone()).await;
+        store_result(state, result).await?;
+        removed.push(key);
+    }
+    let expired = records
+        .into_iter()
+        .filter(|record| {
+            record.collected_at.is_some_and(|collected| {
+                now.signed_duration_since(collected) > chrono::Duration::days(7)
+            })
+        })
+        .map(|record| session_key(&record))
+        .collect::<Vec<_>>();
+    if !expired.is_empty() {
+        let result = state
+            .app
+            .store
+            .delete_sessions(&ScopeFilter {
+                project: Some(project.to_owned()),
+                sessions: Some(expired),
+                ..Default::default()
+            })
+            .await;
+        store_result(state, result).await?;
+    }
+    Ok(removed)
+}
+
+async fn release_session(
+    State(state): State<RouterState>,
+    body: Result<Json<ReleaseRequest>, JsonRejection>,
+) -> ApiResult<ReleaseResponse> {
+    let request = json_body(body)?;
+    required(&request.harness)?;
+    required(&request.project)?;
+    required(&request.session)?;
+    let _operation = state.operation_lock.write().await;
+    let _guard = state.registry_lock.lock().await;
+    let record = state
+        .app
+        .store
+        .get_session(&request.harness, &request.session)
+        .await;
+    let Some(mut record) = store_result(&state, record).await? else {
+        return Ok(Json(ReleaseResponse {
+            released: false,
+            removed: Vec::new(),
+        }));
+    };
+    if record.project != request.project {
+        return Ok(Json(ReleaseResponse {
+            released: false,
+            removed: Vec::new(),
+        }));
+    }
+    if record.deleted_at.is_none() {
+        record.deleted_at = Some(Utc::now());
+        let result = state.app.store.upsert_session(record).await;
+        store_result(&state, result).await?;
+    }
+    let removed = collect_project(&state, &request.project).await?;
+    Ok(Json(ReleaseResponse {
+        released: true,
+        removed,
+    }))
+}
+
 async fn merge_session(
     state: &RouterState,
     update: SessionUpdate,
@@ -320,6 +470,12 @@ async fn merge_session(
         .get_session(&update.harness, &update.session)
         .await;
     let existing = store_result(state, existing).await?;
+    if existing
+        .as_ref()
+        .is_some_and(|record| record.deleted_at.is_some())
+    {
+        return Ok(existing.expect("deleted session exists"));
+    }
     if existing
         .as_ref()
         .is_some_and(|record| record.project != update.project)
@@ -340,6 +496,8 @@ async fn merge_session(
         retention: Retention::default(),
         title: None,
         created: Some(Utc::now()),
+        deleted_at: None,
+        collected_at: None,
     });
     record.project = update.project;
     if let Some(parent) = update.parent {
@@ -369,13 +527,28 @@ async fn merge_session(
             .store
             .get_session(&parent.harness, &parent.session)
             .await;
-        if store_result(state, parent_record)
-            .await?
-            .is_some_and(|parent| parent.project != record.project)
+        let parent_record = store_result(state, parent_record).await?;
+        if update.require_parent
+            && parent_record
+                .as_ref()
+                .is_none_or(|parent| parent.deleted_at.is_some())
         {
+            return Err(ApiError {
+                status: StatusCode::CONFLICT,
+                code: "parent_unavailable",
+                message: "parent session is missing or deleted",
+            });
+        }
+        if parent_record.is_some_and(|parent| parent.project != record.project) {
             return Err(ApiError::cross_project());
         }
         validate_link(&child, &parent, &links)?;
+    } else if update.require_parent {
+        return Err(ApiError {
+            status: StatusCode::CONFLICT,
+            code: "parent_unavailable",
+            message: "parent session is missing or deleted",
+        });
     }
     if let Some(retention) = update.retention {
         record.retention = retention;
@@ -414,6 +587,13 @@ async fn put_continuation(
     };
     if parent.project != request.project {
         return Err(ApiError::cross_project());
+    }
+    if parent.deleted_at.is_some() {
+        return Err(ApiError {
+            status: StatusCode::CONFLICT,
+            code: "parent_deleted",
+            message: "parent session is deleted",
+        });
     }
     let record = ContinuationRecord {
         project: request.project,
@@ -517,6 +697,7 @@ async fn claim_continuation(
             parent_harness: Some(pending.parent_harness.clone()),
             retention: None,
             title: None,
+            require_parent: false,
         },
     )
     .await?;
@@ -550,6 +731,8 @@ fn unclaimed() -> ClaimResponse {
 struct SessionQuery {
     harness: String,
     project: Option<String>,
+    #[serde(default)]
+    include_deleted: bool,
 }
 
 #[derive(Serialize)]
@@ -569,6 +752,9 @@ async fn list_sessions(
         .list_sessions(&query.harness, query.project.as_deref())
         .await;
     let mut sessions = store_result(&state, sessions).await?;
+    if !query.include_deleted {
+        sessions.retain(|record| record.deleted_at.is_none());
+    }
     sessions.sort_by(|left, right| {
         left.created
             .cmp(&right.created)
@@ -648,6 +834,16 @@ async fn ingest(
     let existing = store_result(&state, existing).await?;
     if existing
         .as_ref()
+        .is_some_and(|record| record.deleted_at.is_some())
+    {
+        return Ok(Json(IngestResponse {
+            segments: 0,
+            skipped: request.items.len(),
+            duplicates: 0,
+        }));
+    }
+    if existing
+        .as_ref()
         .is_some_and(|record| record.project != request.project)
     {
         return Err(ApiError::cross_project());
@@ -665,6 +861,8 @@ async fn ingest(
                 retention: Retention::default(),
                 title: None,
                 created: Some(Utc::now()),
+                deleted_at: None,
+                collected_at: None,
             })
             .await;
         store_result(&state, result).await?;
@@ -723,7 +921,8 @@ async fn search(
     if request.kinds.as_ref().is_some_and(Vec::is_empty) {
         return Ok(Json(SearchResponse { hits: Vec::new() }));
     }
-    let sessions = match request.scope {
+    let _operation = state.operation_lock.read().await;
+    let mut sessions = match request.scope {
         Scope::Session => Some(vec![SessionKey {
             harness: request.harness.clone(),
             session: request.session.clone(),
@@ -731,6 +930,33 @@ async fn search(
         Scope::Lineage => Some(ancestors(&state, &request.harness, &request.session).await?),
         Scope::Project | Scope::Global => None,
     };
+    let records = state
+        .app
+        .store
+        .list_sessions_filtered(ScopeFilter {
+            project: (request.scope != Scope::Global).then_some(request.project.clone()),
+            ..Default::default()
+        })
+        .await;
+    let records = store_result(&state, records).await?;
+    let hidden = records
+        .iter()
+        .filter(|record| {
+            record.collected_at.is_some()
+                || (matches!(request.scope, Scope::Project | Scope::Global)
+                    && record.deleted_at.is_some())
+        })
+        .map(|record| SessionKey {
+            harness: record.harness.clone(),
+            session: record.session.clone(),
+        })
+        .collect::<std::collections::HashSet<_>>();
+    if let Some(keys) = &mut sessions {
+        keys.retain(|key| !hidden.contains(key));
+        if keys.is_empty() {
+            return Ok(Json(SearchResponse { hits: Vec::new() }));
+        }
+    }
     let filter = ScopeFilter {
         harness: None,
         project: (request.scope != Scope::Global).then_some(request.project),
@@ -745,6 +971,12 @@ async fn search(
     let candidates = store_result(&state, candidates)
         .await?
         .into_iter()
+        .filter(|(segment, _)| {
+            !hidden.contains(&SessionKey {
+                harness: segment.harness.clone(),
+                session: segment.session.clone(),
+            })
+        })
         .map(|(segment, fused_score)| Candidate {
             segment,
             fused_score,
@@ -790,7 +1022,34 @@ async fn render_session_digest(
     session: &str,
     budget: Option<usize>,
 ) -> Result<DigestResponse, ApiError> {
-    let lineage = ancestors(state, harness, session).await?;
+    let mut lineage = ancestors(state, harness, session).await?;
+    let records = state
+        .app
+        .store
+        .list_sessions_filtered(ScopeFilter {
+            project: Some(project.to_owned()),
+            ..Default::default()
+        })
+        .await;
+    let records = store_result(state, records).await?;
+    lineage.retain(|key| {
+        !records.iter().any(|record| {
+            record.harness == key.harness
+                && record.session == key.session
+                && record.collected_at.is_some()
+        })
+    });
+    if lineage.is_empty() {
+        return Ok(render_digest(
+            &DigestInput {
+                harness: harness.into(),
+                project: project.into(),
+                lineage: Vec::new(),
+                segments: Vec::new(),
+            },
+            budget.unwrap_or(12000).clamp(1000, 100000),
+        ));
+    }
     let segments = state
         .app
         .store
@@ -853,6 +1112,25 @@ async fn forget(
             }
         }
     };
+    let affected_projects = if let Some(project) = &request.project {
+        vec![project.clone()]
+    } else {
+        let records = state
+            .app
+            .store
+            .list_sessions_filtered(ScopeFilter {
+                sessions: sessions.clone(),
+                ..Default::default()
+            })
+            .await;
+        store_result(&state, records)
+            .await?
+            .into_iter()
+            .map(|record| record.project)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    };
     let filter = ScopeFilter {
         harness: None,
         project: request.project,
@@ -870,6 +1148,9 @@ async fn forget(
             .delete_project_continuations(filter.project.as_deref().unwrap_or_default())
             .await;
         store_result(&state, result).await?;
+    }
+    for project in affected_projects {
+        collect_project(&state, &project).await?;
     }
     Ok(Json(ForgetResponse {
         deleted: usize::try_from(deleted).map_err(ApiError::internal)?,
@@ -964,5 +1245,67 @@ mod tests {
             validate_link(&key(0), &key(64), &links).err().unwrap().code,
             "too_deep"
         );
+    }
+
+    fn record(harness: &str, session: &str, parent: Option<(&str, &str)>) -> SessionRecord {
+        SessionRecord {
+            harness: harness.into(),
+            project: "project".into(),
+            session: session.into(),
+            parent: parent.map(|(_, session)| session.into()),
+            parent_harness: parent.map(|(harness, _)| harness.into()),
+            retention: Retention::Continuation,
+            title: None,
+            created: Some(Utc::now()),
+            deleted_at: Some(Utc::now()),
+            collected_at: None,
+        }
+    }
+
+    #[test]
+    fn collection_respects_dependents_retention_and_pending_slots() {
+        let now = Utc::now();
+        let parent = record("opencode", "parent", None);
+        let mut child = record("codex", "child", Some(("opencode", "parent")));
+        assert!(collectible(
+            &parent,
+            std::slice::from_ref(&parent),
+            &[],
+            now
+        ));
+        child.deleted_at = None;
+        assert!(!collectible(
+            &parent,
+            &[parent.clone(), child.clone()],
+            &[],
+            now
+        ));
+        child.deleted_at = Some(now);
+        assert!(!collectible(
+            &parent,
+            &[parent.clone(), child.clone()],
+            &[],
+            now
+        ));
+        child.collected_at = Some(now);
+        assert!(collectible(&parent, &[parent.clone(), child], &[], now));
+        let mut kept = parent.clone();
+        kept.retention = Retention::Keep;
+        assert!(!collectible(&kept, std::slice::from_ref(&kept), &[], now));
+        let slot = ContinuationRecord {
+            project: "project".into(),
+            parent_harness: "opencode".into(),
+            parent_session: "parent".into(),
+            target_harness: None,
+            created: now,
+            claimed_by: None,
+            claimed_at: None,
+        };
+        assert!(!collectible(
+            &parent,
+            std::slice::from_ref(&parent),
+            &[slot],
+            now
+        ));
     }
 }

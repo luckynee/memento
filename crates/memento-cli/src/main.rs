@@ -66,6 +66,8 @@ enum Command {
     Digest(DigestArgs),
     #[command(about = "Delete matching memories")]
     Forget(ForgetArgs),
+    #[command(about = "Release memories for deleted harness sessions")]
+    Gc(cross_harness::GcArgs),
     #[command(about = "Ingest transcript items")]
     Ingest(IngestArgs),
     #[command(about = "Print the canonical project key")]
@@ -339,6 +341,7 @@ fn build_request(
         Command::Forget(_) => (Method::POST, vec!["v1", "forget"]),
         Command::Ingest(_) => (Method::POST, vec!["v1", "ingest"]),
         Command::ProjectKey { .. }
+        | Command::Gc(_)
         | Command::Import(_)
         | Command::HookImport(_)
         | Command::Continue(_)
@@ -438,6 +441,7 @@ fn build_request(
             request.json(ingest.ok_or_else(|| CliError::other("missing ingest input"))?)
         }
         Command::ProjectKey { .. }
+        | Command::Gc(_)
         | Command::Import(_)
         | Command::HookImport(_)
         | Command::Continue(_)
@@ -627,6 +631,7 @@ fn render(command: &Command, body: &str) -> Result<String, CliError> {
             Ok(lines.join("\n"))
         }
         Command::ProjectKey { .. }
+        | Command::Gc(_)
         | Command::Import(_)
         | Command::HookImport(_)
         | Command::Continue(_)
@@ -639,6 +644,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
     if matches!(
         &cli.command,
         Command::ProjectKey { .. }
+            | Command::Gc(_)
             | Command::Import(_)
             | Command::HookImport(_)
             | Command::Continue(_)

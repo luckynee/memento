@@ -88,6 +88,8 @@ async fn run_test(store: &Store) -> anyhow::Result<()> {
         retention: Retention::Keep,
         title: Some("title".into()),
         created: Some("2026-11-18T10:00:00Z".parse().unwrap()),
+        deleted_at: None,
+        collected_at: None,
     };
     store.upsert_session(session.clone()).await?;
     assert_eq!(store.get_session("h", "s1").await?, Some(session.clone()));

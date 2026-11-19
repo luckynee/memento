@@ -680,7 +680,7 @@ impl Store {
         Ok(())
     }
 
-    async fn list_sessions_filtered(&self, filter: ScopeFilter) -> Result<Vec<SessionRecord>> {
+    pub async fn list_sessions_filtered(&self, filter: ScopeFilter) -> Result<Vec<SessionRecord>> {
         self.scroll_payloads(&self.sessions_collection, filter.to_filter()?)
             .await?
             .into_iter()

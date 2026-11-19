@@ -74,6 +74,23 @@ pub struct SessionRecord {
     pub retention: Retention,
     pub title: Option<String>,
     pub created: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub deleted_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub collected_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseRequest {
+    pub harness: String,
+    pub project: String,
+    pub session: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseResponse {
+    pub released: bool,
+    pub removed: Vec<SessionKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
