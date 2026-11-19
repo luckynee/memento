@@ -1,6 +1,68 @@
 export type JevModel = { providerID: string; id: string; variant?: string };
 export const DEFAULT_JEV_MODEL: JevModel = { providerID: "opencode", id: "jev-1.13-free" };
 
+const scaffoldStripTags = new Set([
+    "system-reminder", "skill_content", "environment_context", "user_instructions",
+    "command-message", "command-name", "local-command-stdout", "local-command-stderr",
+    "local-command-caveat", "subagent", "memento-digest", "memento-memory", "memento-continuation",
+]);
+
+export function stripScaffolding(text: string): string {
+    let output = "";
+    let position = 0;
+    const stripped: string[] = [];
+    while (true) {
+        const start = text.indexOf("<", position);
+        if (start < 0) {
+            break;
+        }
+        if (stripped.length === 0) {
+            output += text.slice(position, start);
+        }
+        const match = /^<(\/?)([a-zA-Z0-9_-]+)(?=>|\s)/u.exec(text.slice(start));
+        let end = start + (match?.[0].length ?? 1);
+        let quote: string | undefined;
+        if (match) {
+            while (end < text.length) {
+                const character = text[end++];
+                if (quote === character) {
+                    quote = undefined;
+                } else if (!quote && (character === "'" || character === '"')) {
+                    quote = character;
+                } else if (!quote && character === ">") {
+                    break;
+                }
+            }
+        }
+        if (!match || end > text.length || text[end - 1] !== ">" || quote) {
+            if (stripped.length === 0) {
+                output += "<";
+            }
+            position = start + 1;
+            continue;
+        }
+        const name = match[2].toLowerCase();
+        if (scaffoldStripTags.has(name)) {
+            if (match[1]) {
+                if (stripped[stripped.length - 1] === name) {
+                    stripped.pop();
+                } else if (stripped.length === 0) {
+                    output += text.slice(start, end);
+                }
+            } else {
+                stripped.push(name);
+            }
+        } else if (stripped.length === 0 && name !== "command-args") {
+            output += text.slice(start, end);
+        }
+        position = end;
+    }
+    if (stripped.length === 0) {
+        output += text.slice(position);
+    }
+    return output === text ? output : output.trim();
+}
+
 type Question =
     | { type: "predicate"; name: string; instructions: string }
     | { type: "choice"; name: string; instructions: string; choices: { value: string | boolean; description?: string }[] };
@@ -95,10 +157,14 @@ export function parseJevModel(option: unknown): JevModel {
 }
 
 export async function classifyKind(decide: DecisionsFn, model: JevModel, text: string, role: "user" | "assistant" = "assistant"): Promise<"decision" | "constraint" | "task" | null> {
+    const classificationText = stripScaffolding(text);
+    if (!classificationText.trim()) {
+        return null;
+    }
     try {
         const result = await decide({
             model,
-            input: [{ type: "text", text: text.slice(0, 4000) }],
+            input: [{ type: "text", text: classificationText.slice(0, 4000) }],
             questions: [{
                 type: "choice",
                 name: "kind",
@@ -115,7 +181,9 @@ export async function classifyKind(decide: DecisionsFn, model: JevModel, text: s
         });
         const answer = result.answers.find((entry) => entry.name === "kind" && entry.type === "choice");
         if (answer?.type === "choice"
-            && (role === "assistant" || (typeof answer.confidence === "number" && Number.isFinite(answer.confidence) && answer.confidence >= 0.6))
+            && (answer.confidence === undefined
+                ? role === "assistant"
+                : typeof answer.confidence === "number" && Number.isFinite(answer.confidence) && answer.confidence >= 0.6)
             && (answer.choice === "decision" || answer.choice === "constraint" || (role === "assistant" && answer.choice === "task"))) {
             return answer.choice;
         }

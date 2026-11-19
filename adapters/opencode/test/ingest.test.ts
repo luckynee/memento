@@ -140,6 +140,25 @@ describe("incremental ingestion", () => {
         ]);
     });
 
+    test("classifies stripped text while sending original items to the daemon", async () => {
+        const inputs: string[] = [];
+        const fake = setup(async (input) => {
+            inputs.push(input.input[0].text);
+            return { answers: [{ type: "choice", name: "kind", choice: "decision", confidence: 0.6 }] };
+        });
+        const text = `<skill_content>${"injected".repeat(600)}</skill_content>workspace decision`;
+        fake.contexts.set("s", [
+            assistant("a", text),
+            { ...user("b"), text: "<system-reminder>hidden</system-reminder>" },
+        ]);
+        await fake.ingestor.flush("s");
+        expect(inputs).toEqual(["workspace decision"]);
+        expect(fake.ingests[0].items.map((item) => [item.text, item.kind_hint])).toEqual([
+            [text, "decision"],
+            ["<system-reminder>hidden</system-reminder>", null],
+        ]);
+    });
+
     test("evicts old classifications after 500 entries", async () => {
         let calls = 0;
         const fake = setup(async () => {

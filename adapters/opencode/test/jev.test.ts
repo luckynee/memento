@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { createIngestor } from "../src/ingest";
-import { classifyKind, createJevGate, DEFAULT_JEV_MODEL, type DecisionsFn } from "../src/jev";
+import { classifyKind, createJevGate, DEFAULT_JEV_MODEL, stripScaffolding, type DecisionsFn } from "../src/jev";
 import { createMemorySearchTool } from "../src/tools";
 
 const noTimer = () => () => {};
@@ -32,16 +32,62 @@ test("user classification requires confidence and uses request instead of note",
     choice = "constraint";
     confidence = 0.599;
     expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "user text", "user")).toBeNull();
+    expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "assistant text")).toBeNull();
     confidence = undefined;
     expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "user text", "user")).toBeNull();
     confidence = Number.NaN;
     expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "user text", "user")).toBeNull();
+    expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "assistant text")).toBeNull();
+    confidence = Number.POSITIVE_INFINITY;
+    expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "assistant text")).toBeNull();
+    confidence = 0.6;
+    expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "assistant text")).toBe("constraint");
     confidence = 1;
     choice = "request";
     expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "user text", "user")).toBeNull();
     choice = "decision";
     confidence = undefined;
     expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "assistant text")).toBe("decision");
+});
+
+test("strips the default Rust scaffolding tags and unwraps command arguments", () => {
+    const tags = [
+        "system-reminder", "skill_content", "environment_context", "user_instructions",
+        "command-message", "command-name", "local-command-stdout", "local-command-stderr",
+        "local-command-caveat", "subagent", "memento-digest", "memento-memory", "memento-continuation",
+    ];
+    for (const tag of tags) {
+        expect(stripScaffolding(`before <${tag} key="a > b">\nsecret\n</${tag}> after`)).toBe("before  after");
+    }
+    const cases = [
+        ["a<command-args x='1'>keep</command-args>b", "akeepb"],
+        ["a<SYSTEM-REMINDER>hide</sYsTeM-rEmInDeR>b", "ab"],
+        ["a<subagent>outer<subagent>inner</subagent>end</subagent>b", "ab"],
+        ["a<subagent>x</subagent><skill_content>y</skill_content>b", "ab"],
+        ["a<subagent>x<system-reminder>y</system-reminder>z</subagent>b", "ab"],
+        ["a<system-reminder attr='x'>unfinished", "a"],
+        ["a<system-reminderish>keep</system-reminderish>b", "a<system-reminderish>keep</system-reminderish>b"],
+        ["é<COMMAND-ARGS>🙂</COMMAND-ARGS>界", "é🙂界"],
+        ["a</subagent>b", "a</subagent>b"],
+        [" a<subagent>unfinished", "a"],
+        [" a<subagent attr='unfinished>", " a<subagent attr='unfinished>"],
+        ["  unchanged  ", "  unchanged  "],
+    ];
+    for (const [text, expected] of cases) {
+        expect(stripScaffolding(text)).toBe(expected);
+    }
+});
+
+test("classifies stripped text before truncation and skips empty scaffolding", async () => {
+    const inputs: string[] = [];
+    const decide: DecisionsFn = async (input) => {
+        inputs.push(input.input[0].text);
+        return { answers: [{ type: "choice", name: "kind", choice: "decision", confidence: 0.6 }] };
+    };
+    expect(await classifyKind(decide, DEFAULT_JEV_MODEL, `<system-reminder>${"x".repeat(5000)}</system-reminder>real detail`, "user")).toBe("decision");
+    expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "<memento-continuation>hidden</memento-continuation>")).toBeNull();
+    expect(await classifyKind(decide, DEFAULT_JEV_MODEL, " \n ", "user")).toBeNull();
+    expect(inputs).toEqual(["real detail"]);
 });
 
 test("failure starts cooldown, expiry retries, and success permits a new cooldown", async () => {
