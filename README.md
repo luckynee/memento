@@ -36,8 +36,8 @@ Add the plugin to `~/.config/opencode/opencode.jsonc` (or a project `.opencode/o
 - Switch models in the same session; the adapter serves the new model from a per-model snapshot.
 - New session continuing an old one: `/memento-continue <harness>/<session>` (bare id = opencode).
 - Hand off to the next session in this project, any harness: `/memento-handoff [harness]` in OpenCode, or `memento continue --from <harness>/<session> [--to <harness>]` from a shell. The next session started in the project claims it on its first event or `SessionStart` hook.
-- Inspect: `memento stats --harness <h> --project <dir> --session <ses>`, `memento digest ...`, `memento sessions lineage --harness <h> --session <ses>`.
-- Done: `memento forget --harness <h> --project <dir> --session <ses> --yes`, `--lineage <ses>` (that session and its continuations, across harnesses), or `--whole-project` (every harness).
+- Inspect from the project directory: `memento search "topic"`, `memento stats`, `memento digest`, `memento sessions lineage --harness <h> --session <ses>`.
+- Done: see [Cleanup](#cleanup) before forgetting or collecting memory.
 
 The project key is the main checkout path (`memento project-key`), identical across harnesses.
 
@@ -46,13 +46,29 @@ The project key is the main checkout path (`memento project-key`), identical acr
 | Harness | Writes memory | Reads memory | Setup |
 | --- | --- | --- | --- |
 | OpenCode | plugin (step/turn events) | digest after model switch, `memory_search`, continuation claim | plugin entry above |
-| Claude Code | `Stop`/`SessionEnd` hook imports the transcript | `SessionStart` hook injects a claimed continuation | `memento install-hooks claude-code --project DIR` (or `--user`) |
-| Codex | async `Stop` hook imports the rollout | `SessionStart` hook (also re-injects after compaction) | `memento install-hooks codex --project DIR` (or `--user`); trust the project (`codex --trust` or `/hooks`) |
-| agy | `memory_note` MCP tool | `memory_search`, `memory_digest`, `memory_continue` MCP tools | `agy mcp add memento -- /path/to/memento-mcp --harness agy` |
+| Claude Code | `Stop` hook starts a detached transcript import | `SessionStart` hook injects a claimed continuation | `memento install-hooks claude-code --project DIR` (or `--user`) |
+| Codex | `Stop` hook starts a detached rollout import | `SessionStart` hook (also re-injects after compaction) | `memento install-hooks codex --project DIR` (or `--user`); trust the project (`codex --trust` or `/hooks`) |
+| agy | `Stop` hook imports the transcript | `SessionStart` hook injects a claimed continuation | `memento install-hooks agy --project DIR` (or `--user`) |
+| Generic | `turn_end` imports a supported transcript or neutral items | `session_start` returns claimed context for the harness to inject | Wire JSON lifecycle events to `memento hook generic --harness NAME`; see [contract](docs/DESIGN.md#generic-hook-contract) |
 
-Any harness can also run the CLI directly: `memento import claude-code|codex --transcript PATH` (incremental cursor), `memento search`, `memento digest`.
+Any harness can use the CLI directly: `memento import claude-code|codex|agy --transcript PATH` (incremental cursor), `memento search`, `memento digest`. MCP is optional for agy and other MCP-capable harnesses; for agy, configure `agy mcp add memento -- /path/to/memento-mcp --harness agy`.
 
-Known limitation: when a model restates facts from the digest, the restatement is stored again ("memory echo"); duplicates rank together and are harmless for recall but grow the store.
+### Cleanup
+
+Preview deleted-session cleanup with `memento gc --project DIR --dry-run`, then run `memento gc --project DIR` when appropriate. Hooks also start gc at most daily per project; `MEMENTO_AUTO_GC=0` disables this. The daemon sweeps stale sessions by default. Deleted sessions can remain available to dependent continuations until collected.
+
+Explicit forgetting is destructive and has no dry-run flag. Inspect sessions and lineage first, then confirm the scope before `memento forget --harness H --project PROJECT --session S`, `--lineage S` (S and its descendants), or `--whole-project` (all harnesses). The CLI asks for confirmation unless `--yes` is supplied.
+
+### Skills
+
+From the repository, preview or install the bundled skills:
+
+```sh
+memento install-skills --harness all --project DIR --source skills --dry-run
+memento install-skills --harness all --project DIR --source skills
+```
+
+Use `--user` instead of `--project DIR` for user-wide installation. The installer skips foreign skills. Project locations are `.opencode/skills`, `.claude/skills`, and `.agents/skills` (shared by Codex and agy); user locations are `~/.config/opencode/skills`, `~/.claude/skills`, `~/.agents/skills`, and `~/.gemini/config/skills`, respectively.
 
 ## Jev
 

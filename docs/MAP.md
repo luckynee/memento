@@ -29,9 +29,10 @@
 
 | Path | Purpose |
 | --- | --- |
-| `crates/memento-cli/src/cross_harness.rs` | Claude Code / Codex JSONL importers (incl. Codex code-mode `exec`), cursor file, `hook`, `continue`, `project-key`, `install-hooks` |
+| `crates/memento-cli/src/cross_harness.rs` | Claude Code / Codex / agy JSONL importers, cursor file, generic and native hooks, continuation, cleanup, hook and skill installation |
 | `crates/memento-cli/tests/fixtures/` | Synthetic Claude and Codex transcripts |
 | `crates/memento-mcp/src/main.rs` | stdio MCP server (`rmcp` 3.11): `memory_search`, `memory_digest`, `memory_continue`, `memory_note` |
+| `skills/` | Harness-agnostic recall, handoff, cleanup, and harness connection skills |
 | CLI state | `${XDG_STATE_HOME:-~/.local/state}/memento/cursors.json` (+ `cursors.lock`) |
 | Session cleanup | `POST /v1/sessions/release` and `memento gc` collect deleted sessions while preserving dependent lineage |
 
@@ -44,6 +45,7 @@
 - Jev: `opencode/jev-1.13-free` works at cost 0 (`billing_source: free`); paid `opencode/jev-1.13` returns 402 without OpenCode Models credits (verified 2026-11-18). Adapter default is the free model.
 - End-to-end verified 2026-11-18 on a standalone OpenCode server: ingest on step/execution events, switch rewrite (digest system part + tail from the cut), multi-switch snapshots, `memory_search` via Code Mode, CLI `forget`.
 - Cross-harness end-to-end verified 2026-11-19 in a throwaway repo: OpenCode S1 -> (`memento continue`) Claude Code 2.1.319 `-p` (SessionStart claim + Stop import) -> Codex 0.169.0 `exec` (SessionStart claim + async Stop import) -> agy 1.5.11 via `memento-mcp` (search + note) -> new OpenCode session (first-sight claim + project-scope search with harness attribution). Lineage 4 hops across 3 harnesses; project-scope forget removed all harnesses' data.
+- agy 1.5.12 hooks verified live 2026-11-19: `SessionStart` claimed an OpenCode handoff without MCP, and `Stop` imported the turn; both hooks fire in `agy -p` and interactive sessions. `transcriptPath` may name `.system_generated/` or `logs/transcript_full.jsonl`. MCP remains optional.
 - Codex 0.169 runs tools in code mode: every call is `custom_tool_call` `exec` with a JavaScript `input` calling `tools.exec_command`, `tools.apply_patch`, `tools.web__run`, MCP tools.
 - Codex ignores project `.codex/hooks.json` until the project is trusted; `-c projects."<dir>".trust_level=...` does not count; `codex exec --trust` writes `[projects."<dir>"] trust_level = "trusted"` to `~/.codex/config.toml`. Scripted runs also need `--dangerously-bypass-hook-trust`.
 - Claude Code `-p` loads project `.claude/settings.json` hooks without extra trust flags.
@@ -65,4 +67,6 @@
 - A git repo with no commits gets OpenCode project id `global`, shared by all such directories, so the adapter's `projectID` ownership gate cannot separate them (open).
 - Codex 0.170 `archive` moves the rollout to `~/.codex/archived_sessions/`; `delete --force` removes it and its `session_index.jsonl` entry (non-interactive `delete` without `--force` refuses). Claude Code deletes transcripts silently after `cleanupPeriodDays` (default 30).
 - Release/gc verified live 2026-11-19 in `/tmp/memento-messy`: leaf delete collected (3 -> 0 segments, tombstone kept); parent with a Claude child retained and still recalled by the child; removing the child transcript + `memento gc` released the child and cascaded the parent; late Stop import into a tombstone stored nothing; archive left segments untouched; fork whose parent was collected before its first turn registered without parent and ingested the copied history.
+- Generic hooks verified live 2026-11-19 with harness `myagent`: a claim returned continuation context, ingested items were searchable with parent lineage, subagent start was not registered, and `session_deleted` cleared memory.
+- An OpenCode child with `parentID` stored zero segments and was not registered in a live 2026-11-19 check.
 - `adapters/opencode/src/jev.ts` `stripScaffolding` mirrors the Rust `strip_scaffolding` default tag set in `crates/memento-core/src/segment.rs`; keep both in sync.

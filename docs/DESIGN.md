@@ -47,8 +47,8 @@ OpenCode plugin (TypeScript, adapters/opencode)      memento (Rust workspace)
 - `project`: canonical project key (OpenCode `ctx.location.project.id`).
 - `session`: harness session id.
 - Lineage: a session may declare a `parent` session (continuation). Lineage of S is S plus all ancestors.
-- Search scopes: `session`, `lineage` (default), `project`, `global`.
-- Retention mode per session: `continuation` (default, user deletes when done) or `keep`. Forgetting is explicit: `memento forget --session|--lineage|--project`.
+- Search scopes: `session`, `lineage`, `project`, `global`. The CLI defaults to `project`, or `lineage` when a session is supplied.
+- Retention mode per session: `continuation` (default) or `keep`. Explicit forgetting uses `memento forget --session|--lineage|--whole-project`.
 
 ## Neutral ingest schema
 
@@ -126,7 +126,7 @@ Collection `memento_segments`:
 
 Collection `memento_sessions` (registry): payload-only points if the Rust client supports a collection without vectors, otherwise a 1-dim dummy dense vector. Point id: UUIDv5 over `harness/session`.
 
-- payload: `harness`, `project`, `session`, `parent` and `parent_harness` (optional), `retention`, `created`, `title`, `deleted_at`, `collected_at` (optional).
+- payload: `harness`, `project`, `session`, `parent` and `parent_harness` (optional), `retention`, `created`, `title`, activity and deletion timestamps, and `deleted_reason` (optional).
 - keyword indexes: `harness`, `project`, `session`, `parent`.
 - Linking rejects cycles and self-parenting (409).
 
@@ -168,14 +168,15 @@ All routes under `http://127.0.0.1:7377`. Optional bearer token via `MEMENTO_TOK
 | --- | --- | --- |
 | `GET /health` | | `{ "ok": true, "qdrant": true }` |
 | `PUT /v1/sessions` | `{ harness, project, session, parent?, parent_harness?, require_parent?, retention?, title? }`; merge semantics: absent fields keep stored values, `created` is set once | session record |
-| `GET /v1/sessions` | `?harness&project&include_deleted` | `{ sessions: [...] }` |
-| `POST /v1/sessions/release` | `{ harness, project, session }` | `{ released, removed: [{ harness, session }] }` |
+| `GET /v1/sessions` | `?harness?&project?&include_deleted?` | `{ sessions: [...] }` |
+| `POST /v1/sessions/release` | `{ harness, project, session, reason? }` | `{ released, removed: [{ harness, session }] }` |
+| `POST /v1/maintenance/sweep` | `{ project?, dry_run? }` | stale and removed session keys |
 | `GET /v1/sessions/{harness}/{session}/lineage` | | `{ lineage: ["ses_child", "ses_parent", ...] }` |
 | `POST /v1/ingest` | neutral ingest schema | `{ segments: n, skipped: n }` |
-| `POST /v1/search` | `{ harness, project, session, query, scope?, k?, kinds? }` | `{ hits: [{ id, score, kind, text, session, ts, path? }] }` |
+| `POST /v1/search` | `{ harness, project, session, query, scope?, k?, kinds? }` (empty harness and session allowed for project/global) | `{ hits: [{ id, score, kind, text, harness, session, ts, path? }] }` |
 | `GET /v1/digest` | `?harness&project&session&budget` | `{ text, segments }` |
 | `POST /v1/forget` | `{ harness, project?, session?, scope: "session" or "lineage" or "project" }` | `{ deleted: n }` |
-| `GET /v1/stats` | `?harness&project&session` | counts by kind |
+| `GET /v1/stats` | `?harness?&project?&session?` | counts by kind |
 
 Errors: `{ "error": { "code": "...", "message": "..." } }` with 4xx/5xx.
 
@@ -184,15 +185,17 @@ Errors: `{ "error": { "code": "...", "message": "..." } }` with 4xx/5xx.
 `memento [--url URL] <command>`; `MEMENTO_URL` default `http://127.0.0.1:7377`.
 
 - `health`
-- `stats --harness H [--project P] [--session S]` (`{ total, by_kind }`)
+- `stats [--harness H] [--project P] [--session S]` (`{ total, by_kind }`; current project by default, all harnesses when omitted)
 - `sessions list --harness H [--project P]`
-- `sessions link --harness H --project P --child S --parent P2 [--title T] [--retention continuation|keep]`
+- `sessions link --harness H --project P --child S --parent P2 [--parent-harness H2] [--title T] [--retention continuation|keep]`
 - `sessions lineage --harness H --session S`
-- `search <query> --harness H --project P --session S [--scope lineage] [--k 8] [--kind KIND]...`
-- `digest --harness H --project P --session S [--budget N]`
+- `search <query> [--harness H] [--project P] [--session S] [--scope session|lineage|project|global] [--k 8] [--kind KIND]...` (current project by default; session and lineage require harness and session)
+- `digest [--harness H --session S] [--project P] [--budget N]` (current project and its most recently active non-deleted session by default; selected session reported on stderr)
 - `forget --harness H [--project P] (--session S | --lineage S | --whole-project) [--yes]` (`--whole-project` requires `--project`; without `--yes` it asks on a TTY and refuses otherwise)
 - `gc [--project DIR] [--dry-run] [--json]` releases sessions whose harness data is gone.
 - `ingest --file turns.json|-` (neutral schema, for harnesses without a plugin)
+- `install-hooks claude-code|codex|agy [--project DIR | --user] [--dry-run]`
+- `install-skills [--harness opencode|claude-code|codex|agy|all] [--project DIR | --user] --source DIR [--dry-run]`
 - Global: `--url`, `--token`, `--json`, `--timeout-secs`.
 
 ## OpenCode adapter
@@ -210,7 +213,7 @@ Location: `adapters/opencode/` (Promise plugin, `@opencode/plugin`). Verified co
 - Persisted history is never touched; the hook changes only the outgoing request.
 - Tool `memory_search({ query, scope? })`: calls `/v1/search` (k = 12). Jev `predicate` relevance runs in parallel only for prose kinds (`user_request`, `assistant_note`, `decision`, `constraint`, `task`); `file_change`, `command` and `file_ref` hits pass through on score because they are short and lexical. Keep hits with probability >= 0.5, return max 6 ordered by score. On any Jev error or timeout (3 s), fall back to the top 6 by score. Results arrive as tool output at the end of the context, which keeps the prefix cacheable.
 - Command `memento-continue <session>`: links current session to parent via `PUT /v1/sessions`, then puts the digest as `ctx.session.instructions.entry.put({ key: "memento-continuation", ... })`.
-- Options (`ctx.options`): `url`, `token`, `harness` (`opencode`), `tailUserTurns` (3), `tailCharBudget` (40000), `digestBudget` (12000), `jev` (true), `jevModel` (`opencode/jev-1.13-free`), `enabled` (true).
+- Options (`ctx.options`): `url`, `token`, `harness` (`opencode`), `tailUserTurns` (3), `tailCharBudget` (40000), `digestBudget` (12000), `jev` (true), `jevModel` (`opencode/jev-1.13-free`), `enabled` (true), `reconcile` (true).
 
 ## Deployment
 
@@ -220,7 +223,7 @@ Location: `adapters/opencode/` (Promise plugin, `@opencode/plugin`). Verified co
 
 ## Cross-harness (v1.1)
 
-Verified 2026-11-18: Claude Code 2.1.319 and Codex CLI 0.169.0 store JSONL transcripts and expose command hooks (`SessionStart`, `UserPromptSubmit`, `Stop`, `SessionEnd`) that receive JSON on stdin with `session_id`, `transcript_path`, `cwd`, `hook_event_name`, and accept `{"hookSpecificOutput":{"hookEventName":"<event>","additionalContext":"..."}}` on `SessionStart` and `UserPromptSubmit`. agy 1.5.11 stores conversations as SQLite with binary step payloads (format unverified) and documents no lifecycle hooks, but supports MCP servers (`agy mcp add`).
+Claude Code and Codex store JSONL transcripts and expose command hooks that receive JSON on stdin with `session_id`, `transcript_path`, `cwd`, and `hook_event_name`; `SessionStart` accepts `hookSpecificOutput.additionalContext`. agy 1.5.12 also supports lifecycle hooks and exports JSONL transcripts.
 
 Harness ids: `opencode`, `claude-code`, `codex`, `agy`.
 
@@ -240,21 +243,55 @@ Harness ids: `opencode`, `claude-code`, `codex`, `agy`.
 
 `PUT /v1/continuations { project, parent_harness, parent_session, target_harness? }` stores one pending continuation per `(project, target_harness)` slot; an absent target is a separate any-harness slot. A put replaces only its slot. `POST /v1/continuations/claim { project, harness, session }` first returns an existing unexpired claim by that caller, then tries the caller's targeted slot followed by the any-harness slot. Expired slots are deleted; a slot claimed by another caller is skipped. A successful claim records `claimed_by` and `claimed_at`, links the session (`parent_harness`, `parent`), and returns `{ claimed: bool, parent_harness?, parent?, digest? }` with the lineage digest. Claims are idempotent per caller for 24 h; unclaimed slots expire 24 h after creation, and claimed slots expire 24 h after claiming. Legacy project-only-ID records remain claimable until expiry or replacement. Project-scope forget removes all continuation slots for the project. Links, continuations and claims are rejected with 409 `cross_project` when parent and child projects differ, and with 409 `too_deep` when the lineage would exceed 64. CLI: `memento continue --from <harness>/<session> [--project DIR] [--to HARNESS]`. Every adapter claims on its first event for a new session.
 
-### Session deletion and gc
+### Harness lifecycle
 
-`POST /v1/sessions/release` marks a matching session deleted under the operation write lock and registry lock, then collects eligible deleted sessions throughout the project to a fixpoint. A missing or project-mismatched session returns `released: false`. A deleted session is collectible only when it is not `keep`, has no uncollected child in any harness, and is not the parent of an unexpired unclaimed continuation. Collection deletes its segments and slots referencing it as parent or claimant, and preserves a tombstone with `collected_at`. Collected tombstones older than seven days are pruned during collection. Explicit `forget` runs collection afterwards, allowing deleted ancestors to cascade.
+| Harness | Track | Inject context | Import turns | Deletion signal | Subagent rule |
+| --- | --- | --- | --- | --- | --- |
+| OpenCode | Plugin session events | Plugin claim and model-switch rewrite | Plugin ingest | `session.deleted`; startup and daily reconciliation | Exclude sessions with `parentID`; searches resolve to the root non-subagent ancestor |
+| Claude Code | `SessionStart` hook | Claimed digest in `additionalContext` | `Stop` transcript import | `memento gc` | Skip inputs with nonempty `agent_id`; subagent hooks are not installed |
+| Codex | `SessionStart` hook | Claimed digest in `additionalContext` | `Stop` transcript import | `memento gc`; `SessionEnd` is not a delete signal | Skip inputs with nonempty `agent_id`; subagent hooks are not installed |
+| agy | `SessionStart` hook | Claimed digest in `injectSteps` | `Stop` transcript import | `memento gc` | Skip inputs with nonempty `agent_id`; per-subagent hook behavior is unverified |
+| Generic | `session_start` hook | Returned `context` | `turn_end` transcript or items | `session_deleted` or supported-harness gc | Skip nonempty `agent_id` or `is_subagent: true` |
+
+OpenCode excludes sessions with `parentID` from registration, ingestion, claims, switch rewriting, and compaction handling. Their `memory_search` resolves to the root non-subagent ancestor in the same project, using bounded cached lookups; continuation and handoff commands are unavailable. Forks remain independent sessions. At startup and every 24 hours, unless `reconcile: false`, the adapter checks registered OpenCode sessions and releases confirmed deleted sessions (`SessionNotFoundError`) and previously registered subagents. Claude Code and Codex emit `SubagentStart` and `SubagentStop` with `agent_id` and `agent_type`, but these hooks are not installed. agy documents subagents without subagent hook fields; whether `SessionStart` fires for them is unverified.
+
+#### Generic hook contract
+
+Invoke `memento hook generic --harness NAME` with JSON on stdin:
+
+```json
+{
+  "event": "session_start|turn_end|session_end|session_deleted",
+  "session_id": "session-id",
+  "cwd": "/absolute/project/path",
+  "transcript_path": "/optional/transcript.jsonl",
+  "transcript_format": "claude-code|codex|agy",
+  "items": [],
+  "parent": { "harness": "opencode", "session": "parent-id" },
+  "agent_id": "optional-subagent-id",
+  "is_subagent": false
+}
+```
+
+Only `event`, `session_id`, and `cwd` are required; `items` contains neutral `IngestItem` objects. `session_start` registers the session, optionally links its parent, claims a continuation, and prints `{"context":"<framed digest>"}` or `{"context":null}`. `turn_end` imports a transcript when `transcript_path` is present, requiring `transcript_format` and taking precedence over `items`; otherwise it ingests the items. `session_deleted` releases with reason `deleted`; `session_end` is a no-op. Unknown events print `{}` and warn on stderr. A nonempty `agent_id` or true `is_subagent` prints `{}` and does nothing.
+
+#### Retention lifecycle
+
+`POST /v1/sessions/release` marks a matching session deleted under the operation write lock and registry lock, then collects eligible deleted sessions throughout the project to a fixpoint. Its optional reason is stored as `deleted_reason` (`deleted`, `stale`, or `subagent`). A missing or project-mismatched session returns `released: false`. A deleted session is retained for dependents until it is not `keep`, has no uncollected child in any harness, and is not the parent of an unexpired unclaimed continuation. Collection deletes its segments leaf-first and slots referencing it as parent or claimant, and preserves a tombstone with `collected_at`. Collected tombstones older than seven days are pruned during collection. Explicit `forget` runs collection afterwards, allowing deleted ancestors to cascade.
 
 Deleted records reject resurrection: ingest stores nothing and session updates return the existing record. A continuation put against a deleted parent returns 409 `parent_deleted`; strict links with `require_parent: true` return 409 `parent_unavailable` if the parent is missing or deleted. Deleted but uncollected ancestors remain visible in descendant lineage search and digest, but not project or global search. Collected tombstones never appear in search or digest. Session listing excludes deleted records unless `include_deleted=true`.
 
-`memento gc` uses the canonical project key for its directory, skips fresh pending imports, and reports alive, deleted and released, retained, and unknown sessions. OpenCode's API reports missing sessions with `HTTP 404` or `SessionNotFoundError`; other failures, including an unreachable server, are unknown. `MEMENTO_OPENCODE_BIN` overrides the executable. Claude Code silently deletes transcripts after `cleanupPeriodDays` (default 30); gc checks cursor paths or searches `~/.claude/projects` (or `CLAUDE_CONFIG_DIR/projects`), treating a missing projects directory as unknown. Codex rollouts live under `~/.codex/sessions`; archive moves them to `archived_sessions`, while `codex delete --force` removes them. Both locations are checked under `CODEX_HOME` when set. agy has no transcript-based deletion detection. Successful releases prune cursor entries under the cursor lock; dry runs do not mutate anything.
+The daemon records activity on ingest, session updates, continuation claims, search, and digest, throttled to one write per 15 minutes. Startup backfills missing timestamps. A periodic sweep controlled by `MEMENTO_STALE_DAYS` (default 7, zero disables) and `MEMENTO_STALE_SWEEP_SECS` (default 3600) marks inactive sessions stale only when their uncollected descendants are also inactive. Unexpired unclaimed continuation slots protect their parent and ancestors; `keep` sessions are never marked. The collector then removes eligible segments. `POST /v1/maintenance/sweep` accepts optional `project` and `dry_run` and reports stale and removed session keys.
+
+`memento gc` uses the canonical project key for its directory, skips fresh pending imports, and reports alive, deleted and released, retained, and unknown sessions. Each `SessionStart` hook also starts detached gc at most once per 24 hours per project; `MEMENTO_AUTO_GC=0` disables it. OpenCode's API reports missing sessions with `HTTP 404` or `SessionNotFoundError`; other failures, including an unreachable server, are unknown. `MEMENTO_OPENCODE_BIN` overrides the executable. Claude Code silently deletes transcripts after `cleanupPeriodDays` (default 30); gc checks cursor paths or searches `~/.claude/projects` (or `CLAUDE_CONFIG_DIR/projects`), treating a missing projects directory as unknown. Codex checks both `~/.codex/sessions` and `archived_sessions` (under `CODEX_HOME` when set); archive is not deletion, and its `SessionEnd` reason is only `other` even on archive or delete. agy is deleted when both `~/.gemini/antigravity-cli/conversations/<id>.db` and `~/.gemini/antigravity-cli/brain/<id>/` are gone. Successful releases prune cursor entries under the cursor lock; dry runs do not mutate anything.
 
 ### Transcript importers (CLI)
 
-`memento import claude-code|codex --transcript PATH [--session ID] [--project DIR]` parses the JSONL into neutral items and posts them. Incremental: a cursor file in `${XDG_STATE_HOME:-~/.local/state}/memento/cursors.json` keyed by canonical transcript path stores the byte offset of the last fully parsed line; only new complete lines are sent. A tool call without a result holds the cursor until its result arrives or a later real user turn appears, after which it is treated as abandoned. Codex command outputs are decoded from plain text (`Process exited with code N`, `Exit code: N`) or JSON wrappers (`output`, `metadata.exit_code`). Jev classification (when available) runs on scaffolding-stripped text and skips items that are empty after stripping. Reasoning (`thinking`, `reasoning`) is dropped. Claude Code records with `isMeta: true`, `isSidechain` subagent transcripts, and harness command/caveat wrappers are marked `injected` or stripped by the policy. Codex `session_meta`, `turn_context`, `<environment_context>` and `<user_instructions>` user messages are marked `injected`.
+`memento import claude-code|codex|agy --transcript PATH [--session ID] [--project DIR]` parses the JSONL into neutral items and posts them. Incremental: a cursor file in `${XDG_STATE_HOME:-~/.local/state}/memento/cursors.json` keyed by canonical transcript path stores the byte offset of the last fully parsed line; only new complete lines are sent. A tool call without a result holds the cursor until its result arrives or a later real user turn appears, after which it is treated as abandoned. Codex command outputs are decoded from plain text (`Process exited with code N`, `Exit code: N`) or JSON wrappers (`output`, `metadata.exit_code`). Jev classification (when available) runs on scaffolding-stripped text and skips items that are empty after stripping. Reasoning (`thinking`, `reasoning`) is dropped. Claude Code records with `isMeta: true`, `isSidechain` subagent transcripts, and harness command/caveat wrappers are marked `injected` or stripped by the policy. Codex `session_meta`, `turn_context`, `<environment_context>` and `<user_instructions>` user messages are marked `injected`. agy records include `USER_INPUT`, `SYSTEM_MESSAGE` (hook injections, skipped), `PLANNER_RESPONSE`, and `GENERIC`.
 
 ### Hooks (CLI)
 
-`memento hook claude-code|codex` reads the hook JSON from stdin:
+`memento hook claude-code|codex|agy` reads the hook JSON from stdin:
 - `SessionStart`: claim a pending continuation for `project-key(cwd)`; if claimed, print the `additionalContext` JSON with the framed digest (`<memento-continuation>` wrapper, reference data, not instructions).
 - `Stop`: the installed synchronous hook atomically writes a timestamped pending marker in `${XDG_STATE_HOME:-~/.local/state}/memento/pending/<harness>-<sanitized-session>`, spawns a detached incremental importer of `transcript_path`, and returns `{}`. The importer removes the marker after success or failure and appends output to `${XDG_STATE_HOME:-~/.local/state}/memento/import.log` when available. `MEMENTO_HOOK_SYNC=1` imports synchronously without a marker; a spawn failure also falls back to synchronous import. Async hooks are dropped by `claude -p` and `codex exec` in headless runs (verified 2026-11-19).
 - `memento continue` waits for the source session's pending marker before calling the daemon, polling every 100 ms for at most 30 s and warning on timeout; markers at least 60 s old are removed and ignored. Overlapping imports share one marker, so the first importer to finish can remove it while another is still pending. `SessionStart` claims do not wait.
@@ -262,13 +299,14 @@ Deleted records reject resurrection: ingest stores nothing and session updates r
 - `SessionStart`: overall deadline 8 s, then prints nothing.
 - Optional Jev classification of imported text: when `opencode` is on PATH and `MEMENTO_JEV` is not `0`, the CLI calls `opencode api post /api/experimental/generate/decisions` with `opencode/jev-1.13-free` (user text: `decision|constraint|request`; assistant text: `decision|constraint|task|note`; confidence >= 0.6), at most 12 items per import, 5 s each, with a 10 minute cooldown file after a failure. Never on `SessionStart`.
 - Hook failures exit 0 with a message on stderr; detached import failures are logged when possible. Synchronous fallback and the explicit sync escape hatch can block the harness.
-- Output contract: `SessionStart` prints the `hookSpecificOutput` JSON or nothing; `Stop` prints `{}` (Codex rejects plain text on `Stop`); `SessionEnd` prints nothing.
+- Output contract: Claude Code and Codex `SessionStart` print `hookSpecificOutput` JSON or nothing; `Stop` prints `{}` (Codex rejects plain text on `Stop`); `SessionEnd` prints nothing.
 - Codex specifics (developers.openai.com/codex/hooks, verified 2026-11-18): `~/.codex/hooks.json` (or `[hooks]` in `config.toml`), matcher groups `{ "matcher"?, "hooks": [{ "type": "command", "command", "timeout"?, "async"?, "additionalContextLimit"? }] }`; `SessionEnd` timeout is 1 s by default and at most 3 s, so imports run from `Stop`; `SessionStart` sources `startup|resume|clear|compact|fork` (on `compact` the digest is re-injected); non-managed hooks need trust via `/hooks`, or `--dangerously-bypass-hook-trust` for scripted runs; default `additionalContext` spill threshold about 2500 tokens (`additionalContextLimit` raises it).
-- `memento install-hooks claude-code|codex [--project DIR | --user] [--dry-run]` prints or merges the hook entries under an exclusive lock, preserving existing configuration and file permissions, removing memento `SessionEnd` entries and `async` from memento `Stop` entries from older installs, and writing a `.bak` copy with the original mode.
+- agy 1.5.12 uses project `.agents/hooks.json` or global `~/.gemini/config/hooks.json`; `SessionStart` and `Stop` fire in `agy -p` and interactive sessions. Input uses camelCase fields including `conversationId`, `cwd`, `transcriptPath`, `workspacePaths`, and `hookEventName`. A claim outputs `{"injectSteps":[{"systemMessage":{"systemMessage":"..."}}]}`. `transcriptPath` can be a `.system_generated/` directory or `logs/transcript_full.jsonl`.
+- `memento install-hooks claude-code|codex|agy [--project DIR | --user] [--dry-run]` prints or merges hook entries under an exclusive lock, preserving existing configuration and file permissions, removing memento `SessionEnd` entries and `async` from memento `Stop` entries from older installs, and writing a `.bak` copy with the original mode.
 
 ### MCP server
 
-`memento-mcp --harness NAME` (crate `memento-mcp`, `rmcp` 3.x) serves stdio MCP tools for harnesses without hooks (agy) and as an option for all: `memory_search { query, scope?, project?, session? }`, `memory_digest { project?, harness?, session? }`, `memory_continue { from_harness, from_session }` (claims nothing, returns the parent digest), and `memory_note { kind: decision|constraint|task|note, text, session? }` which stores an explicit note for harnesses whose transcripts cannot be imported (default session `<harness>-notes`, project from the server's cwd).
+`memento-mcp --harness NAME` (crate `memento-mcp`, `rmcp` 3.x) optionally serves stdio MCP tools for agy and other MCP-capable harnesses: `memory_search { query, scope?, project?, session? }`, `memory_digest { project?, harness?, session? }`, `memory_continue { from_harness, from_session }` (claims nothing, returns the parent digest), and `memory_note { kind: decision|constraint|task|note, text, session? }` which stores an explicit note (default session `<harness>-notes`, project from the server's cwd).
 
 ### Hardening (2026-11-19)
 
@@ -284,5 +322,4 @@ Deleted records reject resurrection: ingest stores nothing and session updates r
 ## Non-goals for v1
 
 - Proactive per-turn recall injection (needs deterministic per-message injection storage to stay cache-safe).
-- Custom compaction via the `compaction` hook.
-- Adapters for other harnesses (the neutral `ingest` CLI is the escape hatch).
+- General-purpose summarization or custom compaction beyond the model-switch digest.
