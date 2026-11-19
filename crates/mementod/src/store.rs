@@ -594,12 +594,33 @@ impl Store {
     }
 
     pub async fn upsert_continuation(&self, record: ContinuationRecord) -> Result<()> {
-        let id = Uuid::new_v5(&CONTINUATION_NAMESPACE, record.project.as_bytes());
+        let legacy_id = Uuid::new_v5(&CONTINUATION_NAMESPACE, record.project.as_bytes());
+        let records = self.list_continuations(&record.project).await?;
+        if records.iter().any(|(id, existing)| {
+            id == &PointId::from(legacy_id.to_string())
+                && existing.target_harness == record.target_harness
+        }) {
+            self.delete_continuation(PointId::from(legacy_id.to_string()))
+                .await?;
+        }
+        let id = Uuid::new_v5(
+            &CONTINUATION_NAMESPACE,
+            format!(
+                "{}\0{}",
+                record.project,
+                record.target_harness.as_deref().unwrap_or_default()
+            )
+            .as_bytes(),
+        );
+        self.write_continuation(id.to_string().into(), record).await
+    }
+
+    pub async fn write_continuation(&self, id: PointId, record: ContinuationRecord) -> Result<()> {
         let payload =
             Payload::try_from(serde_json::to_value(record).context("serializing continuation")?)
                 .context("encoding continuation payload")?;
         let point = PointStruct {
-            id: Some(id.to_string().into()),
+            id: Some(id),
             payload: payload.into(),
             vectors: Some(HashMap::<String, Vector>::new().into()),
         };
@@ -612,34 +633,50 @@ impl Store {
         Ok(())
     }
 
-    pub async fn get_continuation(&self, project: &str) -> Result<Option<ContinuationRecord>> {
-        let mut records = self
-            .scroll_payloads(
-                &self.continuations_collection,
-                Filter::must([Condition::matches("project", project.to_owned())]),
-            )
-            .await?
-            .into_iter()
-            .map(|(_, payload)| {
-                Payload::from(payload)
-                    .deserialize()
-                    .context("decoding continuation payload")
-            })
-            .collect::<Result<Vec<_>>>()?;
-        ensure!(records.len() <= 1, "duplicate continuation records");
-        Ok(records.pop())
+    pub async fn list_continuations(
+        &self,
+        project: &str,
+    ) -> Result<Vec<(PointId, ContinuationRecord)>> {
+        self.scroll_payloads(
+            &self.continuations_collection,
+            Filter::must([Condition::matches("project", project.to_owned())]),
+        )
+        .await?
+        .into_iter()
+        .map(|(id, payload)| {
+            let id = id.context("missing continuation point id")?;
+            let record = Payload::from(payload)
+                .deserialize()
+                .context("decoding continuation payload")?;
+            Ok((id, record))
+        })
+        .collect()
     }
 
-    pub async fn delete_continuation(&self, project: &str) -> Result<()> {
-        let id = Uuid::new_v5(&CONTINUATION_NAMESPACE, project.as_bytes());
+    pub async fn delete_continuation(&self, id: PointId) -> Result<()> {
         self.client
             .delete_points(
                 DeletePointsBuilder::new(&self.continuations_collection)
-                    .points(vec![PointId::from(id.to_string())])
+                    .points(vec![id])
                     .wait(true),
             )
             .await
             .context("deleting continuation")?;
+        Ok(())
+    }
+
+    pub async fn delete_project_continuations(&self, project: &str) -> Result<()> {
+        self.client
+            .delete_points(
+                DeletePointsBuilder::new(&self.continuations_collection)
+                    .points(Filter::must([Condition::matches(
+                        "project",
+                        project.to_owned(),
+                    )]))
+                    .wait(true),
+            )
+            .await
+            .context("deleting project continuations")?;
         Ok(())
     }
 

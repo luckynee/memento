@@ -212,6 +212,7 @@ async fn run_workflow(address: &str, store: &Store) {
     assert_eq!(stats["total"], 2);
     cross_harness_workflow(address, store).await;
     regression_workflow(address, store).await;
+    continuation_slots_workflow(address, store).await;
 }
 
 async fn regression_workflow(address: &str, store: &Store) {
@@ -293,7 +294,13 @@ async fn regression_workflow(address: &str, store: &Store) {
     let claim = json!({"project":"one","harness":"reg","session":"continuation"});
     let first = call("POST", "/v1/continuations/claim", claim.clone()).await;
     assert_eq!(first.1["claimed"], true);
-    let retained = store.get_continuation("one").await.unwrap().unwrap();
+    let retained = store
+        .list_continuations("one")
+        .await
+        .unwrap()
+        .pop()
+        .unwrap()
+        .1;
     assert_eq!(
         retained.claimed_by,
         Some(SessionKey {
@@ -741,7 +748,14 @@ async fn cross_harness_workflow(address: &str, store: &Store) {
         .1,
         json!({"claimed":false})
     );
-    assert!(store.get_continuation("cross").await.unwrap().is_none());
+    assert!(
+        store
+            .list_continuations("cross")
+            .await
+            .unwrap()
+            .iter()
+            .all(|(_, record)| record.target_harness.is_some())
+    );
 
     assert_eq!(
         call(
@@ -763,7 +777,14 @@ async fn cross_harness_workflow(address: &str, store: &Store) {
         .0,
         409
     );
-    assert!(store.get_continuation("cross").await.unwrap().is_some());
+    assert!(
+        store
+            .list_continuations("cross")
+            .await
+            .unwrap()
+            .iter()
+            .any(|(_, record)| record.target_harness.is_none())
+    );
 
     let forgotten = call(
         "POST",
@@ -798,4 +819,232 @@ async fn cross_harness_workflow(address: &str, store: &Store) {
     assert_eq!(forgotten["deleted"], 1);
     assert!(store.get_session("codex", "new").await.unwrap().is_none());
     assert!(store.get_session("codex", "other").await.unwrap().is_some());
+}
+
+async fn continuation_slots_workflow(address: &str, store: &Store) {
+    use std::collections::HashMap;
+
+    use chrono::{Duration, Utc};
+    use memento_core::protocol::ContinuationRecord;
+    use qdrant_client::{
+        Payload,
+        qdrant::{PointStruct, UpsertPointsBuilder, Vector},
+    };
+
+    let call = |method: &'static str, path: &'static str, body: Value| async move {
+        request(address, method, path, Some("test-token"), &body.to_string()).await
+    };
+    for session in ["parent-a", "parent-b"] {
+        assert_eq!(
+            call(
+                "PUT",
+                "/v1/sessions",
+                json!({"harness":"opencode","project":"slots","session":session})
+            )
+            .await
+            .0,
+            200
+        );
+    }
+    let pending = |parent, target: Option<&str>| json!({"project":"slots","parent_harness":"opencode","parent_session":parent,"target_harness":target});
+    let claim = |harness, session| json!({"project":"slots","harness":harness,"session":session});
+    for target in ["claude-code", "codex"] {
+        assert_eq!(
+            call(
+                "PUT",
+                "/v1/continuations",
+                pending("parent-a", Some(target))
+            )
+            .await
+            .0,
+            200
+        );
+    }
+    assert_eq!(
+        call(
+            "PUT",
+            "/v1/continuations",
+            pending("parent-b", Some("codex"))
+        )
+        .await
+        .0,
+        200
+    );
+    for (harness, parent) in [("claude-code", "parent-a"), ("codex", "parent-b")] {
+        let response = call("POST", "/v1/continuations/claim", claim(harness, "first")).await;
+        assert_eq!(response.1["claimed"], true);
+        assert_eq!(response.1["parent"], parent);
+    }
+    assert_eq!(
+        call("PUT", "/v1/continuations", pending("parent-a", None))
+            .await
+            .0,
+        200
+    );
+    let fallback = call(
+        "POST",
+        "/v1/continuations/claim",
+        claim("codex", "fallback"),
+    )
+    .await;
+    assert_eq!(fallback.1["claimed"], true);
+    assert_eq!(fallback.1["parent"], "parent-a");
+    assert_eq!(
+        call(
+            "PUT",
+            "/v1/continuations",
+            pending("parent-b", Some("codex"))
+        )
+        .await
+        .0,
+        200
+    );
+    let repeated = call(
+        "POST",
+        "/v1/continuations/claim",
+        claim("codex", "fallback"),
+    )
+    .await;
+    assert_eq!(repeated.1["parent"], "parent-a");
+    assert_eq!(
+        call("PUT", "/v1/continuations", pending("parent-a", None))
+            .await
+            .0,
+        200
+    );
+    let preferred = call(
+        "POST",
+        "/v1/continuations/claim",
+        claim("codex", "preferred"),
+    )
+    .await;
+    assert_eq!(preferred.1["parent"], "parent-b");
+    let fallback = call(
+        "POST",
+        "/v1/continuations/claim",
+        claim("claude-code", "fallback"),
+    )
+    .await;
+    assert_eq!(fallback.1["parent"], "parent-a");
+
+    store
+        .upsert_continuation(ContinuationRecord {
+            project: "slots".into(),
+            parent_harness: "opencode".into(),
+            parent_session: "parent-b".into(),
+            target_harness: Some("codex".into()),
+            created: Utc::now() - Duration::hours(25),
+            claimed_by: None,
+            claimed_at: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        call("PUT", "/v1/continuations", pending("parent-a", None))
+            .await
+            .0,
+        200
+    );
+    let expired = call(
+        "POST",
+        "/v1/continuations/claim",
+        claim("codex", "expired-target"),
+    )
+    .await;
+    assert_eq!(expired.1["parent"], "parent-a");
+    assert!(
+        store
+            .list_continuations("slots")
+            .await
+            .unwrap()
+            .iter()
+            .all(|(_, record)| record.target_harness.as_deref() != Some("codex"))
+    );
+    assert!(
+        store
+            .list_continuations("slots")
+            .await
+            .unwrap()
+            .iter()
+            .any(|(_, record)| record.target_harness.as_deref() == Some("claude-code"))
+    );
+
+    let legacy = ContinuationRecord {
+        project: "slots".into(),
+        parent_harness: "opencode".into(),
+        parent_session: "parent-b".into(),
+        target_harness: Some("legacy".into()),
+        created: Utc::now(),
+        claimed_by: None,
+        claimed_at: None,
+    };
+    let legacy_id = Uuid::new_v5(
+        &Uuid::from_u128(0x8bcc899f_a24d_53d6_83e1_80669ad0e156),
+        b"slots",
+    );
+    let payload = Payload::try_from(serde_json::to_value(legacy).unwrap()).unwrap();
+    store
+        .client
+        .upsert_points(
+            UpsertPointsBuilder::new(
+                &store.continuations_collection,
+                vec![PointStruct {
+                    id: Some(legacy_id.to_string().into()),
+                    payload: payload.into(),
+                    vectors: Some(HashMap::<String, Vector>::new().into()),
+                }],
+            )
+            .wait(true),
+        )
+        .await
+        .unwrap();
+    let legacy_claim = call("POST", "/v1/continuations/claim", claim("legacy", "first")).await;
+    assert_eq!(legacy_claim.1["parent"], "parent-b");
+    assert_eq!(
+        call("POST", "/v1/continuations/claim", claim("legacy", "first"))
+            .await
+            .1["claimed"],
+        true
+    );
+    assert_eq!(
+        call(
+            "PUT",
+            "/v1/continuations",
+            pending("parent-a", Some("legacy"))
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        store
+            .list_continuations("slots")
+            .await
+            .unwrap()
+            .iter()
+            .filter(|(_, record)| record.target_harness.as_deref() == Some("legacy"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        call(
+            "POST",
+            "/v1/continuations/claim",
+            claim("legacy", "replacement")
+        )
+        .await
+        .1["parent"],
+        "parent-a"
+    );
+    assert_eq!(
+        call(
+            "POST",
+            "/v1/forget",
+            json!({"harness":"opencode","project":"slots","scope":"project"})
+        )
+        .await
+        .0,
+        200
+    );
+    assert!(store.list_continuations("slots").await.unwrap().is_empty());
 }

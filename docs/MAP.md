@@ -11,7 +11,7 @@
 | `crates/memento-core/src/rerank.rs` | RRF normalization + recency rerank (no wall clock) |
 | `crates/memento-core/src/digest.rs` | `render_digest`, `merge_chunks`; byte-stable output |
 | `crates/mementod/src/routes.rs` | All HTTP routes, bearer auth, error mapping |
-| `crates/mementod/src/store.rs` | Qdrant schema, segment upsert (dense + bm25 Document), hybrid RRF candidates, session registry |
+| `crates/mementod/src/store.rs` | Qdrant schema, segment upsert (dense + bm25 Document), hybrid RRF candidates, session registry, continuation slots per `(project, target_harness)` (`list_continuations` keeps legacy project-only ids) |
 | `crates/mementod/src/embed.rs` | `Embedder` trait, `FastEmbedder` (spawn_blocking), `FakeEmbedder` for tests |
 | `crates/mementod/tests/` | Live Qdrant tests, gated on `MEMENTO_TEST_QDRANT_URL` |
 | `crates/memento-cli/src/main.rs` | `memento` CLI, HTTP client of mementod |

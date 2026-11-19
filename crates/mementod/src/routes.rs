@@ -438,35 +438,44 @@ async fn claim_continuation(
     required(&request.harness)?;
     required(&request.session)?;
     let _guard = state.registry_lock.lock().await;
-    let pending = state.app.store.get_continuation(&request.project).await;
-    let Some(mut pending) = store_result(&state, pending).await? else {
-        return Ok(Json(unclaimed()));
-    };
-    if Utc::now().signed_duration_since(pending.claimed_at.unwrap_or(pending.created))
-        >= chrono::Duration::hours(24)
-    {
-        let result = state.app.store.delete_continuation(&request.project).await;
-        store_result(&state, result).await?;
-        return Ok(Json(unclaimed()));
-    }
-    if pending
-        .target_harness
-        .as_deref()
-        .is_some_and(|target| target != request.harness)
-    {
-        return Ok(Json(unclaimed()));
-    }
     let caller = SessionKey {
         harness: request.harness.clone(),
         session: request.session.clone(),
     };
-    if pending
-        .claimed_by
-        .as_ref()
-        .is_some_and(|claimed| claimed != &caller)
-    {
-        return Ok(Json(unclaimed()));
+    let records = state.app.store.list_continuations(&request.project).await;
+    let mut records = store_result(&state, records).await?;
+    records.retain(|(_, pending)| {
+        pending.target_harness.is_none()
+            || pending.target_harness.as_deref() == Some(&request.harness)
+    });
+    records.sort_by_key(|(_, pending)| {
+        (
+            pending.claimed_by.as_ref() != Some(&caller),
+            pending.target_harness.is_none(),
+        )
+    });
+    let mut selected = None;
+    for (id, pending) in records {
+        if Utc::now().signed_duration_since(pending.claimed_at.unwrap_or(pending.created))
+            >= chrono::Duration::hours(24)
+        {
+            let result = state.app.store.delete_continuation(id).await;
+            store_result(&state, result).await?;
+            continue;
+        }
+        if pending
+            .claimed_by
+            .as_ref()
+            .is_some_and(|claimed| claimed != &caller)
+        {
+            continue;
+        }
+        selected = Some((id, pending));
+        break;
     }
+    let Some((id, mut pending)) = selected else {
+        return Ok(Json(unclaimed()));
+    };
     let parent = state
         .app
         .store
@@ -491,7 +500,11 @@ async fn claim_continuation(
     if pending.claimed_by.is_none() {
         pending.claimed_by = Some(caller);
         pending.claimed_at = Some(Utc::now());
-        let result = state.app.store.upsert_continuation(pending.clone()).await;
+        let result = state
+            .app
+            .store
+            .write_continuation(id, pending.clone())
+            .await;
         store_result(&state, result).await?;
     }
     let record = merge_session(
@@ -850,6 +863,14 @@ async fn forget(
     let deleted = store_result(&state, deleted).await?;
     let result = state.app.store.delete_sessions(&filter).await;
     store_result(&state, result).await?;
+    if request.scope == ForgetScope::Project {
+        let result = state
+            .app
+            .store
+            .delete_project_continuations(filter.project.as_deref().unwrap_or_default())
+            .await;
+        store_result(&state, result).await?;
+    }
     Ok(Json(ForgetResponse {
         deleted: usize::try_from(deleted).map_err(ApiError::internal)?,
     }))
