@@ -52,4 +52,5 @@
 - Codex 0.169 code-mode `exec` outputs are `[{"type":"input_text","text":"Script completed\nWall time ...\nOutput:\n"}, {...command output...}]` with no exit code; no `Script failed` variant observed in local rollouts.
 - Interactive TUIs: Codex asks to trust new project hooks once (`Hooks need review`); Claude Code and agy ask to trust the folder once. agy's start banner and Codex `/status` show account emails, so recordings must redact or avoid them.
 - Demo recording on this machine (i3 + picom, X11): OBS Xcomposite capture of a kitty window records black; `ffmpeg -f x11grab -window_id <wid>` works. Demo kitty is floated and made sticky via `i3-msg` so it stays mapped.
+- OpenCode switching a 285k session to a 200k-window model (`claude-agent/claude-haiku-4-5`) auto-compacts before the context hook (verified 2026-11-19: 182,179-token summarisation call). With the adapter's compaction hook the compaction is a memento digest at zero model cost; first requests about 19-20k, 4/4 recall.
 - `adapters/opencode/src/jev.ts` `stripScaffolding` mirrors the Rust `strip_scaffolding` default tag set in `crates/memento-core/src/segment.rs`; keep both in sync.
