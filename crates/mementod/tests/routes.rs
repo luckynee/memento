@@ -925,6 +925,82 @@ async fn cross_harness_workflow(address: &str, store: &Store) {
             .len(),
         7
     );
+    let project_hits = call(
+        "POST",
+        "/v1/search",
+        json!({"harness":"","project":"cross","session":"","query":"unique_marker","scope":"project"}),
+    )
+    .await;
+    assert_eq!(project_hits.0, 200);
+    assert_eq!(project_hits.1["hits"].as_array().unwrap().len(), 4);
+    assert!(
+        project_hits.1["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|hit| {
+                hit["harness"]
+                    .as_str()
+                    .is_some_and(|harness| !harness.is_empty())
+                    && hit["session"]
+                        .as_str()
+                        .is_some_and(|session| !session.is_empty())
+            })
+    );
+    assert_eq!(
+        call(
+            "POST",
+            "/v1/search",
+            json!({"harness":"","project":"cross","session":"","query":"unique_marker","scope":"global"})
+        )
+        .await
+        .1["hits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        7
+    );
+    for scope in ["session", "lineage"] {
+        assert_eq!(
+            call(
+                "POST",
+                "/v1/search",
+                json!({"harness":"","project":"cross","session":"","query":"unique_marker","scope":scope})
+            )
+            .await
+            .0,
+            400
+        );
+    }
+    assert_eq!(
+        call("GET", "/v1/sessions?project=cross", json!(null))
+            .await
+            .1["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    assert_eq!(
+        call("GET", "/v1/stats?project=cross", json!(null)).await.1["total"],
+        4
+    );
+    assert_eq!(
+        call("GET", "/v1/stats?project=cross&session=same", json!(null))
+            .await
+            .1["total"],
+        3
+    );
+    assert_eq!(
+        call(
+            "GET",
+            "/v1/stats?harness=opencode&project=cross&session=same",
+            json!(null)
+        )
+        .await
+        .1["total"],
+        1
+    );
     let digest = call(
         "GET",
         "/v1/digest?harness=claude-code&project=cross&session=same",

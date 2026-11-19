@@ -92,8 +92,8 @@ enum Command {
 #[derive(Debug, Args)]
 struct StatsArgs {
     #[arg(long, help = "Harness identifier")]
-    harness: String,
-    #[arg(long, help = "Filter by project")]
+    harness: Option<String>,
+    #[arg(long, help = "Filter by project (default: current project)")]
     project: Option<String>,
     #[arg(long, help = "Filter by session")]
     session: Option<String>,
@@ -201,13 +201,17 @@ struct SearchArgs {
     #[arg(help = "Search query")]
     query: String,
     #[arg(long, help = "Harness identifier")]
-    harness: String,
-    #[arg(long, help = "Project identifier")]
-    project: String,
+    harness: Option<String>,
+    #[arg(long, help = "Project identifier (default: current project)")]
+    project: Option<String>,
     #[arg(long, help = "Session identifier")]
-    session: String,
-    #[arg(long, value_enum, default_value = "lineage", help = "Search scope")]
-    scope: ScopeArg,
+    session: Option<String>,
+    #[arg(
+        long,
+        value_enum,
+        help = "Search scope (default: project, or lineage with --session)"
+    )]
+    scope: Option<ScopeArg>,
     #[arg(long, default_value_t = 8, help = "Maximum number of results")]
     k: usize,
     #[arg(long, value_enum, help = "Filter by memory kind")]
@@ -216,12 +220,12 @@ struct SearchArgs {
 
 #[derive(Debug, Args)]
 struct DigestArgs {
-    #[arg(long, help = "Harness identifier")]
-    harness: String,
-    #[arg(long, help = "Project identifier")]
-    project: String,
-    #[arg(long, help = "Session identifier")]
-    session: String,
+    #[arg(long, requires = "session", help = "Harness identifier")]
+    harness: Option<String>,
+    #[arg(long, help = "Project identifier (default: current project)")]
+    project: Option<String>,
+    #[arg(long, requires = "harness", help = "Session identifier")]
+    session: Option<String>,
     #[arg(long, help = "Digest character budget")]
     budget: Option<usize>,
 }
@@ -322,6 +326,39 @@ fn endpoint(base: &str, segments: &[&str]) -> Result<Url, CliError> {
     Ok(url)
 }
 
+fn project_or_current(project: &Option<String>) -> Result<String, CliError> {
+    match project {
+        Some(project) => Ok(project.clone()),
+        None => cross_harness::project_key(None),
+    }
+}
+
+fn search_scope(args: &SearchArgs) -> Scope {
+    args.scope
+        .map(Into::into)
+        .unwrap_or(if args.session.is_some() {
+            Scope::Lineage
+        } else {
+            Scope::Project
+        })
+}
+
+fn validate_search(args: &SearchArgs) -> Result<(), CliError> {
+    if matches!(search_scope(args), Scope::Session | Scope::Lineage) {
+        if args.harness.as_deref().is_none_or(str::is_empty) {
+            return Err(CliError::other(
+                "--harness is required for session or lineage search",
+            ));
+        }
+        if args.session.as_deref().is_none_or(str::is_empty) {
+            return Err(CliError::other(
+                "--session is required for session or lineage search",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn build_request(
     client: &Client,
     cli: &Cli,
@@ -361,10 +398,12 @@ fn build_request(
             command: SessionsCommand::Lineage { .. },
         } => request,
         Command::Stats(args) => {
-            let mut query = vec![("harness", args.harness.as_str())];
-            if let Some(project) = &args.project {
-                query.push(("project", project));
+            let project = project_or_current(&args.project)?;
+            let mut query = Vec::new();
+            if let Some(harness) = &args.harness {
+                query.push(("harness", harness.as_str()));
             }
+            query.push(("project", project.as_str()));
             if let Some(session) = &args.session {
                 query.push(("session", session));
             }
@@ -404,21 +443,34 @@ fn build_request(
             }
             request.json(&body)
         }
-        Command::Search(args) => request.json(&SearchRequest {
-            harness: args.harness.clone(),
-            project: args.project.clone(),
-            session: args.session.clone(),
-            query: args.query.clone(),
-            scope: args.scope.into(),
-            k: args.k,
-            kinds: (!args.kind.is_empty())
-                .then(|| args.kind.iter().copied().map(Into::into).collect()),
-        }),
+        Command::Search(args) => {
+            validate_search(args)?;
+            request.json(&SearchRequest {
+                harness: args.harness.clone().unwrap_or_default(),
+                project: project_or_current(&args.project)?,
+                session: args.session.clone().unwrap_or_default(),
+                query: args.query.clone(),
+                scope: search_scope(args),
+                k: args.k,
+                kinds: (!args.kind.is_empty())
+                    .then(|| args.kind.iter().copied().map(Into::into).collect()),
+            })
+        }
         Command::Digest(args) => {
             let mut query = vec![
-                ("harness", args.harness.clone()),
-                ("project", args.project.clone()),
-                ("session", args.session.clone()),
+                (
+                    "harness",
+                    args.harness
+                        .clone()
+                        .ok_or_else(|| CliError::other("missing digest harness"))?,
+                ),
+                ("project", project_or_current(&args.project)?),
+                (
+                    "session",
+                    args.session
+                        .clone()
+                        .ok_or_else(|| CliError::other("missing digest session"))?,
+                ),
             ];
             if let Some(budget) = args.budget {
                 query.push(("budget", budget.to_string()));
@@ -645,7 +697,57 @@ fn render(command: &Command, body: &str) -> Result<String, CliError> {
     }
 }
 
-fn run(cli: Cli) -> Result<(), CliError> {
+fn select_digest_session(client: &Client, cli: &mut Cli) -> Result<(), CliError> {
+    let Command::Digest(args) = &cli.command else {
+        return Ok(());
+    };
+    if args.session.is_some() {
+        return Ok(());
+    }
+    let project = project_or_current(&args.project)?;
+    let mut request = client
+        .get(endpoint(&cli.url, &["v1", "sessions"])?)
+        .query(&[("project", &project)]);
+    if let Some(token) = &cli.token {
+        request = request.bearer_auth(token);
+    }
+    let response = request
+        .send()
+        .map_err(|error| CliError::request(error, &cli.url))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .map_err(|error| CliError::other(format!("cannot read session list: {error}")))?;
+    if !status.is_success() {
+        return Err(response_error(status, &body));
+    }
+    #[derive(Deserialize)]
+    struct SessionsResponse {
+        sessions: Vec<SessionRecord>,
+    }
+    let response: SessionsResponse = parse_response(&body)?;
+    let session = response
+        .sessions
+        .into_iter()
+        .filter(|record| record.project == project && record.deleted_at.is_none())
+        .max_by(|left, right| {
+            left.last_active_at
+                .cmp(&right.last_active_at)
+                .then_with(|| left.harness.cmp(&right.harness))
+                .then_with(|| left.session.cmp(&right.session))
+        })
+        .ok_or_else(|| CliError::other(format!("no active sessions in project {project}")))?;
+    eprintln!("digest session: {}/{}", session.harness, session.session);
+    let Command::Digest(args) = &mut cli.command else {
+        unreachable!()
+    };
+    args.project = Some(project);
+    args.harness = Some(session.harness);
+    args.session = Some(session.session);
+    Ok(())
+}
+
+fn run(mut cli: Cli) -> Result<(), CliError> {
     if matches!(
         &cli.command,
         Command::ProjectKey { .. }
@@ -673,6 +775,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
         .timeout(Duration::from_secs(cli.timeout_secs))
         .build()
         .map_err(|error| CliError::other(format!("cannot create HTTP client: {error}")))?;
+    select_digest_session(&client, &mut cli)?;
     let request = build_request(&client, &cli, ingest.as_ref())?;
     let response = client
         .execute(request)
@@ -823,7 +926,7 @@ mod tests {
         let Command::Search(args) = cli.command else {
             panic!("expected search")
         };
-        assert!(matches!(args.scope, ScopeArg::Lineage));
+        assert_eq!(search_scope(&args), Scope::Lineage);
         assert_eq!(args.k, 8);
         assert!(args.kind.is_empty());
     }
@@ -995,6 +1098,53 @@ mod tests {
             digest.url().query(),
             Some("harness=h&project=p&session=s&budget=100")
         );
+    }
+
+    #[test]
+    fn search_and_stats_default_to_current_project() {
+        let project = cross_harness::project_key(None).unwrap();
+        let search = request(&["search", "retry limit"]);
+        assert_eq!(
+            body(&search),
+            json!({"harness":"","project":project,"session":"","query":"retry limit","scope":"project","k":8,"kinds":null})
+        );
+        let global = request(&["search", "retry", "--scope", "global"]);
+        assert_eq!(body(&global)["scope"], "global");
+        let lineage = request(&["search", "retry", "--harness", "h", "--session", "s"]);
+        assert_eq!(body(&lineage)["scope"], "lineage");
+        let stats = request(&["stats"]);
+        assert_eq!(
+            stats.url().query_pairs().collect::<Vec<_>>(),
+            vec![("project".into(), project.into())]
+        );
+    }
+
+    #[test]
+    fn scoped_search_requires_harness_and_session() {
+        for scope in ["session", "lineage"] {
+            for args in [
+                vec!["search", "q", "--scope", scope],
+                vec!["search", "q", "--scope", scope, "--harness", "h"],
+                vec!["search", "q", "--scope", scope, "--session", "s"],
+            ] {
+                let cli = parse(&args);
+                let error = build_request(&Client::new(), &cli, None).unwrap_err();
+                assert!(error.message.contains("required"));
+            }
+        }
+        let cli = parse(&["search", "q", "--session", "s"]);
+        assert!(
+            build_request(&Client::new(), &cli, None)
+                .unwrap_err()
+                .message
+                .contains("--harness")
+        );
+    }
+
+    #[test]
+    fn digest_rejects_partial_explicit_identity() {
+        assert!(Cli::try_parse_from(["memento", "digest", "--harness", "h"]).is_err());
+        assert!(Cli::try_parse_from(["memento", "digest", "--session", "s"]).is_err());
     }
 
     #[test]

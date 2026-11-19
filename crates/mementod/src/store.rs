@@ -32,6 +32,7 @@ const CONTINUATION_NAMESPACE: Uuid = Uuid::from_u128(0x8bcc899f_a24d_53d6_83e1_8
 pub struct ScopeFilter {
     pub harness: Option<String>,
     pub project: Option<String>,
+    pub session: Option<String>,
     pub sessions: Option<Vec<SessionKey>>,
     pub kinds: Option<Vec<Kind>>,
 }
@@ -44,6 +45,9 @@ impl ScopeFilter {
         }
         if let Some(project) = &self.project {
             conditions.push(Condition::matches("project", project.clone()));
+        }
+        if let Some(session) = &self.session {
+            conditions.push(Condition::matches("session", session.clone()));
         }
         if let Some(sessions) = &self.sessions {
             ensure!(
@@ -873,6 +877,7 @@ mod tests {
         let filter = ScopeFilter {
             harness: Some("h".into()),
             project: Some("p".into()),
+            session: Some("a".into()),
             sessions: Some(vec![
                 SessionKey {
                     harness: "h".into(),
@@ -887,7 +892,7 @@ mod tests {
         }
         .to_filter()
         .unwrap();
-        assert_eq!(filter.must.len(), 4);
+        assert_eq!(filter.must.len(), 5);
         assert!(
             ScopeFilter {
                 sessions: Some(vec![]),

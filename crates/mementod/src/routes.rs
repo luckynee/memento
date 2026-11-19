@@ -940,7 +940,7 @@ fn unclaimed() -> ClaimResponse {
 
 #[derive(Deserialize)]
 struct SessionQuery {
-    harness: String,
+    harness: Option<String>,
     project: Option<String>,
     #[serde(default)]
     include_deleted: bool,
@@ -956,11 +956,17 @@ async fn list_sessions(
     query: Result<Query<SessionQuery>, QueryRejection>,
 ) -> ApiResult<SessionsResponse> {
     let query = query_params(query)?;
-    required(&query.harness)?;
+    if let Some(harness) = &query.harness {
+        required(harness)?;
+    }
     let sessions = state
         .app
         .store
-        .list_sessions(&query.harness, query.project.as_deref())
+        .list_sessions_filtered(ScopeFilter {
+            harness: query.harness,
+            project: query.project,
+            ..Default::default()
+        })
         .await;
     let mut sessions = store_result(&state, sessions).await?;
     if !query.include_deleted {
@@ -1129,15 +1135,19 @@ async fn search(
     body: Result<Json<SearchRequest>, JsonRejection>,
 ) -> ApiResult<SearchResponse> {
     let request = json_body(body)?;
-    required(&request.harness)?;
     required(&request.project)?;
-    required(&request.session)?;
     required(&request.query)?;
+    if matches!(request.scope, Scope::Session | Scope::Lineage) {
+        required(&request.harness)?;
+        required(&request.session)?;
+    }
     if request.k > 50 {
         return Err(ApiError::invalid("k must not exceed 50"));
     }
     let _operation = state.operation_lock.read().await;
-    read_activity(&state, &request.harness, &request.project, &request.session).await;
+    if !request.harness.trim().is_empty() && !request.session.trim().is_empty() {
+        read_activity(&state, &request.harness, &request.project, &request.session).await;
+    }
     if request.kinds.as_ref().is_some_and(Vec::is_empty) {
         return Ok(Json(SearchResponse { hits: Vec::new() }));
     }
@@ -1179,6 +1189,7 @@ async fn search(
     let filter = ScopeFilter {
         harness: None,
         project: (request.scope != Scope::Global).then_some(request.project),
+        session: None,
         sessions,
         kinds: request.kinds,
     };
@@ -1380,7 +1391,7 @@ async fn forget(
 
 #[derive(Deserialize)]
 struct StatsQuery {
-    harness: String,
+    harness: Option<String>,
     project: Option<String>,
     session: Option<String>,
 }
@@ -1396,19 +1407,19 @@ async fn stats(
     query: Result<Query<StatsQuery>, QueryRejection>,
 ) -> ApiResult<StatsResponse> {
     let query = query_params(query)?;
-    required(&query.harness)?;
+    if let Some(harness) = &query.harness {
+        required(harness)?;
+    }
+    if let Some(session) = &query.session {
+        required(session)?;
+    }
     let by_kind = state
         .app
         .store
         .count_by_kind(&ScopeFilter {
-            harness: Some(query.harness.clone()),
+            harness: query.harness,
             project: query.project,
-            sessions: query.session.map(|session| {
-                vec![SessionKey {
-                    harness: query.harness,
-                    session,
-                }]
-            }),
+            session: query.session,
             ..Default::default()
         })
         .await;

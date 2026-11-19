@@ -132,7 +132,7 @@ pub struct InstallSkillsArgs {
     dry_run: bool,
 }
 
-fn project_key(dir: Option<&Path>) -> Result<String, CliError> {
+pub(super) fn project_key(dir: Option<&Path>) -> Result<String, CliError> {
     let dir = match dir {
         Some(dir) => dir.to_path_buf(),
         None => env::current_dir()
