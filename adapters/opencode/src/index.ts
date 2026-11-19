@@ -54,6 +54,7 @@ export default Plugin.define({
             client,
             storage: ctx.storage,
             loadContext: (sessionID) => ctx.session.context({ sessionID }).catch(() => []),
+            loadSession: (sessionID) => ctx.session.get({ sessionID }),
             putInstruction: (sessionID, key, value) => ctx.session.instructions.entry.put({ sessionID, key, value }),
             decide,
             jevModel: options.jevModel,

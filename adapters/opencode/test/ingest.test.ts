@@ -6,7 +6,7 @@ import type { IngestItem } from "../src/transcript";
 const user = (id: string) => ({ id, type: "user", time: { created: 0 }, text: id });
 const assistant = (id: string, text: string) => ({ id, type: "assistant", time: { created: 0 }, content: [{ type: "text", text }] });
 
-function setup(decide?: DecisionsFn) {
+function setup(decide?: DecisionsFn, loadSession?: (sessionID: string) => Promise<{ fork?: { sessionID: string }; time: { created: number } }>) {
     const values = new Map<string, unknown>();
     const contexts = new Map<string, unknown[]>();
     const puts: unknown[] = [];
@@ -28,6 +28,7 @@ function setup(decide?: DecisionsFn) {
             async set(key, value) { values.set(key, value); },
         },
         async loadContext(sessionID) { return contexts.get(sessionID) ?? []; },
+        loadSession,
         async putInstruction() {},
         decide,
         jevModel: DEFAULT_JEV_MODEL,
@@ -39,6 +40,53 @@ function setup(decide?: DecisionsFn) {
 }
 
 describe("incremental ingestion", () => {
+    test("links forks and ingests only messages created at or after the fork", async () => {
+        const fake = setup(undefined, async () => ({ fork: { sessionID: "parent" }, time: { created: 100 } }));
+        fake.contexts.set("fork", [
+            { ...user("copied-user"), time: { created: 10 } },
+            { ...assistant("copied-assistant", "old"), time: { created: 20 } },
+            { ...user("new-user"), time: { created: 100 } },
+            { ...assistant("new-assistant", "new"), time: { created: 101 } },
+        ]);
+        await fake.ingestor.ensureRegistered("fork");
+        await fake.ingestor.flush("fork");
+        expect(fake.puts).toEqual([{ harness: "opencode", project: "p", session: "fork", parent_harness: "opencode", parent: "parent" }]);
+        expect(fake.ingests[0].items.map((item) => item.source_id)).toEqual(["new-user", "new-assistant:text:0"]);
+        expect(fake.values.get("memento/ingest/fork")).toBe("new-assistant");
+    });
+
+    test("fork filtering survives a restart and a context without the cursor", async () => {
+        const fake = setup(undefined, async () => ({ fork: { sessionID: "parent" }, time: { created: 100 } }));
+        fake.contexts.set("fork", [{ ...user("copied"), time: { created: 1 } }]);
+        await fake.ingestor.flush("fork");
+        expect(fake.ingests).toHaveLength(0);
+        fake.contexts.set("fork", [
+            { ...user("copied"), time: { created: 1 } },
+            { ...user("new"), time: { created: 101 } },
+        ]);
+        await fake.ingestor.flush("fork");
+        fake.values.set("memento/ingest/fork", "missing");
+        await fake.ingestor.flush("fork");
+        expect(fake.ingests.map((entry) => entry.items.map((item) => item.source_id))).toEqual([["new"], ["new"]]);
+    });
+
+    test("session lookup failure logs and backfills without a parent", async () => {
+        const fake = setup(undefined, async () => { throw new Error("lookup failed"); });
+        fake.contexts.set("s", [user("a")]);
+        await fake.ingestor.flush("s");
+        expect(fake.puts).toEqual([{ harness: "opencode", project: "p", session: "s" }]);
+        expect(fake.ingests[0].items.map((item) => item.source_id)).toEqual(["a"]);
+        expect(fake.errors).toHaveLength(1);
+    });
+
+    test("a non-fork lookup preserves full backfill", async () => {
+        const fake = setup(undefined, async () => ({ time: { created: 100 } }));
+        fake.contexts.set("s", [user("a")]);
+        await fake.ingestor.flush("s");
+        expect(fake.puts).toEqual([{ harness: "opencode", project: "p", session: "s" }]);
+        expect(fake.ingests[0].items.map((item) => item.source_id)).toEqual(["a"]);
+    });
+
     test("backfills, registers once, and ingests only new messages", async () => {
         const fake = setup();
         fake.contexts.set("s", [user("a"), user("b")]);
@@ -237,6 +285,28 @@ describe("incremental ingestion", () => {
         await Promise.all([first, second]);
         expect(order).toEqual(["start-1", "end-1", "start-2", "end-2"]);
     });
+});
+
+test("a claimed continuation wins over the fork parent while copied messages stay excluded", async () => {
+    const values = new Map<string, unknown>();
+    const puts: unknown[] = [];
+    const ingests: IngestItem[] = [];
+    const ingestor = createIngestor({
+        client: {
+            async claimContinuation() { return { claimed: true, parent_harness: "codex", parent: "claimed", digest: "digest" }; },
+            async putSession(value) { puts.push(value); },
+            async ingest(value) { ingests.push(...value.items); return { segments: value.items.length, skipped: 0 }; },
+        },
+        storage: { async get(key) { return values.get(key); }, async set(key, value) { values.set(key, value); } },
+        async loadSession() { return { fork: { sessionID: "fork-parent" }, time: { created: 100 } }; },
+        async loadContext() { return [{ ...user("copied"), time: { created: 1 } }, { ...user("new"), time: { created: 100 } }]; },
+        async putInstruction() {},
+        jevModel: DEFAULT_JEV_MODEL, harness: "opencode", project: "p", log() {},
+    });
+    await ingestor.flush("s");
+    expect(puts).toEqual([{ harness: "opencode", project: "p", session: "s" }]);
+    expect(JSON.parse(String(values.get("memento/parent/s")))).toEqual({ harness: "codex", session: "claimed" });
+    expect(ingests.map((item) => item.source_id)).toEqual(["new"]);
 });
 
 test("claims once before registration, serializes with ingestion, and stores a framed parent", async () => {

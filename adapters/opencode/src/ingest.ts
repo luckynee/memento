@@ -13,6 +13,7 @@ export function createIngestor(deps: {
     client: Pick<MementoClient, "putSession" | "ingest" | "claimContinuation">;
     storage: Storage;
     loadContext(sessionID: string): Promise<unknown[]>;
+    loadSession?(sessionID: string): Promise<{ fork?: { sessionID: string }; time: { created: number } }>;
     putInstruction(sessionID: string, key: string, value: string): Promise<unknown>;
     decide?: DecisionsFn;
     jevModel: JevModel;
@@ -56,7 +57,24 @@ export function createIngestor(deps: {
             state.registered = true;
             state.retryClaim = true;
         }
+        let fork: { sessionID: string; created: number } | undefined;
+        if (!state.registered && deps.loadSession) {
+            try {
+                const session = await deps.loadSession(sessionID);
+                if (session.fork) {
+                    if (typeof session.fork.sessionID !== "string" || !session.fork.sessionID
+                        || typeof session.time?.created !== "number" || !Number.isFinite(session.time.created)) {
+                        throw new Error("Fork parent or creation time is missing");
+                    }
+                    fork = { sessionID: session.fork.sessionID, created: session.time.created };
+                    await deps.storage.set(`memento/fork/${sessionID}`, JSON.stringify(fork));
+                }
+            } catch (error) {
+                deps.log(`Failed to look up fork for session ${sessionID}`, error);
+            }
+        }
         const claimKey = `memento/claimed/${sessionID}`;
+        let claimedParent = false;
         if (await deps.storage.get(claimKey) !== true) {
             try {
                 const claim = await deps.client.claimContinuation({ project: deps.project, harness: deps.harness, session: sessionID });
@@ -69,6 +87,7 @@ export function createIngestor(deps: {
                     }
                 }
                 if (claim.claimed) {
+                    claimedParent = true;
                     await deps.storage.set(`memento/parent/${sessionID}`, JSON.stringify({ harness: claim.parent_harness, session: claim.parent }));
                     await deps.putInstruction(sessionID, "memento-continuation", frameContinuation(claim.parent_harness!, claim.parent!, claim.digest!));
                 }
@@ -82,7 +101,13 @@ export function createIngestor(deps: {
             }
         }
         if (!state.registered) {
-            await deps.client.putSession({ harness: deps.harness, project: deps.project, session: sessionID });
+            const hasClaimedParent = claimedParent || typeof await deps.storage.get(`memento/parent/${sessionID}`) === "string";
+            await deps.client.putSession({
+                harness: deps.harness,
+                project: deps.project,
+                session: sessionID,
+                ...(fork && !hasClaimedParent ? { parent_harness: deps.harness, parent: fork.sessionID } : {}),
+            });
             if (state.retryClaim) {
                 await deps.storage.set(`memento/registered/${sessionID}`, "claim-pending");
                 state.registered = true;
@@ -99,7 +124,25 @@ export function createIngestor(deps: {
         const cursorValue = await deps.storage.get(`memento/ingest/${sessionID}`);
         const cursor = typeof cursorValue === "string" ? cursorValue : undefined;
         const context = await deps.loadContext(sessionID);
-        const selection = selectNewMessages(context, cursor);
+        const forkValue = await deps.storage.get(`memento/fork/${sessionID}`);
+        let forkCreated: number | undefined;
+        if (typeof forkValue === "string") {
+            const fork = JSON.parse(forkValue) as { created?: unknown };
+            if (typeof fork.created === "number" && Number.isFinite(fork.created)) {
+                forkCreated = fork.created;
+            }
+        }
+        const forkContext = forkCreated === undefined ? context : context.filter((value) => {
+            if (!value || typeof value !== "object" || !("time" in value)) {
+                return true;
+            }
+            const time = value.time;
+            if (!time || typeof time !== "object" || !("created" in time) || typeof time.created !== "number") {
+                return true;
+            }
+            return time.created >= forkCreated;
+        });
+        const selection = selectNewMessages(forkContext, cursor);
         const items = selection.messages.flatMap(mapMessage);
         if (deps.decide) {
             const decide = deps.decide;
