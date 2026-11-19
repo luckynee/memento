@@ -12,6 +12,8 @@ test("uses the canonical project path when available", () => {
 test("step ended dispatches ingestion and cleanup stops the subscription", async () => {
     const values = new Map<string, unknown>();
     const ingests: unknown[] = [];
+    const hooks: string[] = [];
+    const disposedHooks: string[] = [];
     let subscriptionTypes: readonly string[] = [];
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async (url, init) => {
@@ -34,7 +36,10 @@ test("step ended dispatches ingestion and cleanup stops the subscription", async
         },
         session: {
             async context() { return [{ id: "u", type: "user", time: { created: 0 }, text: "hello" }]; },
-            async hook() { return registration(); },
+            async hook(name: string) {
+                hooks.push(name);
+                return { async dispose() { disposedHooks.push(name); } };
+            },
             instructions: { entry: { async put() {} } },
         },
         tool: { async transform() { return registration(); } },
@@ -66,7 +71,9 @@ test("step ended dispatches ingestion and cleanup stops the subscription", async
         });
         expect(subscriptionTypes).toContain("session.step.ended");
         expect(ingests).toHaveLength(1);
+        expect(hooks).toEqual(["context", "compaction"]);
         if (cleanup) { await cleanup(); }
+        expect(disposedHooks).toEqual(["context", "compaction"]);
     } finally {
         globalThis.fetch = originalFetch;
     }

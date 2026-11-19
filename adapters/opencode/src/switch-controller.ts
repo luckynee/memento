@@ -1,5 +1,5 @@
 import type { MementoClient } from "./client";
-import { cloneMessage, rewriteForSwitch, sameModel, type ConversationMessage, type ModelRef, type SwitchState, type SystemText } from "./switch";
+import { buildDigestText, cloneMessage, rewriteForSwitch, sameModel, type ConversationMessage, type ModelRef, type SwitchState, type SystemText } from "./switch";
 
 type Storage = {
     get(key: string): Promise<unknown>;
@@ -85,6 +85,32 @@ export function createSwitchController(deps: {
         return undefined;
     }
 
+    function onCompaction(event: { sessionID: string; model: ModelRef; result?: { summary: string; metadata?: Record<string, unknown> } }): Promise<void> {
+        return serialize(event.sessionID, async () => {
+            const state = await load(event.sessionID);
+            const previous = state.lastModel ?? historyModel(await deps.loadContext(event.sessionID)) ?? state.origin;
+            if (!previous || sameModel(event.model, previous)) {
+                return;
+            }
+            await deps.flush(event.sessionID);
+            const digest = await deps.client.digest({
+                harness: deps.harness,
+                project: deps.project,
+                session: event.sessionID,
+                budget: deps.digestBudget,
+            });
+            const model = { providerID: event.model.providerID, id: event.model.id };
+            const modelKey = `${model.providerID}/${model.id}`;
+            await persist(event.sessionID, {
+                ...state,
+                origin: state.origin ?? previous,
+                lastModel: model,
+                snapshots: { ...state.snapshots, [modelKey]: { cutMessageID: null, digest: digest.text, compacted: true } },
+            });
+            event.result = { summary: buildDigestText(digest.text), metadata: { source: "memento" } };
+        });
+    }
+
     function onContext<M extends ConversationMessage, S extends SystemText>(event: { sessionID: string; model: ModelRef; system: S[]; messages: M[] }): Promise<void> {
         return serialize(event.sessionID, async () => {
             let state = await load(event.sessionID);
@@ -131,6 +157,9 @@ export function createSwitchController(deps: {
             }
             state = { ...state, lastModel: { providerID: event.model.providerID, id: event.model.id } };
             await persist(event.sessionID, state);
+            if (snapshot.compacted) {
+                return;
+            }
             const rewritten = rewriteForSwitch(event, snapshot, {
                 tailUserTurns: deps.tailUserTurns,
                 tailCharBudget: deps.tailCharBudget,
@@ -141,5 +170,5 @@ export function createSwitchController(deps: {
         });
     }
 
-    return { onModelSelected, onContext };
+    return { onModelSelected, onCompaction, onContext };
 }

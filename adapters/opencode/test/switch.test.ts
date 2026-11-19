@@ -260,6 +260,57 @@ describe("switch controller", () => {
         expect(fake.errors).toHaveLength(1);
     });
 
+    test("switch-induced compaction uses a framed digest and avoids duplicate context injection", async () => {
+        const fake = setup();
+        fake.setContext([{ type: "assistant", model: a }]);
+        const event: { sessionID: string; model: ModelRef; result?: { summary: string; metadata?: Record<string, unknown> } } = {
+            sessionID: "s", model: b,
+        };
+        await fake.controller.onCompaction(event);
+        expect(event.result).toEqual({ summary: buildDigestText("digest-1"), metadata: { source: "memento" } });
+        expect(fake.order).toEqual(["flush", "flushed", "digest"]);
+        expect(fake.values.get("memento/switch/s")).toEqual({
+            origin: a,
+            lastModel: b,
+            snapshots: { "p/b": { cutMessageID: null, digest: "digest-1", compacted: true } },
+        });
+        const context = { sessionID: "s", model: b, system: system(), messages: [message("summary", "assistant", event.result!.summary)] };
+        const original = JSON.stringify(context);
+        await fake.controller.onContext(context);
+        expect(JSON.stringify(context)).toBe(original);
+        await fake.controller.onContext(context);
+        expect(JSON.stringify(context)).toBe(original);
+        expect(fake.calls()).toBe(1);
+    });
+
+    test("same-model compaction leaves native compaction untouched", async () => {
+        const fake = setup();
+        await fake.controller.onContext(fake.event(a));
+        const event: { sessionID: string; model: ModelRef; result?: { summary: string } } = { sessionID: "s", model: a };
+        await fake.controller.onCompaction(event);
+        expect(event.result).toBeUndefined();
+        expect(fake.order).toEqual([]);
+    });
+
+    test("compaction detection uses last model rather than assistant history", async () => {
+        const fake = setup();
+        await fake.controller.onContext(fake.event(a));
+        fake.setContext([{ type: "assistant", model: b }]);
+        const event: { sessionID: string; model: ModelRef; result?: { summary: string } } = { sessionID: "s", model: b };
+        await fake.controller.onCompaction(event);
+        expect(event.result?.summary).toBe(buildDigestText("digest-1"));
+    });
+
+    test("failed compaction digest falls back to native compaction without changing state", async () => {
+        const fake = setup(true);
+        await fake.controller.onContext(fake.event(a));
+        const event: { sessionID: string; model: ModelRef; result?: { summary: string } } = { sessionID: "s", model: b };
+        await fake.controller.onCompaction(event);
+        expect(event.result).toBeUndefined();
+        expect(fake.errors).toHaveLength(1);
+        expect(fake.values.get("memento/switch/s")).toEqual({ origin: a, lastModel: a, snapshots: {} });
+    });
+
     test("concurrent hooks share a snapshot", async () => {
         const fake = setup();
         await fake.controller.onContext(fake.event(a));

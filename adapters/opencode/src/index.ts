@@ -99,6 +99,9 @@ export default Plugin.define({
             await ensureRegistered(event.sessionID);
             await switchController.onContext(event);
         });
+        const compactionRegistration = await ctx.session.hook("compaction", async (event) => {
+            await switchController.onCompaction(event);
+        });
         const controller = new AbortController();
         const eventLoop = (async () => {
             while (!controller.signal.aborted) {
@@ -127,7 +130,7 @@ export default Plugin.define({
         })();
         return async () => {
             controller.abort();
-            const disposals = Promise.allSettled([hookRegistration.dispose(), toolRegistration.dispose(), commandRegistration.dispose()]);
+            const disposals = Promise.allSettled([hookRegistration.dispose(), compactionRegistration.dispose(), toolRegistration.dispose(), commandRegistration.dispose()]);
             await eventLoop;
             await ingestor.idle();
             const results = await disposals;
