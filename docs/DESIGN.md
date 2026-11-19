@@ -109,7 +109,8 @@ Harness scaffolding is not session memory, and stored text is untrusted when it 
 - Adapters set `injected: true` on harness-generated items; the segmenter skips them.
 - `SegmentPolicy.scaffold_strip_tags` removes `<system-reminder>`, `<skill_content>`, `<environment_context>`, `<user_instructions>`, `<command-message>`, `<command-name>`, `<local-command-stdout|stderr|caveat>`, `<subagent>`, and memento's own `<memento-*>` wrappers from user and assistant text (an unclosed tag strips to the end); `scaffold_unwrap_tags` keeps the inner text of `<command-args>`. Text that is empty after stripping is skipped.
 - `ignored_tools` (`skill`, `memory_search`, `question`, `execute`) and `self_command_prefixes` (`memento `, `mementod `) prevent ingesting skill bodies and memento's own output.
-- The digest contains only user requests, assistant-authored decisions, constraints and notes, the latest todo list, and file paths; tool output (command tails, subagent reports) never reaches it. Search results may include tool output because they arrive as tool output.
+- The digest contains user requests, assistant-authored decisions, constraints and notes, the latest todo list, changed and inspected file paths, and a few recent commands with exit status and a short (160 char) output tail, failures first. Other tool output (file contents, subagent reports) never reaches it; file reads are stored as path pointers only. Search results may include tool output because they arrive as tool output.
+- Continuation framing (CLI hooks and OpenCode adapter) states that the digest omits full command output and file contents, tells the model to search memory before concluding something was not recorded, and to read or grep workspace files for code details. The CLI hook prints a runnable `memento search "<query>" --harness ... --project ... --session ...` with the real, shell-quoted values.
 - Every `<memento-` or `</memento-` sequence in rendered text is escaped to `&lt;`, so stored text cannot close the wrapper. Digest, continuation, and search output are framed as reference data, not instructions, with current instructions taking precedence.
 - Residual risk: assistant-authored text that quotes an attack is still shown (escaped and framed). Optional future step: a Jev `predicate` screen at ingest for text addressed to an AI model.
 
@@ -146,11 +147,15 @@ Search:
 | Section | Share | Selection | Rendered order |
 | --- | --- | --- | --- |
 | Header (harness, project, lineage) | fixed | | |
-| Constraints and decisions | 35% | newest entries that fit | chronological |
-| Current tasks | 10% | latest `task` entry only | as stored |
-| User requests | 35% | newest entries that fit; an entry longer than 1500 chars is truncated deterministically | chronological |
-| Files changed | 10% | distinct paths across all `file_change` `paths`, newest change first | newest first, preserving path order within a change |
-| Recent notes | 10% | newest `assistant_note` entries that fit | chronological |
+| Constraints and decisions | 27% | newest entries that fit | chronological |
+| Current tasks | 8% | latest `task` entry only | as stored |
+| User requests | 32% | newest entries that fit; an entry longer than 1500 chars is truncated deterministically | chronological |
+| Files changed | 7% | distinct paths across all `file_change` `paths`, newest change first | newest first, preserving path order within a change |
+| Recent notes | 8% | newest `assistant_note` entries that fit | chronological |
+| Recent commands | 11% | up to 5 `command` entries, failures first then newest; command line (160 chars), `(exit: N)` or `(failed)` when known, 160-char output tail | newest first |
+| Files inspected | 7% | distinct `file_ref` paths not already under Files changed | newest first |
+
+Failed commands always carry a status line in stored text: the harness's own header (`Exit code: N`, `Process exited with code N`) or `Exit status: failed`.
 
 Identical stored data yields byte-identical output, which keeps the injected prefix cacheable.
 
@@ -223,7 +228,7 @@ Harness ids: `opencode`, `claude-code`, `codex`, `agy`.
 
 ### Scopes
 
-- `session`, `lineage`: pair-based as above.
+- `session`, `lineage`: pair-based as above, and also filtered by the request's `project` (search and forget), so a session id cannot reach another project.
 - `project`: every harness, filtered by `project`.
 - `global`: everything.
 
@@ -233,7 +238,7 @@ Harness ids: `opencode`, `claude-code`, `codex`, `agy`.
 
 ### Transcript importers (CLI)
 
-`memento import claude-code|codex --transcript PATH [--session ID] [--project DIR]` parses the JSONL into neutral items and posts them. Incremental: a cursor file in `${XDG_STATE_HOME:-~/.local/state}/memento/cursors.json` keyed by canonical transcript path stores the byte offset of the last fully parsed line; only new complete lines are sent. Reasoning (`thinking`, `reasoning`) is dropped. Claude Code records with `isMeta: true`, `isSidechain` subagent transcripts, and harness command/caveat wrappers are marked `injected` or stripped by the policy. Codex `session_meta`, `turn_context`, `<environment_context>` and `<user_instructions>` user messages are marked `injected`.
+`memento import claude-code|codex --transcript PATH [--session ID] [--project DIR]` parses the JSONL into neutral items and posts them. Incremental: a cursor file in `${XDG_STATE_HOME:-~/.local/state}/memento/cursors.json` keyed by canonical transcript path stores the byte offset of the last fully parsed line; only new complete lines are sent. A tool call without a result holds the cursor until its result arrives or a later real user turn appears, after which it is treated as abandoned. Codex command outputs are decoded from plain text (`Process exited with code N`, `Exit code: N`) or JSON wrappers (`output`, `metadata.exit_code`). Jev classification (when available) runs on scaffolding-stripped text and skips items that are empty after stripping. Reasoning (`thinking`, `reasoning`) is dropped. Claude Code records with `isMeta: true`, `isSidechain` subagent transcripts, and harness command/caveat wrappers are marked `injected` or stripped by the policy. Codex `session_meta`, `turn_context`, `<environment_context>` and `<user_instructions>` user messages are marked `injected`.
 
 ### Hooks (CLI)
 
@@ -254,7 +259,7 @@ Harness ids: `opencode`, `claude-code`, `codex`, `agy`.
 
 ### Hardening (2026-11-19)
 
-- Ingest: `IngestResponse.duplicates` counts prose segments skipped as near-duplicates of an existing segment in the same project (dense cosine >= 0.95 and 3-gram word-shingle Jaccard >= 0.8; `MEMENTO_DUPLICATE_COSINE_THRESHOLD`, `MEMENTO_DUPLICATE_JACCARD_THRESHOLD`). This curbs memory echo when a model restates the digest.
+- Ingest: `IngestResponse.duplicates` counts prose segments skipped as near-duplicates of an existing segment in the same project and the same lineage (the session and its ancestors; an unlinked session repeating a fact is stored) (dense cosine >= 0.95 and 3-gram word-shingle Jaccard >= 0.8; `MEMENTO_DUPLICATE_COSINE_THRESHOLD`, `MEMENTO_DUPLICATE_JACCARD_THRESHOLD`). This curbs memory echo when a model restates the digest.
 - Re-ingesting a source with fewer chunks deletes its higher-index chunks.
 - User items honor `kind_hint` `decision` and `constraint` only; user text never becomes `task`.
 - Per-session locks for ingest; a short registry lock for registry writes and claims; embedding and upserts run outside global locks.
