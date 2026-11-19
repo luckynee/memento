@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { MementoClient } from "./client";
+import { MementoError, type MementoClient } from "./client";
 import { frameContinuation } from "./commands";
 import { classifyKind, type DecisionsFn, type JevModel } from "./jev";
 import { mapMessage, selectNewMessages } from "./transcript";
@@ -7,6 +7,7 @@ import { mapMessage, selectNewMessages } from "./transcript";
 type Storage = {
     get(key: string): Promise<unknown>;
     set(key: string, value: string | boolean): Promise<unknown>;
+    remove?(key: string): Promise<unknown>;
 };
 
 export function createIngestor(deps: {
@@ -102,12 +103,26 @@ export function createIngestor(deps: {
         }
         if (!state.registered) {
             const hasClaimedParent = claimedParent || typeof await deps.storage.get(`memento/parent/${sessionID}`) === "string";
-            await deps.client.putSession({
+            const identity = {
                 harness: deps.harness,
                 project: deps.project,
                 session: sessionID,
-                ...(fork && !hasClaimedParent ? { parent_harness: deps.harness, parent: fork.sessionID } : {}),
-            });
+            };
+            try {
+                await deps.client.putSession({
+                    ...identity,
+                    ...(fork && !hasClaimedParent ? { parent_harness: deps.harness, parent: fork.sessionID, require_parent: true } : {}),
+                });
+            } catch (error) {
+                if (!fork || hasClaimedParent || !(error instanceof MementoError) || error.code !== "parent_unavailable") {
+                    throw error;
+                }
+                if (!deps.storage.remove) {
+                    throw new Error(`Cannot clear fork state for session ${sessionID}`);
+                }
+                await deps.storage.remove(`memento/fork/${sessionID}`);
+                await deps.client.putSession(identity);
+            }
             if (state.retryClaim) {
                 await deps.storage.set(`memento/registered/${sessionID}`, "claim-pending");
                 state.registered = true;
@@ -208,5 +223,12 @@ export function createIngestor(deps: {
         }
     }
 
-    return { handleExecutionSucceeded, flush, idle, markRegistered, ensureRegistered };
+    async function forget(sessionID: string): Promise<void> {
+        while (chains.has(sessionID)) {
+            await chains.get(sessionID);
+        }
+        sessions.delete(sessionID);
+    }
+
+    return { handleExecutionSucceeded, flush, idle, forget, markRegistered, ensureRegistered };
 }

@@ -17,6 +17,7 @@ export type SessionIdentity = {
 export type SessionRecord = SessionIdentity & {
     parent?: string;
     parent_harness?: string;
+    require_parent?: boolean;
     retention?: string;
     title?: string;
 };
@@ -114,6 +115,10 @@ export class MementoClient {
 
     putSession(payload: SessionRecord): Promise<unknown> {
         return this.request("/v1/sessions", "PUT", payload);
+    }
+
+    releaseSession(payload: SessionIdentity): Promise<{ released: boolean; removed: { harness: string; session: string }[] }> {
+        return this.request("/v1/sessions/release", "POST", payload);
     }
 
     claimContinuation(payload: SessionIdentity): Promise<ClaimResponse> {

@@ -170,5 +170,12 @@ export function createSwitchController(deps: {
         });
     }
 
-    return { onModelSelected, onCompaction, onContext };
+    async function forget(sessionID: string): Promise<void> {
+        while (chains.has(sessionID)) {
+            await chains.get(sessionID);
+        }
+        states.delete(sessionID);
+    }
+
+    return { onModelSelected, onCompaction, onContext, forget };
 }

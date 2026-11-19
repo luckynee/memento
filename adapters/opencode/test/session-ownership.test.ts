@@ -58,3 +58,28 @@ test("shares concurrent lookups for a session", async () => {
     expect(await Promise.all([ownsSession("session"), ownsSession("session")])).toEqual([true, true]);
     expect(calls).toBe(1);
 });
+
+test("forget clears cached and pending ownership without restoring stale results", async () => {
+    let calls = 0;
+    let resolveFirst!: (value: string) => void;
+    const firstLookup = new Promise<string>((resolve) => { resolveFirst = resolve; });
+    const ownsSession = createSessionOwnership({
+        async getSessionProjectID() {
+            calls++;
+            return calls === 1 ? firstLookup : "other";
+        },
+        projectID: "project",
+        log() {},
+    });
+    const first = ownsSession("session");
+    await Promise.resolve();
+    ownsSession.forget("session");
+    expect(await ownsSession("session")).toBe(false);
+    resolveFirst("project");
+    expect(await first).toBe(true);
+    expect(await ownsSession("session")).toBe(false);
+    expect(calls).toBe(2);
+    ownsSession.forget("session");
+    expect(await ownsSession("session")).toBe(false);
+    expect(calls).toBe(3);
+});

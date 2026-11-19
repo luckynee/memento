@@ -43,6 +43,23 @@ describe("daemon client", () => {
         expect(lineage.lineage).toEqual([{ harness: "codex", session: "old" }]);
     });
 
+    test("sends release and parent-required registration requests", async () => {
+        const calls: { path: string; method: string | undefined; body: unknown }[] = [];
+        const client = new MementoClient({
+            fetch: (async (url, init) => {
+                calls.push({ path: new URL(String(url)).pathname, method: init?.method, body: JSON.parse(String(init?.body)) });
+                return Response.json({ released: true, removed: [{ harness: "h", session: "s" }] });
+            }) as typeof fetch,
+        });
+        const identity = { harness: "h", project: "p", session: "s" };
+        await client.putSession({ ...identity, parent: "parent", require_parent: true });
+        expect(await client.releaseSession(identity)).toEqual({ released: true, removed: [{ harness: "h", session: "s" }] });
+        expect(calls).toEqual([
+            { path: "/v1/sessions", method: "PUT", body: { ...identity, parent: "parent", require_parent: true } },
+            { path: "/v1/sessions/release", method: "POST", body: identity },
+        ]);
+    });
+
     test("sends the optional injected marker", async () => {
         let body: unknown;
         const fetcher = (async (_url, init) => {

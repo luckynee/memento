@@ -137,9 +137,29 @@ export default Plugin.define({
             while (!controller.signal.aborted) {
                 try {
                     for await (const event of ctx.event.subscribe({
-                        types: ["session.execution.succeeded", "session.step.ended", "session.model.selected"],
+                        types: ["session.execution.succeeded", "session.step.ended", "session.model.selected", "session.deleted"],
                         signal: controller.signal,
                     })) {
+                        if (event.type === "session.deleted") {
+                            const sessionID = event.data.sessionID;
+                            try {
+                                await switchController.forget(sessionID);
+                                await ingestor.forget(sessionID);
+                                await client.releaseSession({ harness: options.harness, project, session: sessionID });
+                            } catch (error) {
+                                log(`Failed to release session ${sessionID}`, error);
+                            } finally {
+                                for (const key of ["ingest", "registered", "fork", "claimed", "parent", "switch"]) {
+                                    try {
+                                        await ctx.storage.remove(`memento/${key}/${sessionID}`);
+                                    } catch (error) {
+                                        log(`Failed to delete ${key} state for session ${sessionID}`, error);
+                                    }
+                                }
+                                ownsSession.forget(sessionID);
+                            }
+                            continue;
+                        }
                         if (!await ownsSession(event.data.sessionID)) {
                             continue;
                         }

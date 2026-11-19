@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { MementoError } from "../src/client";
 import { createIngestor } from "../src/ingest";
 import { DEFAULT_JEV_MODEL, type DecisionsFn } from "../src/jev";
 import type { IngestItem } from "../src/transcript";
@@ -50,9 +51,59 @@ describe("incremental ingestion", () => {
         ]);
         await fake.ingestor.ensureRegistered("fork");
         await fake.ingestor.flush("fork");
-        expect(fake.puts).toEqual([{ harness: "opencode", project: "p", session: "fork", parent_harness: "opencode", parent: "parent" }]);
+        expect(fake.puts).toEqual([{ harness: "opencode", project: "p", session: "fork", parent_harness: "opencode", parent: "parent", require_parent: true }]);
         expect(fake.ingests[0].items.map((item) => item.source_id)).toEqual(["new-user", "new-assistant:text:0"]);
         expect(fake.values.get("memento/ingest/fork")).toBe("new-assistant");
+    });
+
+    test("backfills a fork when its parent is unavailable", async () => {
+        const values = new Map<string, unknown>();
+        const puts: unknown[] = [];
+        const ingests: IngestItem[] = [];
+        const ingestor = createIngestor({
+            client: {
+                async claimContinuation() { return { claimed: false }; },
+                async putSession(value) {
+                    puts.push(value);
+                    if (value.require_parent) {
+                        throw new MementoError("missing parent", "parent_unavailable", 409);
+                    }
+                },
+                async ingest(value) { ingests.push(...value.items); return { segments: value.items.length, skipped: 0 }; },
+            },
+            storage: {
+                async get(key) { return values.get(key); },
+                async set(key, value) { values.set(key, value); },
+                async remove(key) { values.delete(key); },
+            },
+            async loadSession() { return { fork: { sessionID: "parent" }, time: { created: 100 } }; },
+            async loadContext() { return [{ ...user("copied"), time: { created: 1 } }, { ...user("new"), time: { created: 100 } }]; },
+            async putInstruction() {},
+            jevModel: DEFAULT_JEV_MODEL, harness: "opencode", project: "p", log() {},
+        });
+        await ingestor.flush("fork");
+        expect(puts).toEqual([
+            { harness: "opencode", project: "p", session: "fork", parent_harness: "opencode", parent: "parent", require_parent: true },
+            { harness: "opencode", project: "p", session: "fork" },
+        ]);
+        expect(values.has("memento/fork/fork")).toBe(false);
+        expect(ingests.map((item) => item.source_id)).toEqual(["copied", "new"]);
+    });
+
+    test("forget clears cached registration and classifications", async () => {
+        let classifications = 0;
+        const fake = setup(async () => {
+            classifications++;
+            return { answers: [{ type: "choice", name: "kind", choice: "decision" }] };
+        });
+        fake.contexts.set("s", [assistant("a", "text")]);
+        await fake.ingestor.flush("s");
+        await fake.ingestor.forget("s");
+        fake.values.delete("memento/registered/s");
+        fake.values.delete("memento/ingest/s");
+        await fake.ingestor.flush("s");
+        expect(fake.puts).toHaveLength(2);
+        expect(classifications).toBe(2);
     });
 
     test("fork filtering survives a restart and a context without the cursor", async () => {
