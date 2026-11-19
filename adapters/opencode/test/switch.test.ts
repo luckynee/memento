@@ -149,17 +149,62 @@ describe("switch controller", () => {
         const values = new Map<string, unknown>();
         const order: string[] = [];
         const errors: unknown[] = [];
+        let context: unknown[] = [];
         let calls = 0;
         const controller = createSwitchController({
             client: { async digest() { order.push("digest"); calls++; if (failFirst && calls === 1) { throw new Error("offline"); } return { text: `digest-${calls}`, segments: 1 }; } },
             storage: { async get(key) { return values.get(key); }, async set(key, value) { values.set(key, value); } },
             async flush() { order.push("flush"); await Promise.resolve(); order.push("flushed"); },
+            async loadContext() { return context; },
             harness: "opencode", project: "p", digestBudget: 100, tailUserTurns: 3, tailCharBudget: 40000,
             log(_message, error) { errors.push(error); },
         });
         const event = (model: ModelRef) => ({ sessionID: "s", model, system: system(), messages: history() });
-        return { controller, values, errors, order, event, calls: () => calls };
+        return { controller, values, errors, order, event, calls: () => calls, setContext(messages: unknown[]) { context = messages; } };
     }
+
+    test("detects a fork's first switch from the most recent assistant model", async () => {
+        const fake = setup();
+        fake.setContext([
+            { type: "assistant", model: b },
+            { type: "assistant", model: a },
+            { type: "assistant" },
+            { type: "user", model: b },
+        ]);
+        const event = fake.event(b);
+        await fake.controller.onContext(event);
+        expect(fake.values.get("memento/switch/s")).toEqual({
+            origin: a,
+            lastModel: b,
+            snapshots: { "p/b": { cutMessageID: "u4", digest: "digest-1" } },
+        });
+        expect(fake.order).toEqual(["flush", "flushed", "digest"]);
+        expect(event.system[2].text).toBe(buildDigestText("digest-1"));
+        expect(event.messages.map((entry) => entry.id)).toEqual(history().slice(1).map((entry) => entry.id));
+    });
+
+    test("selection uses assistant history instead of the inherited previous model", async () => {
+        const fake = setup();
+        fake.setContext([{ type: "assistant", model: a }]);
+        await fake.controller.onModelSelected("s", a, b);
+        expect(fake.values.get("memento/switch/s")).toEqual({ origin: a, snapshots: {} });
+        const event = fake.event(b);
+        await fake.controller.onContext(event);
+        expect(fake.calls()).toBe(1);
+        expect(event.system[2].text).toBe(buildDigestText("digest-1"));
+    });
+
+    test("leaves a brand-new session untouched", async () => {
+        const fake = setup();
+        const event = { sessionID: "s", model: b, system: system(), messages: [message("u1", "user", "first")] };
+        const originalSystem = event.system;
+        const originalMessages = event.messages;
+        await fake.controller.onContext(event);
+        expect(fake.values.get("memento/switch/s")).toEqual({ origin: b, lastModel: b, snapshots: {} });
+        expect(event.system).toBe(originalSystem);
+        expect(event.messages).toBe(originalMessages);
+        expect(fake.calls()).toBe(0);
+    });
 
     test("is untouched before switching and initializes origin from selection previous", async () => {
         const fake = setup();
@@ -231,6 +276,7 @@ describe("switch controller", () => {
             client: { async digest() { order.push("digest"); return { text: "d", segments: 1 }; } },
             storage: { async get(key) { return values.get(key); }, async set(key, value) { values.set(key, value); } },
             async flush() { order.push("flush"); if (fail) { throw new Error("failed"); } },
+            async loadContext() { return []; },
             harness: "h", project: "p", digestBudget: 1, tailUserTurns: 1, tailCharBudget: 100,
             log(_message, error) { errors.push(error); },
         });
@@ -261,6 +307,7 @@ describe("switch controller", () => {
                 async set(key, value) { values.set(key, value); },
             },
             async flush() {},
+            async loadContext() { return []; },
             harness: "h", project: "p", digestBudget: 1, tailUserTurns: 1, tailCharBudget: 100,
             log() {},
         });

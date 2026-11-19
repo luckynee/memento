@@ -10,6 +10,7 @@ export function createSwitchController(deps: {
     client: Pick<MementoClient, "digest">;
     storage: Storage;
     flush(sessionID: string): Promise<void>;
+    loadContext(sessionID: string): Promise<unknown[]>;
     harness: string;
     project: string;
     digestBudget: number;
@@ -63,10 +64,25 @@ export function createSwitchController(deps: {
         return serialize(sessionID, async () => {
             const state = await load(sessionID);
             if (!state.origin) {
-                const origin = previous ?? model;
+                const messages = await deps.loadContext(sessionID);
+                const origin = historyModel(messages) ?? previous ?? model;
                 await persist(sessionID, { ...state, origin: { providerID: origin.providerID, id: origin.id } });
             }
         });
+    }
+
+    function historyModel(messages: unknown[]): ModelRef | undefined {
+        for (let index = messages.length - 1; index >= 0; index--) {
+            const message = messages[index];
+            if (!message || typeof message !== "object" || !("type" in message) || message.type !== "assistant" || !("model" in message)) {
+                continue;
+            }
+            const model = message.model;
+            if (model && typeof model === "object" && "providerID" in model && typeof model.providerID === "string" && "id" in model && typeof model.id === "string") {
+                return { providerID: model.providerID, id: model.id };
+            }
+        }
+        return undefined;
     }
 
     function onContext<M extends ConversationMessage, S extends SystemText>(event: { sessionID: string; model: ModelRef; system: S[]; messages: M[] }): Promise<void> {
@@ -74,7 +90,9 @@ export function createSwitchController(deps: {
             let state = await load(event.sessionID);
             let changed = false;
             if (!state.origin) {
-                state = { ...state, origin: { providerID: event.model.providerID, id: event.model.id } };
+                const messages = await deps.loadContext(event.sessionID);
+                const origin = historyModel(messages) ?? event.model;
+                state = { ...state, origin: { providerID: origin.providerID, id: origin.id } };
                 changed = true;
             }
             if (!state.lastModel) {

@@ -47,7 +47,7 @@ export default Plugin.define({
         const ingestor = createIngestor({
             client,
             storage: ctx.storage,
-            loadContext: (sessionID) => ctx.session.context({ sessionID }),
+            loadContext: (sessionID) => ctx.session.context({ sessionID }).catch(() => []),
             putInstruction: (sessionID, key, value) => ctx.session.instructions.entry.put({ sessionID, key, value }),
             decide,
             jevModel: options.jevModel,
@@ -59,6 +59,7 @@ export default Plugin.define({
             client,
             storage: ctx.storage,
             flush: ingestor.flush,
+            loadContext: (sessionID) => ctx.session.context({ sessionID }).catch(() => []),
             harness: options.harness,
             project,
             digestBudget: options.digestBudget,
