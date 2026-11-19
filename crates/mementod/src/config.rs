@@ -11,6 +11,8 @@ pub struct Config {
     pub cache_dir: Option<PathBuf>,
     pub duplicate_cosine_threshold: f32,
     pub duplicate_jaccard_threshold: f32,
+    pub stale_days: u64,
+    pub stale_sweep_secs: u64,
 }
 
 impl Config {
@@ -36,6 +38,15 @@ impl Config {
                 .unwrap_or_else(|_| "0.8".into())
                 .parse()
                 .context("invalid MEMENTO_DUPLICATE_JACCARD_THRESHOLD")?,
+            stale_days: env::var("MEMENTO_STALE_DAYS")
+                .unwrap_or_else(|_| "7".into())
+                .parse()
+                .context("invalid MEMENTO_STALE_DAYS")?,
+            stale_sweep_secs: env::var("MEMENTO_STALE_SWEEP_SECS")
+                .unwrap_or_else(|_| "3600".into())
+                .parse::<u64>()
+                .context("invalid MEMENTO_STALE_SWEEP_SECS")?
+                .max(1),
         })
     }
 }

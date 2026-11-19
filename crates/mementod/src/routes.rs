@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::{Arc, Weak},
 };
 
@@ -14,7 +14,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use memento_core::{
     digest::{DigestInput, render_digest},
     lineage::{self, SessionKey, SessionLink},
@@ -22,7 +22,7 @@ use memento_core::{
         ClaimRequest, ClaimResponse, ContinuationRecord, ContinuationRequest, DigestResponse,
         ErrorBody, ErrorDetail, ForgetRequest, ForgetResponse, ForgetScope, Health, IngestRequest,
         IngestResponse, ReleaseRequest, ReleaseResponse, Retention, Scope, SearchRequest,
-        SearchResponse, SessionRecord,
+        SearchResponse, SessionRecord, SweepRequest, SweepResponse,
     },
     rerank::{Candidate, RerankConfig, rerank},
     segment::{SegmentPolicy, segment_items},
@@ -90,10 +90,30 @@ pub fn router(state: AppState) -> Router {
         operation_lock: Arc::new(RwLock::new(())),
         session_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
     };
+    if state.app.config.stale_days > 0 {
+        let sweep_state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                sweep_state.app.config.stale_sweep_secs.max(1),
+            ));
+            interval.tick().await;
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            loop {
+                if sweep_projects(&sweep_state, None, false, Utc::now())
+                    .await
+                    .is_err()
+                {
+                    tracing::error!("background stale sweep failed");
+                }
+                interval.tick().await;
+            }
+        });
+    }
     Router::new()
         .route("/health", get(health))
         .route("/v1/sessions", get(list_sessions).put(put_session))
         .route("/v1/sessions/release", post(release_session))
+        .route("/v1/maintenance/sweep", post(maintenance_sweep))
         .route("/v1/continuations", axum::routing::put(put_continuation))
         .route("/v1/continuations/claim", post(claim_continuation))
         .route(
@@ -321,6 +341,189 @@ fn session_key(record: &SessionRecord) -> SessionKey {
     }
 }
 
+fn refresh_activity(record: &mut SessionRecord, now: DateTime<Utc>) -> bool {
+    if record.deleted_at.is_some()
+        || record
+            .last_active_at
+            .is_some_and(|last| now.signed_duration_since(last) < Duration::minutes(15))
+    {
+        return false;
+    }
+    record.last_active_at = Some(now);
+    true
+}
+
+async fn record_activity(
+    state: &RouterState,
+    harness: &str,
+    project: &str,
+    session: &str,
+) -> anyhow::Result<()> {
+    let _guard = state.registry_lock.lock().await;
+    if let Some(mut record) = state.app.store.get_session(harness, session).await?
+        && record.project == project
+        && refresh_activity(&mut record, Utc::now())
+    {
+        state.app.store.upsert_session(record).await?;
+    }
+    Ok(())
+}
+
+async fn read_activity(state: &RouterState, harness: &str, project: &str, session: &str) {
+    if let Err(error) = record_activity(state, harness, project, session).await {
+        tracing::warn!(?error, "recording read activity failed");
+    }
+}
+
+pub async fn backfill_activity(store: &Store, now: DateTime<Utc>) -> anyhow::Result<usize> {
+    let records = store.list_sessions_filtered(ScopeFilter::default()).await?;
+    let mut updated = 0;
+    for mut record in records {
+        if record.last_active_at.is_none() {
+            record.last_active_at = Some(now);
+            store.upsert_session(record).await?;
+            updated += 1;
+        }
+    }
+    Ok(updated)
+}
+
+fn stale_sessions(
+    records: &[SessionRecord],
+    slots: &[ContinuationRecord],
+    now: DateTime<Utc>,
+    stale_days: u64,
+) -> Vec<SessionKey> {
+    if stale_days == 0 {
+        return Vec::new();
+    }
+    let threshold = i64::try_from(stale_days)
+        .ok()
+        .and_then(Duration::try_days)
+        .and_then(|duration| now.checked_sub_signed(duration))
+        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+    let records = records
+        .iter()
+        .filter(|record| record.collected_at.is_none())
+        .collect::<Vec<_>>();
+    let links = records
+        .iter()
+        .map(|record| SessionLink {
+            key: session_key(record),
+            parent: record.parent.as_ref().map(|parent| SessionKey {
+                harness: record
+                    .parent_harness
+                    .clone()
+                    .unwrap_or_else(|| record.harness.clone()),
+                session: parent.clone(),
+            }),
+        })
+        .collect::<Vec<_>>();
+    let active = records
+        .iter()
+        .filter(|record| {
+            record.last_active_at.is_none_or(|last| last >= threshold)
+                || slots.iter().any(|slot| {
+                    slot.parent_harness == record.harness
+                        && slot.parent_session == record.session
+                        && slot.claimed_by.is_none()
+                        && now.signed_duration_since(slot.created) < Duration::hours(24)
+                })
+        })
+        .map(|record| session_key(record))
+        .collect::<BTreeSet<_>>();
+    let mut stale = records
+        .iter()
+        .filter(|record| record.deleted_at.is_none() && record.retention != Retention::Keep)
+        .filter(|record| {
+            lineage::descendants(&session_key(record), &links)
+                .iter()
+                .all(|key| !active.contains(key))
+        })
+        .map(|record| session_key(record))
+        .collect::<Vec<_>>();
+    stale.sort();
+    stale
+}
+
+async fn maintenance_sweep(
+    State(state): State<RouterState>,
+    body: Result<Json<SweepRequest>, JsonRejection>,
+) -> ApiResult<SweepResponse> {
+    let request = json_body(body)?;
+    if let Some(project) = &request.project {
+        required(project)?;
+    }
+    Ok(Json(
+        sweep_projects(
+            &state,
+            request.project.as_deref(),
+            request.dry_run,
+            Utc::now(),
+        )
+        .await?,
+    ))
+}
+
+async fn sweep_projects(
+    state: &RouterState,
+    project: Option<&str>,
+    dry_run: bool,
+    now: DateTime<Utc>,
+) -> Result<SweepResponse, ApiError> {
+    let mut response = SweepResponse {
+        stale: Vec::new(),
+        removed: Vec::new(),
+    };
+    if state.app.config.stale_days == 0 {
+        return Ok(response);
+    }
+    let _operation = state.operation_lock.write().await;
+    let _guard = state.registry_lock.lock().await;
+    let records = state
+        .app
+        .store
+        .list_sessions_filtered(ScopeFilter {
+            project: project.map(str::to_owned),
+            ..Default::default()
+        })
+        .await;
+    let records = store_result(state, records).await?;
+    let projects = records
+        .iter()
+        .map(|record| record.project.clone())
+        .collect::<BTreeSet<_>>();
+    for project in projects {
+        let project_records = records
+            .iter()
+            .filter(|record| record.project == project)
+            .cloned()
+            .collect::<Vec<_>>();
+        let slots = state.app.store.list_continuations(&project).await;
+        let slots = store_result(state, slots)
+            .await?
+            .into_iter()
+            .map(|(_, slot)| slot)
+            .collect::<Vec<_>>();
+        let stale = stale_sessions(&project_records, &slots, now, state.app.config.stale_days);
+        if !dry_run {
+            for mut record in project_records {
+                if stale.contains(&session_key(&record)) {
+                    record.deleted_at = Some(now);
+                    record.deleted_reason = Some("stale".into());
+                    let result = state.app.store.upsert_session(record).await;
+                    store_result(state, result).await?;
+                }
+            }
+            response
+                .removed
+                .extend(collect_project(state, &project).await?);
+        }
+        response.stale.extend(stale);
+    }
+    Ok(response)
+}
+
 fn collectible(
     record: &SessionRecord,
     records: &[SessionRecord],
@@ -450,6 +653,7 @@ async fn release_session(
     }
     if record.deleted_at.is_none() {
         record.deleted_at = Some(Utc::now());
+        record.deleted_reason = Some(request.reason.unwrap_or_else(|| "deleted".into()));
         let result = state.app.store.upsert_session(record).await;
         store_result(&state, result).await?;
     }
@@ -487,6 +691,7 @@ async fn merge_session(
         .await?
         .into_iter()
         .collect::<BTreeMap<_, _>>();
+    let original = existing.clone();
     let mut record = existing.unwrap_or_else(|| SessionRecord {
         harness: update.harness.clone(),
         project: update.project.clone(),
@@ -496,7 +701,9 @@ async fn merge_session(
         retention: Retention::default(),
         title: None,
         created: Some(Utc::now()),
+        last_active_at: None,
         deleted_at: None,
+        deleted_reason: None,
         collected_at: None,
     });
     record.project = update.project;
@@ -556,8 +763,11 @@ async fn merge_session(
     if let Some(title) = update.title {
         record.title = Some(title);
     }
-    let result = state.app.store.upsert_session(record.clone()).await;
-    store_result(state, result).await?;
+    refresh_activity(&mut record, Utc::now());
+    if original.as_ref() != Some(&record) {
+        let result = state.app.store.upsert_session(record.clone()).await;
+        store_result(state, result).await?;
+    }
     Ok(record)
 }
 
@@ -617,6 +827,7 @@ async fn claim_continuation(
     required(&request.project)?;
     required(&request.harness)?;
     required(&request.session)?;
+    let _operation = state.operation_lock.read().await;
     let _guard = state.registry_lock.lock().await;
     let caller = SessionKey {
         harness: request.harness.clone(),
@@ -861,10 +1072,17 @@ async fn ingest(
                 retention: Retention::default(),
                 title: None,
                 created: Some(Utc::now()),
+                last_active_at: Some(Utc::now()),
                 deleted_at: None,
+                deleted_reason: None,
                 collected_at: None,
             })
             .await;
+        store_result(&state, result).await?;
+    } else if let Some(mut record) = existing
+        && refresh_activity(&mut record, Utc::now())
+    {
+        let result = state.app.store.upsert_session(record).await;
         store_result(&state, result).await?;
     }
     let lineage = ancestors(&state, &request.harness, &request.session).await?;
@@ -918,10 +1136,11 @@ async fn search(
     if request.k > 50 {
         return Err(ApiError::invalid("k must not exceed 50"));
     }
+    let _operation = state.operation_lock.read().await;
+    read_activity(&state, &request.harness, &request.project, &request.session).await;
     if request.kinds.as_ref().is_some_and(Vec::is_empty) {
         return Ok(Json(SearchResponse { hits: Vec::new() }));
     }
-    let _operation = state.operation_lock.read().await;
     let mut sessions = match request.scope {
         Scope::Session => Some(vec![SessionKey {
             harness: request.harness.clone(),
@@ -1003,6 +1222,8 @@ async fn digest(
     required(&query.harness)?;
     required(&query.project)?;
     required(&query.session)?;
+    let _operation = state.operation_lock.read().await;
+    read_activity(&state, &query.harness, &query.project, &query.session).await;
     Ok(Json(
         render_session_digest(
             &state,
@@ -1257,9 +1478,57 @@ mod tests {
             retention: Retention::Continuation,
             title: None,
             created: Some(Utc::now()),
+            last_active_at: None,
             deleted_at: Some(Utc::now()),
+            deleted_reason: None,
             collected_at: None,
         }
+    }
+
+    #[test]
+    fn activity_is_throttled_and_deleted_records_are_untouched() {
+        let now = Utc::now();
+        let mut session = record("h", "s", None);
+        session.deleted_at = None;
+        session.last_active_at = Some(now - Duration::minutes(16));
+        assert!(refresh_activity(&mut session, now));
+        assert_eq!(session.last_active_at, Some(now));
+        assert!(!refresh_activity(&mut session, now + Duration::minutes(14)));
+        assert!(refresh_activity(&mut session, now + Duration::minutes(15)));
+        session.deleted_at = Some(now);
+        assert!(!refresh_activity(&mut session, now + Duration::days(1)));
+    }
+
+    #[test]
+    fn stale_selection_protects_active_descendants_and_pending_slots() {
+        let now = Utc::now();
+        let mut parent = record("opencode", "parent", None);
+        let mut child = record("codex", "child", Some(("opencode", "parent")));
+        parent.deleted_at = None;
+        child.deleted_at = None;
+        parent.last_active_at = Some(now - Duration::days(8));
+        child.last_active_at = Some(now);
+        let records = vec![parent.clone(), child.clone()];
+        assert!(stale_sessions(&records, &[], now, 7).is_empty());
+        child.last_active_at = Some(now - Duration::days(8));
+        let records = vec![parent.clone(), child.clone()];
+        assert_eq!(stale_sessions(&records, &[], now, 7).len(), 2);
+        assert!(stale_sessions(&records, &[], now, 0).is_empty());
+        let slot = ContinuationRecord {
+            project: "project".into(),
+            parent_harness: "codex".into(),
+            parent_session: "child".into(),
+            target_harness: None,
+            created: now,
+            claimed_by: None,
+            claimed_at: None,
+        };
+        assert!(stale_sessions(&records, &[slot], now, 7).is_empty());
+        child.retention = Retention::Keep;
+        assert_eq!(
+            stale_sessions(&[parent.clone(), child], &[], now, 7),
+            vec![session_key(&parent)]
+        );
     }
 
     #[test]

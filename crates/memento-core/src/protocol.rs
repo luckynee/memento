@@ -75,7 +75,11 @@ pub struct SessionRecord {
     pub title: Option<String>,
     pub created: Option<DateTime<Utc>>,
     #[serde(default)]
+    pub last_active_at: Option<DateTime<Utc>>,
+    #[serde(default)]
     pub deleted_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub deleted_reason: Option<String>,
     #[serde(default)]
     pub collected_at: Option<DateTime<Utc>>,
 }
@@ -85,6 +89,22 @@ pub struct ReleaseRequest {
     pub harness: String,
     pub project: String,
     pub session: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SweepRequest {
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SweepResponse {
+    pub stale: Vec<SessionKey>,
+    pub removed: Vec<SessionKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

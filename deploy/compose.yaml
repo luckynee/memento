@@ -16,6 +16,8 @@ services:
         environment:
             MEMENTO_QDRANT_URL: http://qdrant:6334
             MEMENTO_TOKEN: ${MEMENTO_TOKEN:-}
+            MEMENTO_STALE_DAYS: ${MEMENTO_STALE_DAYS:-7}
+            MEMENTO_STALE_SWEEP_SECS: ${MEMENTO_STALE_SWEEP_SECS:-3600}
         ports:
             - "127.0.0.1:7377:7377"
         depends_on:

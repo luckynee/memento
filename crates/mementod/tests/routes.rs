@@ -3,7 +3,7 @@ use std::sync::Arc;
 use mementod::{
     config::Config,
     embed::FakeEmbedder,
-    routes::{AppState, router},
+    routes::{AppState, backfill_activity, router},
     store::Store,
 };
 use qdrant_client::{Qdrant, qdrant::DeleteCollectionBuilder};
@@ -75,6 +75,8 @@ async fn route_workflow() {
             cache_dir: None,
             duplicate_cosine_threshold: 0.95,
             duplicate_jaccard_threshold: 0.8,
+            stale_days: 7,
+            stale_sweep_secs: 3600,
         },
         policy: Default::default(),
         rerank: Default::default(),
@@ -214,6 +216,202 @@ async fn run_workflow(address: &str, store: &Store) {
     regression_workflow(address, store).await;
     continuation_slots_workflow(address, store).await;
     release_workflow(address).await;
+    stale_workflow(address, store).await;
+}
+
+async fn stale_workflow(address: &str, store: &Store) {
+    use chrono::{Duration, Utc};
+
+    let call = |method: &'static str, path: &'static str, body: Value| async move {
+        request(address, method, path, Some("test-token"), &body.to_string()).await
+    };
+    let project = "stale-project";
+    for session in [
+        json!({"harness":"h","project":project,"session":"stale-parent"}),
+        json!({"harness":"other","project":project,"session":"stale-child","parent":"stale-parent","parent_harness":"h"}),
+        json!({"harness":"h","project":project,"session":"kept","retention":"keep"}),
+        json!({"harness":"h","project":project,"session":"pending"}),
+        json!({"harness":"h","project":project,"session":"active-parent"}),
+        json!({"harness":"other","project":project,"session":"active-child","parent":"active-parent","parent_harness":"h"}),
+    ] {
+        assert_eq!(call("PUT", "/v1/sessions", session).await.0, 200);
+    }
+    for (harness, session) in [
+        ("h", "stale-parent"),
+        ("other", "stale-child"),
+        ("h", "kept"),
+        ("h", "pending"),
+        ("h", "active-parent"),
+    ] {
+        let mut record = store.get_session(harness, session).await.unwrap().unwrap();
+        record.last_active_at = Some(Utc::now() - Duration::days(8));
+        store.upsert_session(record).await.unwrap();
+    }
+    assert_eq!(
+        call(
+            "PUT",
+            "/v1/continuations",
+            json!({
+                "project":project,"parent_harness":"h","parent_session":"pending"
+            })
+        )
+        .await
+        .0,
+        200
+    );
+    let dry = call(
+        "POST",
+        "/v1/maintenance/sweep",
+        json!({"project":project,"dry_run":true}),
+    )
+    .await;
+    assert_eq!(dry.0, 200);
+    assert_eq!(dry.1["stale"].as_array().unwrap().len(), 2);
+    assert_eq!(dry.1["removed"], json!([]));
+    assert!(
+        store
+            .get_session("h", "stale-parent")
+            .await
+            .unwrap()
+            .unwrap()
+            .deleted_at
+            .is_none()
+    );
+    let sweep = call("POST", "/v1/maintenance/sweep", json!({"project":project})).await;
+    assert_eq!(sweep.0, 200);
+    assert_eq!(
+        sweep.1["removed"],
+        json!([
+            {"harness":"other","session":"stale-child"},
+            {"harness":"h","session":"stale-parent"}
+        ])
+    );
+    assert_eq!(
+        store
+            .get_session("h", "stale-parent")
+            .await
+            .unwrap()
+            .unwrap()
+            .deleted_reason
+            .as_deref(),
+        Some("stale")
+    );
+    for session in ["kept", "pending", "active-parent"] {
+        assert!(
+            store
+                .get_session("h", session)
+                .await
+                .unwrap()
+                .unwrap()
+                .deleted_at
+                .is_none()
+        );
+    }
+    let mut backfill = store.get_session("h", "kept").await.unwrap().unwrap();
+    backfill.last_active_at = None;
+    store.upsert_session(backfill).await.unwrap();
+    let now = Utc::now();
+    assert_eq!(backfill_activity(store, now).await.unwrap(), 1);
+    assert_eq!(backfill_activity(store, now).await.unwrap(), 0);
+    assert_eq!(
+        store
+            .get_session("h", "kept")
+            .await
+            .unwrap()
+            .unwrap()
+            .last_active_at,
+        Some(now)
+    );
+    let old = Utc::now() - Duration::hours(1);
+    let mut active = store
+        .get_session("other", "active-child")
+        .await
+        .unwrap()
+        .unwrap();
+    active.last_active_at = Some(old);
+    store.upsert_session(active).await.unwrap();
+    assert_eq!(call("POST", "/v1/search", json!({
+        "harness":"other","project":project,"session":"active-child","query":"anything","kinds":[]
+    })).await.0, 200);
+    let after_search = store
+        .get_session("other", "active-child")
+        .await
+        .unwrap()
+        .unwrap()
+        .last_active_at
+        .unwrap();
+    assert!(after_search > old);
+    assert_eq!(
+        call(
+            "POST",
+            "/v1/ingest",
+            json!({
+                "harness":"other","project":project,"session":"active-child","items":[]
+            })
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        store
+            .get_session("other", "active-child")
+            .await
+            .unwrap()
+            .unwrap()
+            .last_active_at,
+        Some(after_search)
+    );
+    let mut active = store
+        .get_session("other", "active-child")
+        .await
+        .unwrap()
+        .unwrap();
+    active.last_active_at = Some(old);
+    store.upsert_session(active).await.unwrap();
+    assert_eq!(
+        call(
+            "POST",
+            "/v1/ingest",
+            json!({
+                "harness":"other","project":project,"session":"active-child","items":[]
+            })
+        )
+        .await
+        .0,
+        200
+    );
+    assert!(
+        store
+            .get_session("other", "active-child")
+            .await
+            .unwrap()
+            .unwrap()
+            .last_active_at
+            .unwrap()
+            > old
+    );
+    assert_eq!(
+        call(
+            "POST",
+            "/v1/continuations/claim",
+            json!({
+                "project":project,"harness":"new","session":"claimant"
+            })
+        )
+        .await
+        .1["claimed"],
+        true
+    );
+    assert!(
+        store
+            .get_session("new", "claimant")
+            .await
+            .unwrap()
+            .unwrap()
+            .last_active_at
+            .is_some()
+    );
 }
 
 async fn release_workflow(address: &str) {
@@ -226,9 +424,18 @@ async fn release_workflow(address: &str) {
     assert_eq!(call("PUT", "/v1/sessions", child).await.0, 200);
     let ingest = json!({"harness":"opencode","project":"gc-project","session":"parent","items":[{"source_id":"item","ts":"2026-11-18T10:00:00Z","role":"user","text":"unique parent memory"}]});
     assert_eq!(call("POST", "/v1/ingest", ingest.clone()).await.0, 200);
-    let release = call("POST", "/v1/sessions/release", parent.clone()).await;
+    let release = call("POST", "/v1/sessions/release", json!({"harness":"opencode","project":"gc-project","session":"parent","reason":"test-reason"})).await;
     assert_eq!(release.1["released"], true);
     assert_eq!(release.1["removed"], json!([]));
+    let deleted = request(
+        address,
+        "GET",
+        "/v1/sessions?harness=opencode&project=gc-project&include_deleted=true",
+        Some("test-token"),
+        "",
+    )
+    .await;
+    assert_eq!(deleted.1["sessions"][0]["deleted_reason"], "test-reason");
     let digest = request(
         address,
         "GET",

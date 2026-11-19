@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use mementod::{
     config::Config,
     embed::FastEmbedder,
-    routes::{AppState, router},
+    routes::{AppState, backfill_activity, router},
     store::Store,
 };
 use qdrant_client::Qdrant;
@@ -43,6 +43,9 @@ async fn main() -> Result<()> {
         .ensure_schema()
         .await
         .context("ensuring Qdrant schema")?;
+    backfill_activity(&store, chrono::Utc::now())
+        .await
+        .context("backfilling session activity")?;
     let router = router(AppState {
         store: Arc::new(store),
         config: config.clone(),
