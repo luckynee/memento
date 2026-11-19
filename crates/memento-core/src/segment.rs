@@ -157,10 +157,184 @@ pub(crate) fn command_exit_header(line: &str) -> Option<&str> {
     if line == "Exit status: failed" {
         return Some(line);
     }
-    let value = line
-        .strip_prefix("Process exited with code ")
-        .or_else(|| line.strip_prefix("Exit code:"))?;
+    let lowercase = line.to_ascii_lowercase();
+    let value = lowercase
+        .strip_prefix("process exited with code ")
+        .or_else(|| lowercase.strip_prefix("exit code:"))
+        .or_else(|| lowercase.strip_prefix("exit code "))?;
     value.trim().parse::<i64>().ok().map(|_| line)
+}
+
+fn shell_file_paths(command: &str) -> Option<Vec<String>> {
+    if command.chars().any(|character| {
+        matches!(
+            character,
+            '|' | '>'
+                | '<'
+                | ';'
+                | '&'
+                | '`'
+                | '$'
+                | '\n'
+                | '\r'
+                | '('
+                | ')'
+                | '*'
+                | '?'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '\\'
+                | '#'
+        )
+    }) {
+        return None;
+    }
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    for character in command.chars() {
+        match (quote, character) {
+            (Some(expected), found) if expected == found => quote = None,
+            (Some(_), _) => word.push(character),
+            (None, '\'' | '"') => quote = Some(character),
+            (None, character) if character.is_whitespace() => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            }
+            (None, _) => word.push(character),
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    let (program, arguments) = words.split_first()?;
+    if !matches!(
+        program.as_str(),
+        "cat" | "head" | "tail" | "nl" | "less" | "more" | "bat" | "sed"
+    ) {
+        return None;
+    }
+    let mut paths = Vec::new();
+    let mut end_options = false;
+    let mut sed_expression = program != "sed";
+    let mut skip_option_value = false;
+    for argument in arguments {
+        if skip_option_value {
+            if argument.is_empty() {
+                return None;
+            }
+            skip_option_value = false;
+            continue;
+        }
+        if !end_options && argument == "--" {
+            end_options = true;
+            continue;
+        }
+        if !end_options && argument.starts_with('-') {
+            let safe = match program.as_str() {
+                "cat" => matches!(
+                    argument.as_str(),
+                    "-A" | "-b"
+                        | "-e"
+                        | "-E"
+                        | "-n"
+                        | "-s"
+                        | "-t"
+                        | "-T"
+                        | "-u"
+                        | "-v"
+                        | "--number"
+                        | "--number-nonblank"
+                        | "--squeeze-blank"
+                        | "--show-all"
+                        | "--show-ends"
+                        | "--show-tabs"
+                        | "--show-nonprinting"
+                ),
+                "head" | "tail" => {
+                    if matches!(argument.as_str(), "-n" | "-c" | "--lines" | "--bytes") {
+                        skip_option_value = true;
+                        true
+                    } else {
+                        matches!(
+                            argument.as_str(),
+                            "-q" | "-v" | "--quiet" | "--silent" | "--verbose"
+                        ) || argument[1..].bytes().all(|byte| byte.is_ascii_digit())
+                            || argument
+                                .strip_prefix("-n")
+                                .or_else(|| argument.strip_prefix("-c"))
+                                .is_some_and(|value| {
+                                    !value.is_empty()
+                                        && value.bytes().all(|byte| byte.is_ascii_digit())
+                                })
+                            || argument
+                                .strip_prefix("--lines=")
+                                .or_else(|| argument.strip_prefix("--bytes="))
+                                .is_some_and(|value| {
+                                    !value.is_empty()
+                                        && value.bytes().all(|byte| byte.is_ascii_digit())
+                                })
+                    }
+                }
+                "nl" => {
+                    if matches!(
+                        argument.as_str(),
+                        "-b" | "-d" | "-f" | "-h" | "-i" | "-l" | "-n" | "-s" | "-v" | "-w"
+                    ) {
+                        skip_option_value = true;
+                        true
+                    } else {
+                        matches!(argument.as_str(), "-p" | "--no-renumber")
+                            || ["-b", "-d", "-f", "-h", "-i", "-l", "-n", "-s", "-v", "-w"]
+                                .iter()
+                                .any(|prefix| {
+                                    argument
+                                        .strip_prefix(prefix)
+                                        .is_some_and(|value| !value.is_empty())
+                                })
+                    }
+                }
+                "less" => matches!(argument.as_str(), "-F" | "-R" | "-S" | "-X" | "-N" | "-n"),
+                "more" => matches!(argument.as_str(), "-d" | "-f" | "-p" | "-c" | "-s" | "-u"),
+                "bat" => matches!(
+                    argument.as_str(),
+                    "-n" | "-p" | "--plain" | "--paging=never" | "--color=never"
+                ),
+                "sed" => argument == "-n",
+                _ => false,
+            };
+            if !safe {
+                return None;
+            }
+            continue;
+        }
+        if !sed_expression {
+            let expression = argument.strip_suffix('p')?;
+            if expression.is_empty()
+                || !expression
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b',' | b'$'))
+            {
+                return None;
+            }
+            sed_expression = true;
+            continue;
+        }
+        if argument == "-" {
+            return None;
+        }
+        paths.push(argument.clone());
+    }
+    if program == "sed" && !arguments.iter().any(|argument| argument == "-n") {
+        return None;
+    }
+    (!paths.is_empty() && sed_expression && !skip_option_value).then_some(paths)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -294,6 +468,15 @@ fn render_tool(tool: &ToolCall, policy: &SegmentPolicy) -> Option<RenderedItem> 
             .any(|prefix| command.trim_start().starts_with(prefix))
         {
             return None;
+        }
+        if let Some(paths) = shell_file_paths(command) {
+            return Some(RenderedItem {
+                kind: Kind::FileRef,
+                text: format!("{} {}", tool.name, paths.join(", ")),
+                tool: Some(tool.name.clone()),
+                path: paths.first().cloned(),
+                paths,
+            });
         }
         let output_limit = if tool.ok {
             policy.successful_output_max_chars
@@ -636,6 +819,92 @@ mod tests {
             &SegmentPolicy::default(),
         );
         assert_eq!(outcome.segments[0].text, "run\nExit code: 7");
+        for header in [
+            "Exit code 1",
+            "exit code 1",
+            "EXIT CODE: 1",
+            "process EXITED with CODE 1",
+        ] {
+            let output = format!("{header}\n{}", "x".repeat(100));
+            let outcome = run(
+                vec![tool_item(
+                    "bash",
+                    json!({"command": "run"}),
+                    Some(&output),
+                    false,
+                )],
+                &policy,
+            );
+            assert!(
+                outcome.segments[0]
+                    .text
+                    .starts_with(&format!("run\n{header}\n"))
+            );
+            assert!(!outcome.segments[0].text.contains("Exit status: failed"));
+        }
+    }
+
+    #[test]
+    fn simple_shell_file_views_store_paths_without_contents() {
+        for (command, expected) in [
+            ("cat src/part18.rs", vec!["src/part18.rs"]),
+            ("cat -n 'a b.rs' \"c.rs\"", vec!["a b.rs", "c.rs"]),
+            ("head -10 a.rs", vec!["a.rs"]),
+            ("head -n 5 a.rs", vec!["a.rs"]),
+            ("tail -20 a.rs", vec!["a.rs"]),
+            ("tail -n 5 a.rs", vec!["a.rs"]),
+            ("nl a.rs", vec!["a.rs"]),
+            ("nl -ba a.rs", vec!["a.rs"]),
+            ("less a.rs", vec!["a.rs"]),
+            ("more a.rs", vec!["a.rs"]),
+            ("bat --plain a.rs", vec!["a.rs"]),
+            ("sed -n '1,20p' a.rs", vec!["a.rs"]),
+        ] {
+            let outcome = run(
+                vec![tool_item(
+                    "bash",
+                    json!({"command":command}),
+                    Some("private file contents"),
+                    true,
+                )],
+                &SegmentPolicy::default(),
+            );
+            assert_eq!(outcome.segments[0].kind, Kind::FileRef, "{command}");
+            assert_eq!(outcome.segments[0].paths, expected, "{command}");
+            assert!(!outcome.segments[0].text.contains("private file contents"));
+        }
+    }
+
+    #[test]
+    fn shell_commands_with_complex_or_unsafe_shapes_stay_commands() {
+        for command in [
+            "cat a.rs | grep hello",
+            "cat a.rs > b.rs",
+            "cat a.rs; echo done",
+            "cat a.rs && echo done",
+            "cat $(echo a.rs)",
+            "cat `echo a.rs`",
+            "cat *.rs",
+            "cat",
+            "cat -",
+            "head -n 5",
+            "sed -i '1p' a.rs",
+            "sed -n '1w file' a.rs",
+            "sed -n '1p' a.rs; rm b.rs",
+            "bat --output=out a.rs",
+            "cat 'unfinished",
+        ] {
+            let outcome = run(
+                vec![tool_item(
+                    "bash",
+                    json!({"command":command}),
+                    Some("command output"),
+                    true,
+                )],
+                &SegmentPolicy::default(),
+            );
+            assert_eq!(outcome.segments[0].kind, Kind::Command, "{command}");
+        }
     }
 
     #[test]

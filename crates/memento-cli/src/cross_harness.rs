@@ -567,6 +567,28 @@ fn codex_exit_code(text: &str) -> Option<i64> {
     })
 }
 
+fn strip_codex_envelope(text: &str) -> &str {
+    let Some((first, rest)) = text.split_once('\n') else {
+        return text;
+    };
+    if first.trim() != "Script completed" {
+        return text;
+    }
+    let Some((wall_time, rest)) = rest.split_once('\n') else {
+        return text;
+    };
+    if !wall_time.trim().starts_with("Wall time ") {
+        return text;
+    }
+    let Some((heading, output)) = rest.split_once('\n') else {
+        return text;
+    };
+    if heading.trim() != "Output:" {
+        return text;
+    }
+    output.strip_prefix('\n').unwrap_or(output)
+}
+
 fn codex_output(raw: &Value) -> (String, bool) {
     let text = text_content(raw);
     let parsed = match raw {
@@ -582,12 +604,12 @@ fn codex_output(raw: &Value) -> (String, bool) {
         })
         .and_then(Value::as_i64)
         .or_else(|| codex_exit_code(&text));
-    let mut output = parsed
+    let output = parsed
         .as_ref()
         .and_then(|value| value.get("output"))
         .and_then(Value::as_str)
-        .unwrap_or(&text)
-        .to_string();
+        .unwrap_or(&text);
+    let mut output = strip_codex_envelope(output).to_string();
     if let Some(code) = code.filter(|code| *code != 0)
         && codex_exit_code(&output) != Some(code)
     {
@@ -1905,6 +1927,29 @@ mod tests {
         );
         assert_eq!(name, "bash");
         assert_eq!(input["command"], "python3 check.py");
+    }
+
+    #[test]
+    fn codex_output_strips_only_complete_code_mode_envelopes() {
+        let raw = json!([
+            {"type":"input_text","text":"Script completed\nWall time 0.1 seconds\nOutput:\n"},
+            {"type":"input_text","text":"running ledger consistency check\nERROR: ERR_CURSOR_GAP_9902\n"}
+        ]);
+        let (output, ok) = codex_output(&raw);
+        assert_eq!(
+            output,
+            "running ledger consistency check\nERROR: ERR_CURSOR_GAP_9902\n"
+        );
+        assert!(ok);
+        let (output, ok) = codex_output(&json!("Script completed\nordinary output"));
+        assert_eq!(output, "Script completed\nordinary output");
+        assert!(ok);
+        let (output, ok) = codex_output(&json!({
+            "output":"Script completed\nWall time 0.1 seconds\nOutput:\nerror",
+            "metadata":{"exit_code":1}
+        }));
+        assert_eq!(output, "Exit code: 1\nerror");
+        assert!(!ok);
     }
 
     #[test]

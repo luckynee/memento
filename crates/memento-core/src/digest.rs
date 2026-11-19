@@ -158,11 +158,27 @@ fn command_status(text: &str) -> Option<CommandStatus> {
         if line == "Exit status: failed" {
             return Some(CommandStatus::Failed);
         }
-        let value = line
-            .strip_prefix("Process exited with code ")
-            .or_else(|| line.strip_prefix("Exit code:"))?;
+        let lowercase = line.to_ascii_lowercase();
+        let value = lowercase
+            .strip_prefix("process exited with code ")
+            .or_else(|| lowercase.strip_prefix("exit code:"))
+            .or_else(|| lowercase.strip_prefix("exit code "))?;
         value.trim().parse().ok().map(CommandStatus::Code)
     })
+}
+
+fn without_truncation_markers(text: &str) -> &str {
+    let mut text = text.trim_end();
+    while let Some(prefix) = text.strip_suffix(" chars]") {
+        let Some((before, count)) = prefix.rsplit_once("...[truncated ") else {
+            break;
+        };
+        if count.is_empty() || !count.bytes().all(|byte| byte.is_ascii_digit()) {
+            break;
+        }
+        text = before.trim_end();
+    }
+    text
 }
 
 fn command_item(text: &str) -> String {
@@ -173,8 +189,7 @@ fn command_item(text: &str) -> String {
         Some(CommandStatus::Failed) => " (failed)".to_string(),
         None => String::new(),
     };
-    let tail: String = output
-        .trim_end()
+    let tail: String = without_truncation_markers(output)
         .chars()
         .rev()
         .take(160)
@@ -720,5 +735,28 @@ mod tests {
         assert!(digest.text.contains("- false (failed)"));
         assert!(!digest.text.contains("- success1\n"));
         assert!(!digest.text.contains("- success2\n"));
+    }
+
+    #[test]
+    fn command_tail_omits_truncation_markers_and_keeps_real_output() {
+        let output = format!(
+            "check\n{}\nERROR_CODE_42...[truncated 35790 chars]",
+            "x".repeat(200)
+        );
+        let item = command_item(&output);
+        assert!(item.contains("ERROR_CODE_42"));
+        assert!(!item.contains("truncated"));
+        assert_eq!(
+            command_item("check\nvalue...[truncated 12 chars]...[truncated 3 chars]"),
+            "- check\n  value\n"
+        );
+        assert_eq!(
+            command_item("check\nvalue...[truncated unknown chars]"),
+            "- check\n  value...[truncated unknown chars]\n"
+        );
+        assert_eq!(
+            command_item("check\nexit code 1\nerror"),
+            "- check (exit: 1)\n  exit code 1\n  error\n"
+        );
     }
 }
