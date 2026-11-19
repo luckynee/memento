@@ -122,10 +122,20 @@ export function rewriteForSwitch<M extends ConversationMessage, S extends System
             }
         }
     }
-    system.push({ type: "text", text: buildDigestText(snapshot.digest) } as S);
+    const addDigest = (messages: M[]): { system: S[]; messages: M[] } => {
+        const userIndex = messages.findIndex((message) => message.role === "user");
+        const digest = { type: "text", text: buildDigestText(snapshot.digest) };
+        if (userIndex < 0) {
+            system.push(digest as S);
+        } else {
+            const original = messages[userIndex];
+            messages[userIndex] = opts.cloneMessage(original, [digest, ...original.content]);
+        }
+        return { system, messages };
+    };
     const cutIndex = snapshot.cutMessageID === null ? -1 : input.messages.findIndex((message) => message.id === snapshot.cutMessageID);
     if (cutIndex < 0) {
-        return { system, messages: input.messages.filter((message) => message.role !== "system") };
+        return addDigest(input.messages.filter((message) => message.role !== "system"));
     }
     const boundaries: number[] = [];
     for (let index = 0; index < cutIndex; index++) {
@@ -151,8 +161,5 @@ export function rewriteForSwitch<M extends ConversationMessage, S extends System
             ? opts.cloneMessage(message, content)
             : message;
     });
-    return {
-        system,
-        messages: tail.filter((message) => message.role !== "system"),
-    };
+    return addDigest(tail.filter((message) => message.role !== "system"));
 }

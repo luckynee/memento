@@ -30,16 +30,20 @@ describe("snapshot rewriting", () => {
         expect(buildDigestText(digest)).toBe(buildDigestText(digest));
     });
 
-    test("keeps user boundaries and tool pairs, adds system digest deterministically", () => {
+    test("keeps user boundaries and tool pairs, prepends digest deterministically", () => {
         const messages = history();
         const input = { system: system(), messages };
         const snapshot = { cutMessageID: "u4", digest: "digest" };
+        const before = JSON.stringify(input);
         const result = rewriteForSwitch(input, snapshot, options);
-        expect(result.system).toEqual([...input.system, { type: "text", text: "system" }, { type: "text", text: buildDigestText("digest") }]);
-        expect(result.messages).toEqual(messages.slice(1));
+        expect(result.system).toEqual([...input.system, { type: "text", text: "system" }]);
+        expect(result.messages[0]).not.toBe(messages[1]);
+        expect(result.messages[0].content).toEqual([{ type: "text", text: buildDigestText("digest") }, ...messages[1].content]);
+        expect(result.messages.slice(1)).toEqual(messages.slice(2));
         expect(result.messages[3]).toBe(messages[4]);
         expect(result.messages[4]).toBe(messages[5]);
         expect(JSON.stringify(result)).toBe(JSON.stringify(rewriteForSwitch(input, snapshot, options)));
+        expect(JSON.stringify(input)).toBe(before);
         expect(sameModel(a, { ...a, variant: "ignored" } as ModelRef)).toBe(true);
     });
 
@@ -72,9 +76,9 @@ describe("snapshot rewriting", () => {
             { type: "text", text: "before cut" },
             { type: "text", text: "after cut" },
             { type: "text", text: "" },
-            { type: "text", text: buildDigestText("digest") },
         ]);
         expect(result.messages.map((entry) => entry.id)).toEqual(["tail", "cut", "answer"]);
+        expect(result.messages[0].content).toEqual([{ type: "text", text: buildDigestText("digest") }, ...messages[3].content]);
         expect(result.messages.every((entry) => entry.role !== "system")).toBe(true);
         expect(JSON.stringify(result)).toBe(JSON.stringify(rewriteForSwitch(input, snapshot, { ...options, tailUserTurns: 1 })));
         expect(JSON.stringify(input)).toBe(before);
@@ -117,21 +121,39 @@ describe("snapshot rewriting", () => {
     });
 
     test("compacted or missing cut hoists system text and retains other messages", () => {
-        const messages = [...history(), message("sys2", "system", "after"), message("end", "user", "end")];
+        const messages = [message("initial", "assistant", "initial"), ...history(), message("sys2", "system", "after"), message("end", "user", "end")];
         for (const cutMessageID of [null, "missing"]) {
             const input = { system: system(), messages };
             const snapshot = { cutMessageID, digest: "d" };
+            const before = JSON.stringify(input);
             const result = rewriteForSwitch(input, snapshot, options);
-            expect(result.messages).toEqual(messages.filter((entry) => entry.role !== "system"));
+            const retained = messages.filter((entry) => entry.role !== "system");
+            expect(result.messages[0]).toBe(retained[0]);
+            expect(result.messages[1]).not.toBe(retained[1]);
+            expect(result.messages[1].content).toEqual([{ type: "text", text: buildDigestText("d") }, ...retained[1].content]);
+            expect(result.messages.slice(2)).toEqual(retained.slice(2));
             expect(result.messages.every((entry) => entry.role !== "system")).toBe(true);
             expect(result.system).toEqual([
                 ...input.system,
                 { type: "text", text: "system" },
                 { type: "text", text: "after" },
-                { type: "text", text: buildDigestText("d") },
             ]);
             expect(JSON.stringify(result)).toBe(JSON.stringify(rewriteForSwitch(input, snapshot, options)));
+            expect(JSON.stringify(input)).toBe(before);
         }
+    });
+
+    test("falls back to a system digest when no user message remains", () => {
+        const messages = [message("sys", "system", "hoisted"), message("cut", "assistant", "answer")];
+        const input = { system: system(), messages };
+        const before = JSON.stringify(input);
+        for (const cutMessageID of [null, "cut"]) {
+            const result = rewriteForSwitch(input, { cutMessageID, digest: "d" }, options);
+            expect(result.system).toEqual([...input.system, { type: "text", text: "hoisted" }, { type: "text", text: buildDigestText("d") }]);
+            expect(result.messages).toEqual([messages[1]]);
+            expect(result.messages[0]).toBe(messages[1]);
+        }
+        expect(JSON.stringify(input)).toBe(before);
     });
 
     test("clones OpenCode Message instances with new content", () => {
@@ -140,6 +162,10 @@ describe("snapshot rewriting", () => {
         expect(clone).toBeInstanceOf(Message);
         expect(clone.id).toBe("m");
         expect(clone.content).toEqual([{ type: "text", text: "after" }]);
+        expect(original.content).toEqual([{ type: "text", text: "before" }]);
+        const result = rewriteForSwitch({ system: system(), messages: [original] }, { cutMessageID: "m", digest: "d" }, options);
+        expect(result.messages[0]).toBeInstanceOf(Message);
+        expect(result.messages[0].content).toEqual([{ type: "text", text: buildDigestText("d") }, ...original.content]);
         expect(original.content).toEqual([{ type: "text", text: "before" }]);
     });
 });
@@ -179,7 +205,7 @@ describe("switch controller", () => {
             snapshots: { "p/b": { cutMessageID: "u4", digest: "digest-1" } },
         });
         expect(fake.order).toEqual(["flush", "flushed", "digest"]);
-        expect(event.system[2].text).toBe(buildDigestText("digest-1"));
+        expect(event.messages[0].content[0]).toEqual({ type: "text", text: buildDigestText("digest-1") });
         expect(event.messages.map((entry) => entry.id)).toEqual(history().slice(1).map((entry) => entry.id));
     });
 
@@ -191,7 +217,7 @@ describe("switch controller", () => {
         const event = fake.event(b);
         await fake.controller.onContext(event);
         expect(fake.calls()).toBe(1);
-        expect(event.system[2].text).toBe(buildDigestText("digest-1"));
+        expect(event.messages[0].content[0]).toEqual({ type: "text", text: buildDigestText("digest-1") });
     });
 
     test("leaves a brand-new session untouched", async () => {
@@ -243,7 +269,7 @@ describe("switch controller", () => {
         await fake.controller.onContext(second);
         expect(fake.calls()).toBe(2);
         expect(JSON.stringify(first)).toBe(JSON.stringify(second));
-        expect(first.system[2].text).toBe(buildDigestText("digest-2"));
+        expect(first.messages[0].content[0]).toEqual({ type: "text", text: buildDigestText("digest-2") });
     });
 
     test("digest failure leaves event untouched, does not update last model, and retries", async () => {
@@ -344,7 +370,7 @@ describe("switch controller", () => {
         fail = false;
         await controller.onContext(event);
         expect(order).toEqual(["flush", "flush", "digest"]);
-        expect(event.system[2].text).toBe(buildDigestText("d"));
+        expect(event.messages[0].content[0]).toEqual({ type: "text", text: buildDigestText("d") });
     });
 
     test("evicts least recently used sessions and reloads persisted snapshots", async () => {
@@ -381,6 +407,6 @@ describe("switch controller", () => {
         await controller.onContext(restored);
         expect(reads.filter((key) => key === "memento/switch/s0")).toHaveLength(2);
         expect(digests).toBe(1);
-        expect(restored.system[2].text).toBe(buildDigestText("d"));
+        expect(restored.messages[0].content[0]).toEqual({ type: "text", text: buildDigestText("d") });
     });
 });
