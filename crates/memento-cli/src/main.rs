@@ -75,6 +75,8 @@ enum Command {
     },
     #[command(about = "Import a harness transcript")]
     Import(cross_harness::ImportArgs),
+    #[command(hide = true, about = "Import a pending hook transcript")]
+    HookImport(cross_harness::ImportArgs),
     #[command(about = "Prepare a cross-harness continuation")]
     Continue(cross_harness::ContinueArgs),
     #[command(about = "Handle a harness lifecycle event")]
@@ -338,6 +340,7 @@ fn build_request(
         Command::Ingest(_) => (Method::POST, vec!["v1", "ingest"]),
         Command::ProjectKey { .. }
         | Command::Import(_)
+        | Command::HookImport(_)
         | Command::Continue(_)
         | Command::Hook(_)
         | Command::InstallHooks(_) => return Err(CliError::other("not a legacy request")),
@@ -436,6 +439,7 @@ fn build_request(
         }
         Command::ProjectKey { .. }
         | Command::Import(_)
+        | Command::HookImport(_)
         | Command::Continue(_)
         | Command::Hook(_)
         | Command::InstallHooks(_) => return Err(CliError::other("not a legacy request")),
@@ -624,6 +628,7 @@ fn render(command: &Command, body: &str) -> Result<String, CliError> {
         }
         Command::ProjectKey { .. }
         | Command::Import(_)
+        | Command::HookImport(_)
         | Command::Continue(_)
         | Command::Hook(_)
         | Command::InstallHooks(_) => Err(CliError::other("not a legacy response")),
@@ -635,6 +640,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
         &cli.command,
         Command::ProjectKey { .. }
             | Command::Import(_)
+            | Command::HookImport(_)
             | Command::Continue(_)
             | Command::Hook(_)
             | Command::InstallHooks(_)

@@ -977,6 +977,122 @@ fn save_atomic_with_mode(path: &Path, contents: &[u8], mode: Option<u32>) -> Res
     }
 }
 
+fn pending_marker(state: &Path, harness: &str, session: &str) -> PathBuf {
+    fn sanitize(value: &str) -> String {
+        value
+            .bytes()
+            .map(|byte| {
+                if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.') {
+                    (byte as char).to_string()
+                } else {
+                    format!("_{byte:02x}")
+                }
+            })
+            .collect()
+    }
+    state
+        .join("pending")
+        .join(format!("{}-{}", sanitize(harness), sanitize(session)))
+}
+
+fn write_pending_marker(path: &Path) -> Result<(), CliError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| CliError::other("pending marker has no parent"))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| CliError::other(format!("cannot create {}: {error}", parent.display())))?;
+    let created = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|error| CliError::other(format!("invalid system time: {error}")))?
+        .as_secs();
+    save_atomic(path, created.to_string().as_bytes())
+}
+
+fn wait_for_pending_marker(path: &Path, timeout: Duration) -> Result<bool, CliError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => {
+                return Err(CliError::other(format!(
+                    "cannot read pending marker {}: {error}",
+                    path.display()
+                )));
+            }
+        };
+        let created = contents.trim().parse::<u64>().map_err(|error| {
+            CliError::other(format!(
+                "invalid pending marker {}: {error}",
+                path.display()
+            ))
+        })?;
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|error| CliError::other(format!("invalid system time: {error}")))?
+            .as_secs();
+        if now.saturating_sub(created) >= 60 {
+            let _ = fs::remove_file(path);
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(
+            Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
+#[cfg(unix)]
+fn spawn_import(cli: &Cli, args: &ImportArgs, state: &Path) -> Result<(), CliError> {
+    let executable = env::current_exe()
+        .map_err(|error| CliError::other(format!("cannot determine executable path: {error}")))?;
+    spawn_import_with_executable(cli, args, state, &executable)
+}
+
+#[cfg(unix)]
+fn spawn_import_with_executable(
+    cli: &Cli,
+    args: &ImportArgs,
+    state: &Path,
+    executable: &Path,
+) -> Result<(), CliError> {
+    use std::os::unix::process::CommandExt;
+
+    let mut options = OpenOptions::new();
+    options.create(true).append(true).mode(0o600);
+    let log = options.open(state.join("import.log")).ok();
+    let stderr = log.as_ref().and_then(|file| file.try_clone().ok());
+    let mut command = Command::new(executable);
+    command
+        .args(["hook-import", args.harness.name(), "--transcript"])
+        .arg(&args.transcript)
+        .arg("--url")
+        .arg(&cli.url)
+        .arg("--timeout-secs")
+        .arg(cli.timeout_secs.to_string())
+        .stdin(Stdio::null())
+        .stdout(log.map_or_else(Stdio::null, Stdio::from))
+        .stderr(stderr.map_or_else(Stdio::null, Stdio::from))
+        .process_group(0);
+    if let Some(session) = &args.session {
+        command.arg("--session").arg(session);
+    }
+    if let Some(project) = &args.project {
+        command.arg("--project").arg(project);
+    }
+    if let Some(token) = &cli.token {
+        command.env("MEMENTO_TOKEN", token);
+    } else {
+        command.env_remove("MEMENTO_TOKEN");
+    }
+    command
+        .spawn()
+        .map_err(|error| CliError::other(format!("cannot spawn transcript importer: {error}")))?;
+    Ok(())
+}
+
 fn jev_request(item: &IngestItem, text: &str) -> Value {
     let (instructions, choices) = if item.role == Role::User {
         (
@@ -1317,6 +1433,7 @@ fn handle_hook(
     input: &HookInput,
     client: &Client,
     state: &Path,
+    sync_import: bool,
 ) -> Result<Option<Value>, CliError> {
     match input.hook_event_name.as_str() {
         "SessionStart" => {
@@ -1413,6 +1530,23 @@ fn handle_hook(
                 project: input.cwd.clone(),
                 full: false,
             };
+            #[cfg(unix)]
+            {
+                if sync_import {
+                    import(cli, &args, client, state)?;
+                } else {
+                    let marker = pending_marker(state, harness.name(), &input.session_id);
+                    write_pending_marker(&marker)?;
+                    if let Err(error) = spawn_import(cli, &args, state) {
+                        let _ = fs::remove_file(&marker);
+                        eprintln!("warning: {}; importing synchronously", error.message);
+                        import(cli, &args, client, state)?;
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = sync_import;
+            #[cfg(not(unix))]
             import(cli, &args, client, state)?;
             Ok(Some(json!({})))
         }
@@ -1475,9 +1609,11 @@ fn merge_hooks(existing: &mut Value, harness: Harness, executable: &Path) -> Res
                     if handler.get("command").and_then(Value::as_str) == Some(command.as_str()) {
                         found = true;
                         if event == "Stop" {
-                            handler["async"] = json!(true);
+                            if let Some(handler) = handler.as_object_mut() {
+                                handler.remove("async");
+                            }
                             if matches!(harness, Harness::Codex) {
-                                handler["timeout"] = json!(120);
+                                handler["timeout"] = json!(30);
                             }
                         }
                     }
@@ -1496,14 +1632,10 @@ fn merge_hooks(existing: &mut Value, harness: Harness, executable: &Path) -> Res
                     handler["additionalContextLimit"] = json!(5000);
                 }
                 "Stop" => {
-                    handler["async"] = json!(true);
-                    handler["timeout"] = json!(120);
+                    handler["timeout"] = json!(30);
                 }
                 _ => {}
             }
-        }
-        if event == "Stop" {
-            handler["async"] = json!(true);
         }
         group["hooks"] = json!([handler]);
         groups.push(group);
@@ -1607,6 +1739,14 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
             let response = import(cli, args, &client(cli, false)?, &state_dir()?)?;
             println!("{}", response.render());
         }
+        crate::Command::HookImport(args) => {
+            let state = state_dir()?;
+            let result = client(cli, false).and_then(|client| import(cli, args, &client, &state));
+            if let Some(session) = &args.session {
+                let _ = fs::remove_file(pending_marker(&state, args.harness.name(), session));
+            }
+            result?;
+        }
         crate::Command::Continue(args) => {
             let (harness, session) = args
                 .from
@@ -1619,6 +1759,19 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
                 parent_session: session.to_string(),
                 target_harness: args.to.clone(),
             };
+            match state_dir().and_then(|state| {
+                wait_for_pending_marker(
+                    &pending_marker(&state, harness, session),
+                    Duration::from_secs(30),
+                )
+            }) {
+                Ok(true) => {}
+                Ok(false) => eprintln!("warning: timed out waiting for transcript import"),
+                Err(error) => eprintln!(
+                    "warning: cannot wait for transcript import: {}",
+                    error.message
+                ),
+            }
             let record: ContinuationRecord = parse_response(&http(
                 &client(cli, false)?,
                 cli,
@@ -1657,7 +1810,7 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
                         let harness = args.harness;
                         std::thread::spawn(move || {
                             let result = client(&cli, true).and_then(|client| {
-                                handle_hook(&cli, harness, &input, &client, Path::new(""))
+                                handle_hook(&cli, harness, &input, &client, Path::new(""), false)
                             });
                             let _ = sender.send(result);
                         });
@@ -1667,7 +1820,15 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
                     } else {
                         client(cli, true).and_then(|client| {
                             state_dir().and_then(|state| {
-                                handle_hook(cli, args.harness, &input, &client, &state)
+                                handle_hook(
+                                    cli,
+                                    args.harness,
+                                    &input,
+                                    &client,
+                                    &state,
+                                    env::var_os("MEMENTO_HOOK_SYNC")
+                                        .is_some_and(|value| value == "1"),
+                                )
                             })
                         })
                     };
@@ -2141,7 +2302,7 @@ mod tests {
             hook_event_name: "SessionStart".into(),
             source: None,
         };
-        let output = handle_hook(&cli, Harness::Codex, &input, &client, temp.path())
+        let output = handle_hook(&cli, Harness::Codex, &input, &client, temp.path(), true)
             .unwrap()
             .unwrap();
         let context = output["hookSpecificOutput"]["additionalContext"]
@@ -2162,7 +2323,7 @@ mod tests {
         assert!(context.contains("omits full command output and file contents"));
         assert!(context.contains("read or grep workspace files"));
         input.source = Some("compact".into());
-        let output = handle_hook(&cli, Harness::Codex, &input, &client, temp.path())
+        let output = handle_hook(&cli, Harness::Codex, &input, &client, temp.path(), true)
             .unwrap()
             .unwrap();
         assert!(
@@ -2201,30 +2362,84 @@ mod tests {
             source: None,
         };
         assert_eq!(
-            handle_hook(&cli, Harness::ClaudeCode, &input, &client, temp.path())
-                .unwrap()
-                .unwrap(),
+            handle_hook(
+                &cli,
+                Harness::ClaudeCode,
+                &input,
+                &client,
+                temp.path(),
+                true
+            )
+            .unwrap()
+            .unwrap(),
             json!({})
         );
+        assert!(!pending_marker(temp.path(), "claude-code", "child").exists());
         input.hook_event_name = "SessionEnd".into();
         assert!(
-            handle_hook(&cli, Harness::ClaudeCode, &input, &client, temp.path())
-                .unwrap()
-                .is_none()
+            handle_hook(
+                &cli,
+                Harness::ClaudeCode,
+                &input,
+                &client,
+                temp.path(),
+                true
+            )
+            .unwrap()
+            .is_none()
         );
         input.hook_event_name = "UserPromptSubmit".into();
         assert!(
-            handle_hook(&cli, Harness::ClaudeCode, &input, &client, temp.path())
-                .unwrap()
-                .is_none()
+            handle_hook(
+                &cli,
+                Harness::ClaudeCode,
+                &input,
+                &client,
+                temp.path(),
+                true
+            )
+            .unwrap()
+            .is_none()
         );
         input.hook_event_name = "SessionStart".into();
         assert!(
-            handle_hook(&cli, Harness::ClaudeCode, &input, &client, temp.path())
-                .unwrap()
-                .is_none()
+            handle_hook(
+                &cli,
+                Harness::ClaudeCode,
+                &input,
+                &client,
+                temp.path(),
+                true
+            )
+            .unwrap()
+            .is_none()
         );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn pending_marker_waits_and_removes_stale_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = pending_marker(temp.path(), "claude-code", "session/one");
+        assert!(marker.starts_with(temp.path().join("pending")));
+        assert_ne!(
+            marker,
+            pending_marker(temp.path(), "claude-code", "session_2fone")
+        );
+        write_pending_marker(&marker).unwrap();
+        assert!(!wait_for_pending_marker(&marker, Duration::from_millis(120)).unwrap());
+        let removal = marker.clone();
+        let thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            fs::remove_file(removal).unwrap();
+        });
+        let started = Instant::now();
+        assert!(wait_for_pending_marker(&marker, Duration::from_secs(2)).unwrap());
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        thread.join().unwrap();
+        fs::write(&marker, b"1").unwrap();
+        assert!(wait_for_pending_marker(&marker, Duration::from_secs(1)).unwrap());
+        assert!(!marker.exists());
     }
 
     #[test]
@@ -2266,7 +2481,11 @@ mod tests {
             merged["hooks"]["SessionStart"][0]["hooks"][0]["additionalContextLimit"],
             5000
         );
-        assert_eq!(merged["hooks"]["Stop"][1]["hooks"][0]["async"], true);
+        assert!(
+            merged["hooks"]["Stop"][1]["hooks"][0]
+                .get("async")
+                .is_none()
+        );
         assert!(merged["hooks"].get("SessionEnd").is_none());
         install(&args, temp.path(), Path::new("/usr/bin/memento")).unwrap();
         assert_eq!(fs::read(&path).unwrap(), first);
@@ -2287,7 +2506,11 @@ mod tests {
             output["hooks"]["Stop"][0]["hooks"][0]["command"],
             "/bin/memento hook claude-code"
         );
-        assert_eq!(output["hooks"]["Stop"][0]["hooks"][0]["async"], true);
+        assert!(
+            output["hooks"]["Stop"][0]["hooks"][0]
+                .get("async")
+                .is_none()
+        );
         assert!(!temp.path().join(".claude/settings.json").exists());
     }
 
@@ -2313,7 +2536,7 @@ mod tests {
         for harness in [Harness::ClaudeCode, Harness::Codex] {
             let command = format!("/bin/memento hook {}", harness.name());
             let mut value = json!({"hooks": {
-                "Stop": [{"hooks": [{"type":"command","command": command}]}],
+                "Stop": [{"hooks": [{"type":"command","command": command,"async":true}, {"command":"other","async":true}]}],
                 "SessionEnd": [
                     {"matcher":"x","hooks":[{"command":command},{"command":"other"}]},
                     {"hooks":[{"command":command}]},
@@ -2321,9 +2544,10 @@ mod tests {
                 ]
             }});
             merge_hooks(&mut value, harness, Path::new("/bin/memento")).unwrap();
-            assert_eq!(value["hooks"]["Stop"][0]["hooks"][0]["async"], true);
+            assert!(value["hooks"]["Stop"][0]["hooks"][0].get("async").is_none());
+            assert_eq!(value["hooks"]["Stop"][0]["hooks"][1]["async"], true);
             if matches!(harness, Harness::Codex) {
-                assert_eq!(value["hooks"]["Stop"][0]["hooks"][0]["timeout"], 120);
+                assert_eq!(value["hooks"]["Stop"][0]["hooks"][0]["timeout"], 30);
             }
             assert_eq!(value["hooks"]["SessionEnd"].as_array().unwrap().len(), 2);
             assert_eq!(
