@@ -4,6 +4,7 @@ import { createContinueCommand, createHandoffCommand } from "./commands";
 import { createIngestor } from "./ingest";
 import { createJevGate, type DecisionsFn } from "./jev";
 import { resolveOptions } from "./options";
+import { createSessionOwnership } from "./session-ownership";
 import { createSwitchController } from "./switch-controller";
 import { createMemorySearchTool } from "./tools";
 
@@ -37,6 +38,11 @@ export default Plugin.define({
         const project = projectKey(ctx.location.project);
         const client = new MementoClient({ url: options.url, token: options.token });
         const log = (message: string, error?: unknown) => console.warn("[memento] " + message, error ?? "");
+        const ownsSession = createSessionOwnership({
+            getSessionProjectID: async (sessionID) => (await ctx.session.get({ sessionID })).projectID,
+            projectID: ctx.location.project.id,
+            log,
+        });
         const decide: DecisionsFn | undefined = options.jev
             ? createJevGate({
                 decide: (input) => ctx.experimental.generate.decisions(input),
@@ -83,10 +89,27 @@ export default Plugin.define({
             harness: options.harness,
             project,
         });
-        const toolRegistration = await ctx.tool.transform((editor) => editor.add(tool));
+        const toolRegistration = await ctx.tool.transform((editor) => editor.add({
+            ...tool,
+            async execute(input, context) {
+                if (!await ownsSession(context.sessionID)) {
+                    return { content: "memory_search: memento is not enabled for this project." };
+                }
+                return tool.execute(input, context);
+            },
+        }));
         const commandRegistration = await ctx.command.transform((editor) => {
-            editor.add(command);
-            editor.add(handoff);
+            for (const entry of [command, handoff]) {
+                editor.add({
+                    ...entry,
+                    async execute(input) {
+                        if (!await ownsSession(input.sessionID)) {
+                            throw new Error("memento is not enabled for this project");
+                        }
+                        await entry.execute(input);
+                    },
+                });
+            }
         });
         const ensureRegistered = async (sessionID: string) => {
             try {
@@ -96,10 +119,16 @@ export default Plugin.define({
             }
         };
         const hookRegistration = await ctx.session.hook("context", async (event) => {
+            if (!await ownsSession(event.sessionID)) {
+                return;
+            }
             await ensureRegistered(event.sessionID);
             await switchController.onContext(event);
         });
         const compactionRegistration = await ctx.session.hook("compaction", async (event) => {
+            if (!await ownsSession(event.sessionID)) {
+                return;
+            }
             await switchController.onCompaction(event);
         });
         const controller = new AbortController();
@@ -110,6 +139,9 @@ export default Plugin.define({
                         types: ["session.execution.succeeded", "session.step.ended", "session.model.selected"],
                         signal: controller.signal,
                     })) {
+                        if (!await ownsSession(event.data.sessionID)) {
+                            continue;
+                        }
                         if (event.type === "session.execution.succeeded" || event.type === "session.step.ended") {
                             void ingestor.handleExecutionSucceeded(event.data.sessionID);
                         } else if (event.type === "session.model.selected") {

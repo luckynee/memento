@@ -265,6 +265,7 @@ Harness ids: `opencode`, `claude-code`, `codex`, `agy`.
 - User items honor `kind_hint` `decision` and `constraint` only; user text never becomes `task`.
 - Per-session locks for ingest; a short registry lock for registry writes and claims; embedding and upserts run outside global locks.
 - OpenCode adapter: no snapshot after a failed pre-switch flush; bounded in-memory caches; claim completion persisted only after the continuation instruction is written; mid-history `system` messages are hoisted into system parts when rewriting (Anthropic-protocol providers reject them).
+- OpenCode adapter ignores sessions outside the plugin instance's project.
 - OpenCode code-mode `execute` stays ignored: verified on 33 local calls that it only wraps catalog and MCP tools, never shell or edits.
 - Deployment: the daemon listens on `0.0.0.0` inside the container but the host port is `127.0.0.1` only; the Compose network contains only `qdrant` and `mementod`. Set `MEMENTO_TOKEN` if you attach other containers to that network.
 

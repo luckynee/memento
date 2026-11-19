@@ -35,6 +35,7 @@ test("step ended dispatches ingestion and cleanup stops the subscription", async
             async set(key: string, value: unknown) { values.set(key, value); },
         },
         session: {
+            async get() { return { projectID: "p" }; },
             async context() { return [{ id: "u", type: "user", time: { created: 0 }, text: "hello" }]; },
             async hook(name: string) {
                 hooks.push(name);
@@ -75,6 +76,72 @@ test("step ended dispatches ingestion and cleanup stops the subscription", async
         if (cleanup) { await cleanup(); }
         expect(disposedHooks).toEqual(["context", "compaction"]);
     } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test("foreign sessions cannot ingest, rewrite, compact, use commands, or search", async () => {
+    const requests: string[] = [];
+    const hooks = new Map<string, (event: any) => Promise<void>>();
+    const commands = new Map<string, any>();
+    let tool: any;
+    let lookups = 0;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url) => {
+        requests.push(String(url));
+        return Response.json({});
+    }) as typeof fetch;
+    const registration = () => ({ async dispose() {} });
+    const ctx = {
+        options: { jev: false },
+        location: { project: { id: "p" } },
+        storage: {
+            async get() { throw new Error("foreign session accessed storage"); },
+            async set() { throw new Error("foreign session accessed storage"); },
+        },
+        session: {
+            async get() { lookups++; return { projectID: "other" }; },
+            async context() { throw new Error("foreign session loaded context"); },
+            async hook(name: string, handler: (event: any) => Promise<void>) {
+                hooks.set(name, handler);
+                return registration();
+            },
+            instructions: { entry: { async put() { throw new Error("foreign session wrote instruction"); } } },
+        },
+        tool: { async transform(callback: (editor: any) => void) { callback({ add(value: unknown) { tool = value; } }); return registration(); } },
+        command: { async transform(callback: (editor: any) => void) { callback({ add(value: any) { commands.set(value.name, value); } }); return registration(); } },
+        event: {
+            async *subscribe(input: { signal: AbortSignal }) {
+                yield { type: "session.step.ended", data: { sessionID: "foreign" } };
+                yield { type: "session.execution.succeeded", data: { sessionID: "foreign" } };
+                yield { type: "session.model.selected", data: { sessionID: "foreign", model: { providerID: "p", id: "m" } } };
+                if (!input.signal.aborted) {
+                    await new Promise<void>((resolve) => input.signal.addEventListener("abort", () => resolve(), { once: true }));
+                }
+            },
+        },
+    } as unknown as Plugin.Context;
+    let cleanup: void | (() => void | Promise<void>) = undefined;
+    try {
+        cleanup = await plugin.setup(ctx);
+        const context = { sessionID: "foreign", system: [], messages: [], model: { providerID: "p", id: "m" } };
+        const compaction = { ...context };
+        await hooks.get("context")!(context);
+        await hooks.get("compaction")!(compaction);
+        expect(context).toEqual({ sessionID: "foreign", system: [], messages: [], model: { providerID: "p", id: "m" } });
+        expect(compaction).toEqual(context);
+        for (const name of ["memento-continue", "memento-handoff"]) {
+            await expect(commands.get(name).execute({ sessionID: "foreign", prompt: { text: "parent" } })).rejects.toThrow("not enabled");
+        }
+        expect(await tool.execute({ query: "test" }, { sessionID: "foreign", signal: new AbortController().signal })).toEqual({
+            content: "memory_search: memento is not enabled for this project.",
+        });
+        await cleanup?.();
+        cleanup = undefined;
+        expect(requests).toEqual([]);
+        expect(lookups).toBe(1);
+    } finally {
+        await cleanup?.();
         globalThis.fetch = originalFetch;
     }
 });

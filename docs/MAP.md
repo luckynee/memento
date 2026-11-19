@@ -15,7 +15,7 @@
 | `crates/mementod/src/embed.rs` | `Embedder` trait, `FastEmbedder` (spawn_blocking), `FakeEmbedder` for tests |
 | `crates/mementod/tests/` | Live Qdrant tests, gated on `MEMENTO_TEST_QDRANT_URL` |
 | `crates/memento-cli/src/main.rs` | `memento` CLI, HTTP client of mementod |
-| `adapters/opencode/src/` | OpenCode V2 plugin: `client`, `transcript`, `ingest`, `switch` (pure rewrite), `switch-controller`, `tools`, `commands`, `options`, `index` |
+| `adapters/opencode/src/` | OpenCode V2 plugin: `client`, `transcript`, `ingest`, `session-ownership`, `switch` (pure rewrite), `switch-controller`, `tools`, `commands`, `options`, `index` |
 | `adapters/opencode/test/` | `bun test` suites (mocked daemon and Jev) |
 | `deploy/` | `Dockerfile` (rust:1.95-trixie builder, debian:trixie-slim + libc++1 runtime, model baked by `mementod warmup`), `compose.yaml` |
 
