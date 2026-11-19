@@ -28,6 +28,7 @@ use crate::{Cli, CliError, IngestResponse, endpoint, parse_response, response_er
 pub enum Harness {
     ClaudeCode,
     Codex,
+    Agy,
 }
 
 impl Harness {
@@ -35,6 +36,7 @@ impl Harness {
         match self {
             Self::ClaudeCode => "claude-code",
             Self::Codex => "codex",
+            Self::Agy => "agy",
         }
     }
 }
@@ -51,6 +53,8 @@ pub struct ImportArgs {
     project: Option<PathBuf>,
     #[arg(long, help = "Re-import from the start")]
     full: bool,
+    #[arg(long, hide = true, help = "Override the ingest harness identifier")]
+    identity_harness: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -69,12 +73,28 @@ pub struct GcArgs {
     project: Option<PathBuf>,
     #[arg(long, help = "Report without changing sessions or cursors")]
     dry_run: bool,
+    #[arg(long, help = "Suppress the garbage collection summary")]
+    quiet: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum HookHarness {
+    ClaudeCode,
+    Codex,
+    Agy,
+    Generic,
 }
 
 #[derive(Debug, Args)]
 pub struct HookArgs {
     #[arg(value_enum, help = "Hook harness")]
-    harness: Harness,
+    kind: HookHarness,
+    #[arg(
+        long,
+        required_if_eq("kind", "generic"),
+        help = "Generic harness identifier"
+    )]
+    harness: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -86,6 +106,29 @@ pub struct InstallArgs {
     #[arg(long, help = "Install in the user's home directory")]
     user: bool,
     #[arg(long, help = "Print merged JSON without writing")]
+    dry_run: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum SkillHarness {
+    Opencode,
+    ClaudeCode,
+    Codex,
+    Agy,
+    All,
+}
+
+#[derive(Debug, Args)]
+pub struct InstallSkillsArgs {
+    #[arg(long, value_enum, default_value = "all", help = "Target harness")]
+    harness: SkillHarness,
+    #[arg(long, conflicts_with = "user", help = "Project directory")]
+    project: Option<PathBuf>,
+    #[arg(long, help = "Install in the user's home directory")]
+    user: bool,
+    #[arg(long, help = "Source skills directory")]
+    source: Option<PathBuf>,
+    #[arg(long, help = "Report without writing")]
     dry_run: bool,
 }
 
@@ -829,6 +872,106 @@ impl Transcript {
             _ => {}
         }
     }
+
+    fn agy(&mut self, record: &Value) {
+        let Some(index) = record.get("step_index").and_then(Value::as_i64) else {
+            return;
+        };
+        let Some(ts) = record
+            .get("created_at")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse().ok())
+        else {
+            return;
+        };
+        let id = format!("agy:{index}");
+        let content = record.get("content").and_then(Value::as_str).unwrap_or("");
+        match record.get("type").and_then(Value::as_str) {
+            Some("USER_INPUT") => {
+                let text = content
+                    .split_once("<USER_REQUEST>")
+                    .and_then(|(_, body)| body.split_once("</USER_REQUEST>"))
+                    .map_or(content, |(body, _)| body)
+                    .trim();
+                if !text.is_empty() {
+                    self.items
+                        .push(item(id, ts, Role::User, text.into(), false));
+                }
+            }
+            Some("PLANNER_RESPONSE") => {
+                if !content.is_empty() {
+                    self.items
+                        .push(item(id.clone(), ts, Role::Assistant, content.into(), false));
+                }
+                if let Some(calls) = record.get("tool_calls").and_then(Value::as_array) {
+                    for (tool_index, call) in calls.iter().enumerate() {
+                        let Some(name) = call.get("name").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        let mut input = call.get("args").cloned().unwrap_or_else(|| json!({}));
+                        if let Some(text) = input.as_str() {
+                            input = serde_json::from_str(text).unwrap_or_else(|_| input.clone());
+                        }
+                        if let Some(fields) = input.as_object_mut() {
+                            for value in fields.values_mut() {
+                                if let Some(text) = value.as_str()
+                                    && let Ok(decoded) = serde_json::from_str::<Value>(text)
+                                {
+                                    *value = decoded;
+                                }
+                            }
+                            for key in ["file_path", "absolute_path", "AbsolutePath", "path"] {
+                                if let Some(path) = fields.get(key).cloned() {
+                                    fields.entry("filePath").or_insert(path);
+                                    break;
+                                }
+                            }
+                            for key in ["CommandLine", "command_line", "cmd"] {
+                                if let Some(command) = fields.get(key).cloned() {
+                                    fields.entry("command").or_insert(command);
+                                    break;
+                                }
+                            }
+                        }
+                        let normalized = name.to_ascii_lowercase();
+                        let name = if normalized.contains("run_command") {
+                            "bash"
+                        } else if matches!(normalized.as_str(), "read_file" | "view_file") {
+                            "read"
+                        } else {
+                            &normalized
+                        };
+                        let mut tool_item = item(
+                            format!("{id}:tool:{tool_index}"),
+                            ts,
+                            Role::Tool,
+                            String::new(),
+                            false,
+                        );
+                        tool_item.tool = Some(ToolCall {
+                            name: name.into(),
+                            input,
+                            output: None,
+                            ok: true,
+                        });
+                        self.items.push(tool_item);
+                    }
+                }
+            }
+            Some("GENERIC") => {
+                let error = record.get("error").and_then(Value::as_str);
+                let mut tool_item = item(id, ts, Role::Tool, String::new(), false);
+                tool_item.tool = Some(ToolCall {
+                    name: "agy_result".into(),
+                    input: json!({}),
+                    output: Some(error.unwrap_or(content).into()),
+                    ok: record.get("status").and_then(Value::as_str) != Some("ERROR"),
+                });
+                self.items.push(tool_item);
+            }
+            _ => {}
+        }
+    }
 }
 
 fn parse_transcript(path: &Path, harness: Harness, offset: u64) -> Result<Transcript, CliError> {
@@ -887,11 +1030,13 @@ fn parse_transcript(path: &Path, harness: Harness, offset: u64) -> Result<Transc
                             }
                         }
                     }
+                    Harness::Agy => {}
                 }
             } else {
                 match harness {
                     Harness::ClaudeCode => parsed.claude(&record, start),
                     Harness::Codex => parsed.codex(&record, start),
+                    Harness::Agy => parsed.agy(&record),
                 }
             }
         }
@@ -909,6 +1054,8 @@ fn parse_transcript(path: &Path, harness: Harness, offset: u64) -> Result<Transc
 struct Cursor {
     offset: u64,
     session: String,
+    #[serde(default)]
+    harness: Option<String>,
 }
 
 fn state_dir() -> Result<PathBuf, CliError> {
@@ -1004,6 +1151,76 @@ fn pending_marker(state: &Path, harness: &str, session: &str) -> PathBuf {
         .join(format!("{}-{}", sanitize(harness), sanitize(session)))
 }
 
+fn auto_gc_stamp(state: &Path, project: &str, now: u64) -> Result<bool, CliError> {
+    fs::create_dir_all(state)
+        .map_err(|error| CliError::other(format!("cannot create {}: {error}", state.display())))?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(state.join("auto-gc.lock"))
+        .map_err(|error| CliError::other(format!("cannot open auto-gc lock: {error}")))?;
+    lock.lock()
+        .map_err(|error| CliError::other(format!("cannot lock auto-gc state: {error}")))?;
+    let path = state.join("auto-gc.json");
+    let mut stamps: BTreeMap<String, u64> = match fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|error| CliError::other(format!("invalid auto-gc state: {error}")))?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
+        Err(error) => {
+            return Err(CliError::other(format!(
+                "cannot read auto-gc state: {error}"
+            )));
+        }
+    };
+    if stamps
+        .get(project)
+        .is_some_and(|stamp| now.saturating_sub(*stamp) < 86400)
+    {
+        return Ok(false);
+    }
+    stamps.insert(project.to_owned(), now);
+    let bytes = serde_json::to_vec(&stamps)
+        .map_err(|error| CliError::other(format!("cannot serialize auto-gc state: {error}")))?;
+    save_atomic(&path, &bytes)?;
+    Ok(true)
+}
+
+fn auto_gc(cli: &Cli, project: &str) -> Result<(), CliError> {
+    if env::var_os("MEMENTO_AUTO_GC").is_some_and(|value| value == "0") {
+        return Ok(());
+    }
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|error| CliError::other(format!("invalid system time: {error}")))?
+        .as_secs();
+    if !auto_gc_stamp(&state_dir()?, project, now)? {
+        return Ok(());
+    }
+    let executable = env::current_exe()
+        .map_err(|error| CliError::other(format!("cannot determine executable path: {error}")))?;
+    let mut command = Command::new(executable);
+    command
+        .args(["--url", &cli.url, "gc", "--project", project, "--quiet"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(token) = &cli.token {
+        command.env("MEMENTO_TOKEN", token);
+    } else {
+        command.env_remove("MEMENTO_TOKEN");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    command
+        .spawn()
+        .map_err(|error| CliError::other(format!("cannot spawn auto-gc: {error}")))?;
+    Ok(())
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum SessionPresence {
     Alive,
@@ -1056,8 +1273,9 @@ fn detect_session(
     claude: &Path,
     codex: &Path,
     opencode: &std::ffi::OsStr,
+    agy: &Path,
 ) -> SessionPresence {
-    if matches!(record.harness.as_str(), "claude-code" | "codex")
+    if matches!(record.harness.as_str(), "claude-code" | "codex" | "agy")
         && (record.session.contains('/')
             || record.session.contains('\\')
             || record.session == "."
@@ -1066,7 +1284,30 @@ fn detect_session(
         return SessionPresence::Unknown("invalid transcript session identifier".into());
     }
     let result = match record.harness.as_str() {
-        "agy" => return SessionPresence::Alive,
+        "agy" if record.session == "agy-notes" => return SessionPresence::Alive,
+        "agy" => {
+            let paths = [
+                agy.join("conversations")
+                    .join(format!("{}.db", record.session)),
+                agy.join("brain").join(&record.session),
+            ];
+            let mut found = false;
+            let mut failure = None;
+            for path in paths {
+                match fs::metadata(path) {
+                    Ok(_) => found = true,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => failure = Some(error),
+                }
+            }
+            if found {
+                Ok(true)
+            } else if let Some(error) = failure {
+                Err(error)
+            } else {
+                Ok(false)
+            }
+        }
         "opencode" => {
             return match Command::new(opencode)
                 .args(["api", "GET", &format!("/api/session/{}", record.session)])
@@ -1206,6 +1447,7 @@ fn gc(cli: &Cli, args: &GcArgs) -> Result<(), CliError> {
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".codex"));
     let opencode = env::var_os("MEMENTO_OPENCODE_BIN").unwrap_or_else(|| "opencode".into());
+    let agy = home.join(".gemini/antigravity-cli");
     let cursors = read_cursors(&state)?;
     let client = client(cli, false)?;
     let mut entries = Vec::new();
@@ -1244,11 +1486,11 @@ fn gc(cli: &Cli, args: &GcArgs) -> Result<(), CliError> {
                     {
                         SessionPresence::Unknown("pending import".into())
                     }
-                    Ok(_) => detect_session(&record, &cursors, &claude, &codex, &opencode),
+                    Ok(_) => detect_session(&record, &cursors, &claude, &codex, &opencode, &agy),
                     Err(_) => SessionPresence::Unknown("invalid pending marker".into()),
                 },
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    detect_session(&record, &cursors, &claude, &codex, &opencode)
+                    detect_session(&record, &cursors, &claude, &codex, &opencode, &agy)
                 }
                 Err(error) => {
                     SessionPresence::Unknown(format!("cannot read pending marker: {error}"))
@@ -1263,6 +1505,7 @@ fn gc(cli: &Cli, args: &GcArgs) -> Result<(), CliError> {
                         harness: harness.into(),
                         project: project.clone(),
                         session: record.session.clone(),
+                        reason: Some("deleted".into()),
                     };
                     let response: ReleaseResponse = parse_response(&http(
                         &client,
@@ -1304,6 +1547,9 @@ fn gc(cli: &Cli, args: &GcArgs) -> Result<(), CliError> {
                 detail,
             });
         }
+    }
+    if args.quiet {
+        return Ok(());
     }
     if cli.json {
         println!(
@@ -1431,6 +1677,9 @@ fn spawn_import_with_executable(
     }
     if let Some(project) = &args.project {
         command.arg("--project").arg(project);
+    }
+    if let Some(harness) = &args.identity_harness {
+        command.arg("--identity-harness").arg(harness);
     }
     if let Some(token) = &cli.token {
         command.env("MEMENTO_TOKEN", token);
@@ -1617,10 +1866,15 @@ fn import(
     client: &Client,
     state: &Path,
 ) -> Result<IngestResponse, CliError> {
-    let path = args.transcript.canonicalize().map_err(|error| {
+    let transcript = if matches!(args.harness, Harness::Agy) {
+        resolve_agy_transcript(&args.transcript)
+    } else {
+        args.transcript.clone()
+    };
+    let path = transcript.canonicalize().map_err(|error| {
         CliError::other(format!(
             "cannot canonicalize transcript {}: {error}",
-            args.transcript.display()
+            transcript.display()
         ))
     })?;
     let key = path
@@ -1666,7 +1920,14 @@ fn import(
         0
     } else {
         previous.map_or(0, |cursor| {
-            if cursor.offset <= length {
+            if cursor.offset <= length
+                && cursor.harness.as_deref()
+                    == Some(
+                        args.identity_harness
+                            .as_deref()
+                            .unwrap_or(args.harness.name()),
+                    )
+            {
                 cursor.offset
             } else {
                 0
@@ -1680,14 +1941,27 @@ fn import(
         .or(parsed.session)
         .or_else(|| previous.map(|cursor| cursor.session.clone()))
         .ok_or_else(|| CliError::other("transcript has no session id; supply --session"))?;
-    if offset > 0 && previous.is_some_and(|cursor| cursor.session != session) {
+    if previous.is_some_and(|cursor| {
+        cursor.session != session
+            || cursor.harness.as_deref().is_some_and(|harness| {
+                harness
+                    != args
+                        .identity_harness
+                        .as_deref()
+                        .unwrap_or(args.harness.name())
+            })
+    }) && !args.full
+    {
         return Err(CliError::other(
             "transcript cursor belongs to another session; use --full",
         ));
     }
     let project = project_key(args.project.as_deref().or(parsed.cwd.as_deref()))?;
     let mut request = IngestRequest {
-        harness: args.harness.name().to_string(),
+        harness: args
+            .identity_harness
+            .clone()
+            .unwrap_or_else(|| args.harness.name().to_string()),
         project,
         session: session.clone(),
         items: parsed.items,
@@ -1714,6 +1988,11 @@ fn import(
         Cursor {
             offset: parsed.complete_offset,
             session,
+            harness: Some(
+                args.identity_harness
+                    .clone()
+                    .unwrap_or_else(|| args.harness.name().into()),
+            ),
         },
     );
     let bytes = serde_json::to_vec_pretty(&cursors)
@@ -1722,13 +2001,29 @@ fn import(
     Ok(response)
 }
 
+fn resolve_agy_transcript(path: &Path) -> PathBuf {
+    let path = if path.is_dir() {
+        path.join("logs/transcript.jsonl")
+    } else {
+        path.to_path_buf()
+    };
+    let full = path.with_file_name("transcript_full.jsonl");
+    if full.is_file() { full } else { path }
+}
+
 #[derive(Deserialize)]
 struct HookInput {
+    #[serde(alias = "conversationId")]
     session_id: String,
+    #[serde(alias = "transcriptPath")]
     transcript_path: Option<PathBuf>,
     cwd: Option<PathBuf>,
+    #[serde(alias = "hookEventName")]
     hook_event_name: String,
     source: Option<String>,
+    agent_id: Option<String>,
+    #[serde(default)]
+    is_subagent: bool,
 }
 
 fn escape_wrapper(text: &str, strip_controls: bool) -> String {
@@ -1785,6 +2080,9 @@ fn handle_hook(
     state: &Path,
     sync_import: bool,
 ) -> Result<Option<Value>, CliError> {
+    if input.is_subagent || input.agent_id.as_deref().is_some_and(|id| !id.is_empty()) {
+        return Ok(Some(json!({})));
+    }
     match input.hook_event_name.as_str() {
         "SessionStart" => {
             let project = project_key(input.cwd.as_deref())?;
@@ -1814,12 +2112,13 @@ fn handle_hook(
                     .digest
                     .as_deref()
                     .ok_or_else(|| CliError::other("claimed continuation has no digest"))?;
-                return Ok(Some(continuation_output(
-                    parent_harness,
-                    &project,
-                    parent,
-                    digest,
-                )));
+                let output = continuation_output(parent_harness, &project, parent, digest);
+                if matches!(harness, Harness::Agy) {
+                    return Ok(Some(
+                        json!({"injectSteps":[{"systemMessage":{"systemMessage":output["hookSpecificOutput"]["additionalContext"]}}]}),
+                    ));
+                }
+                return Ok(Some(output));
             }
             if input.source.as_deref() == Some("compact") {
                 let body = http::<Value>(
@@ -1866,7 +2165,11 @@ fn handle_hook(
                     )));
                 }
             }
-            Ok(None)
+            Ok(if matches!(harness, Harness::Agy) {
+                Some(json!({}))
+            } else {
+                None
+            })
         }
         "Stop" => {
             let transcript = input
@@ -1879,6 +2182,7 @@ fn handle_hook(
                 session: Some(input.session_id.clone()),
                 project: input.cwd.clone(),
                 full: false,
+                identity_harness: None,
             };
             #[cfg(unix)]
             {
@@ -1900,7 +2204,11 @@ fn handle_hook(
             import(cli, &args, client, state)?;
             Ok(Some(json!({})))
         }
-        _ => Ok(None),
+        _ => Ok(if matches!(harness, Harness::Agy) {
+            Some(json!({}))
+        } else {
+            None
+        }),
     }
 }
 
@@ -1920,6 +2228,20 @@ fn merge_hooks(existing: &mut Value, harness: Harness, executable: &Path) -> Res
     let root = existing
         .as_object_mut()
         .ok_or_else(|| CliError::other("hook settings must be a JSON object"))?;
+    if matches!(harness, Harness::Agy) {
+        let hook = root
+            .entry("memento")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| CliError::other("agy memento hook must be an object"))?;
+        for event in ["SessionStart", "Stop"] {
+            hook.insert(
+                event.into(),
+                json!([{"type":"command","command":command,"timeout":30}]),
+            );
+        }
+        return Ok(());
+    }
     let hooks = root
         .entry("hooks")
         .or_insert_with(|| json!({}))
@@ -2006,6 +2328,8 @@ fn install(args: &InstallArgs, home: &Path, executable: &Path) -> Result<Option<
     let path = match args.harness {
         Harness::ClaudeCode => base.join(".claude/settings.json"),
         Harness::Codex => base.join(".codex/hooks.json"),
+        Harness::Agy if args.user => base.join(".gemini/config/hooks.json"),
+        Harness::Agy => base.join(".agents/hooks.json"),
     };
     let parent = path
         .parent()
@@ -2082,6 +2406,346 @@ fn install(args: &InstallArgs, home: &Path, executable: &Path) -> Result<Option<
     Ok(None)
 }
 
+#[derive(Deserialize)]
+struct GenericParent {
+    harness: String,
+    session: String,
+}
+
+#[derive(Deserialize)]
+struct GenericInput {
+    event: String,
+    session_id: String,
+    cwd: PathBuf,
+    transcript_path: Option<PathBuf>,
+    transcript_format: Option<String>,
+    items: Option<Vec<IngestItem>>,
+    parent: Option<GenericParent>,
+    agent_id: Option<String>,
+    #[serde(default)]
+    is_subagent: bool,
+}
+
+fn generic_hook(
+    cli: &Cli,
+    harness: &str,
+    input: &GenericInput,
+    spawn_gc: bool,
+) -> Result<Value, CliError> {
+    if input.is_subagent || input.agent_id.as_deref().is_some_and(|id| !id.is_empty()) {
+        return Ok(json!({}));
+    }
+    if input.event == "session_end" {
+        return Ok(json!({}));
+    }
+    if !matches!(
+        input.event.as_str(),
+        "session_start" | "turn_end" | "session_deleted"
+    ) {
+        eprintln!("warning: unknown generic hook event: {}", input.event);
+        return Ok(json!({}));
+    }
+    let project = project_key(Some(&input.cwd))?;
+    let client = client(cli, true)?;
+    match input.event.as_str() {
+        "session_start" => {
+            if spawn_gc && let Err(error) = auto_gc(cli, &project) {
+                eprintln!("warning: auto-gc: {}", error.message);
+            }
+            let mut registration =
+                json!({"harness":harness,"project":project,"session":input.session_id});
+            if let Some(parent) = &input.parent {
+                registration["parent"] = json!(parent.session);
+                registration["parent_harness"] = json!(parent.harness);
+            }
+            http(
+                &client,
+                cli,
+                Method::PUT,
+                &["v1", "sessions"],
+                Some(&registration),
+                &[],
+            )?;
+            let claim = ClaimRequest {
+                project: project.clone(),
+                harness: harness.into(),
+                session: input.session_id.clone(),
+            };
+            let response: ClaimResponse = parse_response(&http(
+                &client,
+                cli,
+                Method::POST,
+                &["v1", "continuations", "claim"],
+                Some(&claim),
+                &[],
+            )?)?;
+            let context = if response.claimed {
+                let parent_harness = response
+                    .parent_harness
+                    .as_deref()
+                    .ok_or_else(|| CliError::other("claimed continuation has no parent harness"))?;
+                let parent = response
+                    .parent
+                    .as_deref()
+                    .ok_or_else(|| CliError::other("claimed continuation has no parent session"))?;
+                let digest = response
+                    .digest
+                    .as_deref()
+                    .ok_or_else(|| CliError::other("claimed continuation has no digest"))?;
+                continuation_output(parent_harness, &project, parent, digest)["hookSpecificOutput"]
+                    ["additionalContext"]
+                    .clone()
+            } else {
+                Value::Null
+            };
+            Ok(json!({"context":context}))
+        }
+        "turn_end" => {
+            if let Some(transcript) = &input.transcript_path {
+                let format = match input.transcript_format.as_deref() {
+                    Some("claude-code") => Harness::ClaudeCode,
+                    Some("codex") => Harness::Codex,
+                    Some("agy") => Harness::Agy,
+                    _ => {
+                        return Err(CliError::other(
+                            "turn_end transcript requires transcript_format: claude-code, codex, or agy",
+                        ));
+                    }
+                };
+                let args = ImportArgs {
+                    harness: format,
+                    transcript: transcript.clone(),
+                    session: Some(input.session_id.clone()),
+                    project: Some(input.cwd.clone()),
+                    full: false,
+                    identity_harness: Some(harness.into()),
+                };
+                let state = state_dir()?;
+                if env::var_os("MEMENTO_HOOK_SYNC").is_some_and(|value| value == "1") {
+                    import(cli, &args, &client, &state)?;
+                } else {
+                    #[cfg(unix)]
+                    {
+                        let marker = pending_marker(&state, harness, &input.session_id);
+                        write_pending_marker(&marker)?;
+                        if let Err(error) = spawn_import(cli, &args, &state) {
+                            let _ = fs::remove_file(&marker);
+                            eprintln!("warning: {}; importing synchronously", error.message);
+                            import(cli, &args, &client, &state)?;
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    import(cli, &args, &client, &state)?;
+                }
+            } else if let Some(items) = &input.items {
+                let request = IngestRequest {
+                    harness: harness.into(),
+                    project,
+                    session: input.session_id.clone(),
+                    items: items.clone(),
+                };
+                http(
+                    &client,
+                    cli,
+                    Method::POST,
+                    &["v1", "ingest"],
+                    Some(&request),
+                    &[],
+                )?;
+            }
+            Ok(json!({}))
+        }
+        "session_deleted" => {
+            let request = ReleaseRequest {
+                harness: harness.into(),
+                project,
+                session: input.session_id.clone(),
+                reason: Some("deleted".into()),
+            };
+            http(
+                &client,
+                cli,
+                Method::POST,
+                &["v1", "sessions", "release"],
+                Some(&request),
+                &[],
+            )?;
+            Ok(json!({}))
+        }
+        _ => Ok(json!({})),
+    }
+}
+
+fn skill_owned(path: &Path) -> Result<bool, CliError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| CliError::other(format!("cannot inspect {}: {error}", path.display())))?;
+    if !metadata.file_type().is_dir() {
+        return Ok(false);
+    }
+    if path.join(".memento-skill").is_file() {
+        return Ok(true);
+    }
+    let file = path.join("SKILL.md");
+    let text = match fs::read_to_string(&file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(CliError::other(format!(
+                "cannot read {}: {error}",
+                file.display()
+            )));
+        }
+    };
+    let mut lines = text.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return Ok(false);
+    }
+    let mut metadata = false;
+    for line in lines {
+        if line.trim() == "---" {
+            break;
+        }
+        if !line.starts_with(char::is_whitespace) {
+            metadata = line.trim() == "metadata:";
+        } else if metadata {
+            let trimmed = line.trim();
+            if let Some(value) = trimmed.strip_prefix("source:") {
+                return Ok(value.trim().trim_matches(['\'', '"']) == "memento");
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn copy_skill(source: &Path, target: &Path) -> Result<(), CliError> {
+    fs::create_dir_all(target)
+        .map_err(|error| CliError::other(format!("cannot create {}: {error}", target.display())))?;
+    for entry in fs::read_dir(source)
+        .map_err(|error| CliError::other(format!("cannot read {}: {error}", source.display())))?
+    {
+        let entry =
+            entry.map_err(|error| CliError::other(format!("cannot read skill entry: {error}")))?;
+        let kind = entry
+            .file_type()
+            .map_err(|error| CliError::other(format!("cannot inspect skill entry: {error}")))?;
+        let destination = target.join(entry.file_name());
+        if fs::symlink_metadata(&destination)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return Err(CliError::other(format!(
+                "refusing symlink in skill destination {}",
+                destination.display()
+            )));
+        }
+        if kind.is_dir() {
+            copy_skill(&entry.path(), &destination)?;
+        } else if kind.is_file() {
+            fs::copy(entry.path(), &destination).map_err(|error| {
+                CliError::other(format!("cannot copy {}: {error}", destination.display()))
+            })?;
+        } else {
+            return Err(CliError::other(format!(
+                "unsupported skill entry {}",
+                entry.path().display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn install_skills(args: &InstallSkillsArgs, home: &Path) -> Result<(), CliError> {
+    let source = args
+        .source
+        .clone()
+        .or_else(|| env::var_os("MEMENTO_SKILLS_DIR").map(PathBuf::from))
+        .ok_or_else(|| CliError::other("supply --source DIR or set MEMENTO_SKILLS_DIR"))?;
+    let base = if args.user {
+        home.to_path_buf()
+    } else {
+        args.project.clone().unwrap_or(
+            env::current_dir().map_err(|error| {
+                CliError::other(format!("cannot get current directory: {error}"))
+            })?,
+        )
+    };
+    let targets: &[&str] = match (args.harness, args.user) {
+        (SkillHarness::Opencode, false) => &[".opencode/skills"],
+        (SkillHarness::Opencode, true) => &[".config/opencode/skills"],
+        (SkillHarness::ClaudeCode, false) => &[".claude/skills"],
+        (SkillHarness::ClaudeCode, true) => &[".claude/skills"],
+        (SkillHarness::Codex, false) => &[".agents/skills"],
+        (SkillHarness::Codex, true) => &[".agents/skills"],
+        (SkillHarness::Agy, false) => &[".agents/skills"],
+        (SkillHarness::Agy, true) => &[".gemini/config/skills"],
+        (SkillHarness::All, false) => &[".opencode/skills", ".claude/skills", ".agents/skills"],
+        (SkillHarness::All, true) => &[
+            ".config/opencode/skills",
+            ".claude/skills",
+            ".agents/skills",
+            ".gemini/config/skills",
+        ],
+    };
+    let entries = fs::read_dir(&source).map_err(|error| {
+        CliError::other(format!(
+            "cannot read skills source {}: {error}",
+            source.display()
+        ))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            CliError::other(format!("cannot read skills source entry: {error}"))
+        })?;
+        if !entry
+            .file_type()
+            .map_err(|error| CliError::other(format!("cannot inspect skill: {error}")))?
+            .is_dir()
+        {
+            continue;
+        }
+        for target in targets {
+            let destination = base.join(target).join(entry.file_name());
+            match fs::symlink_metadata(&destination) {
+                Ok(_) if !skill_owned(&destination)? => {
+                    eprintln!("warning: skipping foreign skill {}", destination.display());
+                    continue;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(CliError::other(format!(
+                        "cannot inspect {}: {error}",
+                        destination.display()
+                    )));
+                }
+            }
+            if !args.dry_run {
+                copy_skill(&entry.path(), &destination)?;
+                let marker = destination.join(".memento-skill");
+                if fs::symlink_metadata(&marker)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    return Err(CliError::other(format!(
+                        "refusing symlink {}",
+                        marker.display()
+                    )));
+                }
+                fs::write(marker, b"memento\n").map_err(|error| {
+                    CliError::other(format!(
+                        "cannot mark skill {}: {error}",
+                        destination.display()
+                    ))
+                })?;
+            }
+            println!(
+                "{} {}",
+                if args.dry_run { "would write" } else { "wrote" },
+                destination.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn run(cli: &Cli) -> Result<(), CliError> {
     match &cli.command {
         crate::Command::Gc(args) => gc(cli, args)?,
@@ -2094,7 +2758,13 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
             let state = state_dir()?;
             let result = client(cli, false).and_then(|client| import(cli, args, &client, &state));
             if let Some(session) = &args.session {
-                let _ = fs::remove_file(pending_marker(&state, args.harness.name(), session));
+                let _ = fs::remove_file(pending_marker(
+                    &state,
+                    args.identity_harness
+                        .as_deref()
+                        .unwrap_or(args.harness.name()),
+                    session,
+                ));
             }
             result?;
         }
@@ -2143,10 +2813,41 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
                 .read_to_string(&mut raw)
                 .map_err(|error| CliError::other(format!("cannot read hook input: {error}")))
                 .and_then(|_| {
+                    if matches!(args.kind, HookHarness::Generic) {
+                        let input: GenericInput = serde_json::from_str(&raw).map_err(|error| {
+                            CliError::other(format!("invalid generic hook JSON: {error}"))
+                        })?;
+                        return generic_hook(
+                            cli,
+                            args.harness.as_deref().unwrap_or_default(),
+                            &input,
+                            true,
+                        )
+                        .map(Some);
+                    }
+                    let harness = match args.kind {
+                        HookHarness::ClaudeCode => Harness::ClaudeCode,
+                        HookHarness::Codex => Harness::Codex,
+                        HookHarness::Agy => Harness::Agy,
+                        HookHarness::Generic => unreachable!(),
+                    };
                     let input: HookInput = serde_json::from_str(&raw)
                         .map_err(|error| CliError::other(format!("invalid hook JSON: {error}")))?;
-                    if input.hook_event_name == "SessionEnd" {
+                    if input.is_subagent
+                        || input.agent_id.as_deref().is_some_and(|id| !id.is_empty())
+                    {
+                        return Ok(Some(json!({})));
+                    }
+                    if input.hook_event_name == "SessionEnd" && !matches!(harness, Harness::Agy) {
                         return Ok(None);
+                    }
+                    if input.hook_event_name == "SessionStart" {
+                        match project_key(input.cwd.as_deref())
+                            .and_then(|project| auto_gc(cli, &project))
+                        {
+                            Ok(()) => {}
+                            Err(error) => eprintln!("warning: auto-gc: {}", error.message),
+                        }
                     }
                     let is_stop = input.hook_event_name == "Stop";
                     let result = if input.hook_event_name == "SessionStart" {
@@ -2158,7 +2859,6 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
                             timeout_secs: cli.timeout_secs,
                             command: crate::Command::Health,
                         };
-                        let harness = args.harness;
                         std::thread::spawn(move || {
                             let result = client(&cli, true).and_then(|client| {
                                 handle_hook(&cli, harness, &input, &client, Path::new(""), false)
@@ -2173,7 +2873,7 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
                             state_dir().and_then(|state| {
                                 handle_hook(
                                     cli,
-                                    args.harness,
+                                    harness,
                                     &input,
                                     &client,
                                     &state,
@@ -2198,7 +2898,12 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
             match result {
                 Ok(Some(output)) => println!("{output}"),
                 Ok(None) => {}
-                Err(error) => eprintln!("error: {}", error.message),
+                Err(error) => {
+                    eprintln!("error: {}", error.message);
+                    if matches!(args.kind, HookHarness::Agy | HookHarness::Generic) {
+                        println!("{{}}");
+                    }
+                }
             }
         }
         crate::Command::InstallHooks(args) => {
@@ -2214,6 +2919,14 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
                 println!("{output}");
             }
         }
+        crate::Command::InstallSkills(args) => {
+            let home = if args.user {
+                home_dir()?
+            } else {
+                PathBuf::new()
+            };
+            install_skills(args, &home)?;
+        }
         _ => return Err(CliError::other("not a cross-harness command")),
     }
     Ok(())
@@ -2228,6 +2941,238 @@ mod tests {
     use std::thread;
 
     #[test]
+    fn agy_fixture_and_transcript_resolution() {
+        let temp = tempfile::tempdir().unwrap();
+        let logs = temp.path().join("logs");
+        fs::create_dir(&logs).unwrap();
+        let short = logs.join("transcript.jsonl");
+        let full = logs.join("transcript_full.jsonl");
+        fs::copy(fixture("agy.jsonl"), &short).unwrap();
+        assert_eq!(resolve_agy_transcript(temp.path()), short);
+        fs::copy(&short, &full).unwrap();
+        assert_eq!(resolve_agy_transcript(temp.path()), full);
+        assert_eq!(resolve_agy_transcript(&short), full);
+        let parsed = parse_transcript(&full, Harness::Agy, 0).unwrap();
+        assert_eq!(parsed.items.len(), 5);
+        assert_eq!(parsed.items[0].text, "Please inspect the issue");
+        assert_eq!(parsed.items[1].text, "I'll check it.");
+        assert_eq!(parsed.items[2].tool.as_ref().unwrap().name, "bash");
+        assert_eq!(
+            parsed.items[2].tool.as_ref().unwrap().input["command"],
+            "false"
+        );
+        assert_eq!(parsed.items[3].tool.as_ref().unwrap().name, "read");
+        assert_eq!(
+            parsed.items[3].tool.as_ref().unwrap().input["filePath"],
+            "src/main.rs"
+        );
+        assert!(!parsed.items[4].tool.as_ref().unwrap().ok);
+        assert_eq!(
+            parsed.items[4].tool.as_ref().unwrap().output.as_deref(),
+            Some("failed command")
+        );
+        assert!(
+            !serde_json::to_string(&parsed.items)
+                .unwrap()
+                .contains("private thought")
+        );
+        assert!(
+            parse_transcript(&full, Harness::Agy, parsed.complete_offset)
+                .unwrap()
+                .items
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn agy_session_start_formats_claim_and_skips_subagents() {
+        let temp = tempfile::tempdir().unwrap();
+        let (url, server) = mock(vec![
+            r#"{"claimed":true,"parent_harness":"opencode","parent":"parent","digest":"remember"}"#,
+        ]);
+        let cli = cli(&url);
+        let client = client(&cli, true).unwrap();
+        let mut input: HookInput = serde_json::from_value(json!({
+            "conversationId":"child",
+            "cwd":temp.path(),
+            "hookEventName":"SessionStart"
+        }))
+        .unwrap();
+        let output = handle_hook(&cli, Harness::Agy, &input, &client, temp.path(), true)
+            .unwrap()
+            .unwrap();
+        assert!(
+            output["injectSteps"][0]["systemMessage"]["systemMessage"]
+                .as_str()
+                .unwrap()
+                .contains("<memento-continuation>")
+        );
+        input.agent_id = Some("agent".into());
+        assert_eq!(
+            handle_hook(&cli, Harness::Agy, &input, &client, temp.path(), true).unwrap(),
+            Some(json!({}))
+        );
+        assert_eq!(server.join().unwrap()[0]["harness"], "agy");
+    }
+
+    #[test]
+    fn auto_gc_stamp_limits_each_project_without_spawning() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(auto_gc_stamp(temp.path(), "first", 100).unwrap());
+        assert!(!auto_gc_stamp(temp.path(), "first", 86499).unwrap());
+        assert!(auto_gc_stamp(temp.path(), "first", 86500).unwrap());
+        assert!(auto_gc_stamp(temp.path(), "second", 101).unwrap());
+    }
+
+    #[test]
+    fn agy_hooks_merge_and_are_idempotent() {
+        let mut hooks = json!({"other":{"Stop":[{"command":"other"}]}});
+        merge_hooks(&mut hooks, Harness::Agy, Path::new("/usr/bin/memento")).unwrap();
+        let first = hooks.clone();
+        merge_hooks(&mut hooks, Harness::Agy, Path::new("/usr/bin/memento")).unwrap();
+        assert_eq!(hooks, first);
+        assert_eq!(hooks["other"]["Stop"][0]["command"], "other");
+        assert_eq!(
+            hooks["memento"]["SessionStart"][0]["command"],
+            "/usr/bin/memento hook agy"
+        );
+        assert_eq!(hooks["memento"]["Stop"][0]["timeout"], 30);
+    }
+
+    #[test]
+    fn agy_session_presence_checks_database_brain_and_notes() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut record: SessionRecord = serde_json::from_value(json!({
+            "harness":"agy","project":"project","session":"conversation"
+        }))
+        .unwrap();
+        let presence = |record: &SessionRecord| {
+            detect_session(
+                record,
+                &BTreeMap::new(),
+                temp.path(),
+                temp.path(),
+                std::ffi::OsStr::new("unused"),
+                temp.path(),
+            )
+        };
+        assert_eq!(presence(&record), SessionPresence::Deleted);
+        fs::create_dir_all(temp.path().join("conversations")).unwrap();
+        fs::write(temp.path().join("conversations/conversation.db"), "").unwrap();
+        assert_eq!(presence(&record), SessionPresence::Alive);
+        fs::remove_file(temp.path().join("conversations/conversation.db")).unwrap();
+        fs::create_dir_all(temp.path().join("brain/conversation")).unwrap();
+        assert_eq!(presence(&record), SessionPresence::Alive);
+        record.session = "agy-notes".into();
+        assert_eq!(presence(&record), SessionPresence::Alive);
+    }
+
+    #[test]
+    fn generic_hook_registers_claims_ingests_and_releases() {
+        let temp = tempfile::tempdir().unwrap();
+        let (url, server) = mock(vec![
+            "{}",
+            r#"{"claimed":true,"parent_harness":"opencode","parent":"parent","digest":"remember"}"#,
+            r#"{"segments":1,"skipped":0}"#,
+            r#"{"released":true,"removed":[]}"#,
+        ]);
+        let cli = cli(&url);
+        let mut input: GenericInput = serde_json::from_value(json!({
+            "event":"session_start",
+            "session_id":"child",
+            "cwd":temp.path(),
+            "parent":{"harness":"opencode","session":"parent"}
+        }))
+        .unwrap();
+        let output = generic_hook(&cli, "custom", &input, false).unwrap();
+        assert!(
+            output["context"]
+                .as_str()
+                .unwrap()
+                .contains("<memento-continuation>")
+        );
+        input.event = "turn_end".into();
+        input.items = Some(vec![item(
+            "one".into(),
+            Utc::now(),
+            Role::User,
+            "hello".into(),
+            false,
+        )]);
+        assert_eq!(
+            generic_hook(&cli, "custom", &input, false).unwrap(),
+            json!({})
+        );
+        input.event = "session_deleted".into();
+        assert_eq!(
+            generic_hook(&cli, "custom", &input, false).unwrap(),
+            json!({})
+        );
+        input.event = "session_end".into();
+        assert_eq!(
+            generic_hook(&cli, "custom", &input, false).unwrap(),
+            json!({})
+        );
+        input.event = "unknown".into();
+        assert_eq!(
+            generic_hook(&cli, "custom", &input, false).unwrap(),
+            json!({})
+        );
+        input.event = "session_start".into();
+        input.is_subagent = true;
+        assert_eq!(
+            generic_hook(&cli, "custom", &input, false).unwrap(),
+            json!({})
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests[0]["parent_harness"], "opencode");
+        assert_eq!(requests[0]["parent"], "parent");
+        assert_eq!(requests[1]["harness"], "custom");
+        assert_eq!(requests[2]["items"][0]["text"], "hello");
+        assert_eq!(requests[3]["reason"], "deleted");
+    }
+
+    #[test]
+    fn skills_preserve_foreign_directories_and_copy_to_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let skill = source.join("example");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), "---\nname: example\n---\ncontent").unwrap();
+        let foreign = temp.path().join(".claude/skills/example");
+        fs::create_dir_all(&foreign).unwrap();
+        fs::write(foreign.join("SKILL.md"), "foreign").unwrap();
+        let args = InstallSkillsArgs {
+            harness: SkillHarness::All,
+            project: Some(temp.path().into()),
+            user: false,
+            source: Some(source),
+            dry_run: false,
+        };
+        install_skills(&args, temp.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(foreign.join("SKILL.md")).unwrap(),
+            "foreign"
+        );
+        assert!(
+            temp.path()
+                .join(".opencode/skills/example/.memento-skill")
+                .is_file()
+        );
+        assert!(
+            temp.path()
+                .join(".agents/skills/example/.memento-skill")
+                .is_file()
+        );
+        fs::write(skill.join("SKILL.md"), "updated").unwrap();
+        install_skills(&args, temp.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(temp.path().join(".agents/skills/example/SKILL.md")).unwrap(),
+            "updated"
+        );
+    }
+
+    #[test]
     #[cfg(unix)]
     fn gc_detects_harness_presence_in_isolated_directories() {
         use std::os::unix::fs::PermissionsExt;
@@ -2237,21 +3182,22 @@ mod tests {
         let binary = temp.path().join("opencode");
         fs::write(&binary, "#!/bin/sh\nprintf 'HTTP 404'\nexit 1\n").unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
-        let mut record = SessionRecord {
-            harness: "opencode".into(),
-            project: "project".into(),
-            session: "abc".into(),
-            parent: None,
-            parent_harness: None,
-            retention: Default::default(),
-            title: None,
-            created: None,
-            deleted_at: None,
-            collected_at: None,
-        };
+        let mut record: SessionRecord = serde_json::from_value(json!({
+            "harness": "opencode",
+            "project": "project",
+            "session": "abc"
+        }))
+        .unwrap();
         let cursors = BTreeMap::new();
         assert_eq!(
-            detect_session(&record, &cursors, &claude, &codex, binary.as_os_str()),
+            detect_session(
+                &record,
+                &cursors,
+                &claude,
+                &codex,
+                binary.as_os_str(),
+                temp.path()
+            ),
             SessionPresence::Deleted
         );
         fs::write(
@@ -2260,29 +3206,64 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            detect_session(&record, &cursors, &claude, &codex, binary.as_os_str()),
+            detect_session(
+                &record,
+                &cursors,
+                &claude,
+                &codex,
+                binary.as_os_str(),
+                temp.path()
+            ),
             SessionPresence::Unknown(_)
         ));
         record.harness = "claude-code".into();
         assert!(matches!(
-            detect_session(&record, &cursors, &claude, &codex, binary.as_os_str()),
+            detect_session(
+                &record,
+                &cursors,
+                &claude,
+                &codex,
+                binary.as_os_str(),
+                temp.path()
+            ),
             SessionPresence::Unknown(_)
         ));
         fs::create_dir_all(claude.join("slug")).unwrap();
         assert_eq!(
-            detect_session(&record, &cursors, &claude, &codex, binary.as_os_str()),
+            detect_session(
+                &record,
+                &cursors,
+                &claude,
+                &codex,
+                binary.as_os_str(),
+                temp.path()
+            ),
             SessionPresence::Deleted
         );
         fs::write(claude.join("slug/abc.jsonl"), "").unwrap();
         assert_eq!(
-            detect_session(&record, &cursors, &claude, &codex, binary.as_os_str()),
+            detect_session(
+                &record,
+                &cursors,
+                &claude,
+                &codex,
+                binary.as_os_str(),
+                temp.path()
+            ),
             SessionPresence::Alive
         );
         record.harness = "codex".into();
         fs::create_dir_all(codex.join("archived_sessions")).unwrap();
         fs::write(codex.join("archived_sessions/rollout-abc.jsonl"), "").unwrap();
         assert_eq!(
-            detect_session(&record, &cursors, &claude, &codex, binary.as_os_str()),
+            detect_session(
+                &record,
+                &cursors,
+                &claude,
+                &codex,
+                binary.as_os_str(),
+                temp.path()
+            ),
             SessionPresence::Alive
         );
     }
@@ -2571,6 +3552,7 @@ mod tests {
             session: None,
             project: Some(temp.path().to_path_buf()),
             full: false,
+            identity_harness: None,
         };
         let client = client(&cli, false).unwrap();
         let first = import(&cli, &args, &client, &state).unwrap();
@@ -2613,6 +3595,7 @@ mod tests {
             session: None,
             project: Some(temp.path().to_path_buf()),
             full: false,
+            identity_harness: None,
         };
         let client = client(&cli, false).unwrap();
         assert_eq!(import(&cli, &args, &client, &state).unwrap().segments, 5);
@@ -2644,6 +3627,7 @@ mod tests {
             session: None,
             project: Some(temp.path().to_path_buf()),
             full: false,
+            identity_harness: None,
         };
         assert!(import(&cli, &args, &client(&cli, false).unwrap(), &state).is_err());
         server.join().unwrap();
@@ -2712,6 +3696,8 @@ mod tests {
             cwd: Some(temp.path().to_path_buf()),
             hook_event_name: "SessionStart".into(),
             source: None,
+            agent_id: None,
+            is_subagent: false,
         };
         let output = handle_hook(&cli, Harness::Codex, &input, &client, temp.path(), true)
             .unwrap()
@@ -2771,6 +3757,8 @@ mod tests {
             cwd: Some(temp.path().to_path_buf()),
             hook_event_name: "Stop".into(),
             source: None,
+            agent_id: None,
+            is_subagent: false,
         };
         assert_eq!(
             handle_hook(

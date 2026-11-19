@@ -85,6 +85,8 @@ enum Command {
     Hook(cross_harness::HookArgs),
     #[command(about = "Install harness lifecycle hooks")]
     InstallHooks(cross_harness::InstallArgs),
+    #[command(about = "Install memento skills for harnesses")]
+    InstallSkills(cross_harness::InstallSkillsArgs),
 }
 
 #[derive(Debug, Args)]
@@ -346,7 +348,8 @@ fn build_request(
         | Command::HookImport(_)
         | Command::Continue(_)
         | Command::Hook(_)
-        | Command::InstallHooks(_) => return Err(CliError::other("not a legacy request")),
+        | Command::InstallHooks(_)
+        | Command::InstallSkills(_) => return Err(CliError::other("not a legacy request")),
     };
     let mut request = client.request(method, endpoint(&cli.url, &segments)?);
     if let Some(token) = &cli.token {
@@ -446,7 +449,8 @@ fn build_request(
         | Command::HookImport(_)
         | Command::Continue(_)
         | Command::Hook(_)
-        | Command::InstallHooks(_) => return Err(CliError::other("not a legacy request")),
+        | Command::InstallHooks(_)
+        | Command::InstallSkills(_) => return Err(CliError::other("not a legacy request")),
     };
     request
         .build()
@@ -636,7 +640,8 @@ fn render(command: &Command, body: &str) -> Result<String, CliError> {
         | Command::HookImport(_)
         | Command::Continue(_)
         | Command::Hook(_)
-        | Command::InstallHooks(_) => Err(CliError::other("not a legacy response")),
+        | Command::InstallHooks(_)
+        | Command::InstallSkills(_) => Err(CliError::other("not a legacy response")),
     }
 }
 
@@ -650,6 +655,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             | Command::Continue(_)
             | Command::Hook(_)
             | Command::InstallHooks(_)
+            | Command::InstallSkills(_)
     ) {
         return cross_harness::run(&cli);
     }
