@@ -44,7 +44,7 @@ export function createIngestor(deps: {
         sessionState(sessionID).registered = true;
     }
 
-    async function registerSession(sessionID: string): Promise<void> {
+    async function registerSession(sessionID: string): Promise<string | undefined> {
         const state = sessionState(sessionID);
         if (state.registered && !state.retryClaim) {
             return;
@@ -76,6 +76,7 @@ export function createIngestor(deps: {
         }
         const claimKey = `memento/claimed/${sessionID}`;
         let claimedParent = false;
+        let continuation: string | undefined;
         if (await deps.storage.get(claimKey) !== true) {
             try {
                 const claim = await deps.client.claimContinuation({ project: deps.project, harness: deps.harness, session: sessionID });
@@ -90,7 +91,9 @@ export function createIngestor(deps: {
                 if (claim.claimed) {
                     claimedParent = true;
                     await deps.storage.set(`memento/parent/${sessionID}`, JSON.stringify({ harness: claim.parent_harness, session: claim.parent }));
-                    await deps.putInstruction(sessionID, "memento-continuation", frameContinuation(claim.parent_harness!, claim.parent!, claim.digest!));
+                    const framed = frameContinuation(claim.parent_harness!, claim.parent!, claim.digest!);
+                    await deps.putInstruction(sessionID, "memento-continuation", framed);
+                    continuation = framed;
                 }
                 await deps.storage.set(claimKey, true);
                 state.retryClaim = false;
@@ -132,6 +135,7 @@ export function createIngestor(deps: {
         } else if (!state.retryClaim && persistedRegistration === "claim-pending") {
             await markRegistered(sessionID);
         }
+        return continuation;
     }
 
     async function ingestSession(sessionID: string): Promise<void> {
@@ -190,10 +194,10 @@ export function createIngestor(deps: {
         }
     }
 
-    function serialize(sessionID: string, action: () => Promise<void>): Promise<void> {
+    function serialize<T>(sessionID: string, action: () => Promise<T>): Promise<T> {
         const previous = chains.get(sessionID) ?? Promise.resolve();
         const result = previous.then(action);
-        const healthy = result.catch(() => {});
+        const healthy = result.then(() => {}, () => {});
         chains.set(sessionID, healthy);
         void healthy.then(() => {
             if (chains.get(sessionID) === healthy) {
@@ -203,7 +207,7 @@ export function createIngestor(deps: {
         return result;
     }
 
-    function ensureRegistered(sessionID: string): Promise<void> {
+    function ensureRegistered(sessionID: string): Promise<string | undefined> {
         return serialize(sessionID, () => registerSession(sessionID));
     }
 

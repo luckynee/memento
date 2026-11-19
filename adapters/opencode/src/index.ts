@@ -5,6 +5,7 @@ import { createIngestor } from "./ingest";
 import { createJevGate, type DecisionsFn } from "./jev";
 import { resolveOptions } from "./options";
 import { createSessionOwnership } from "./session-ownership";
+import { cloneMessage, type ConversationMessage, type SystemText } from "./switch";
 import { createSwitchController } from "./switch-controller";
 import { createMemorySearchTool } from "./tools";
 
@@ -31,6 +32,28 @@ export function projectKey(project: { id: string; canonical?: unknown }): string
 function isSessionNotFound(error: unknown): boolean {
     return Boolean(error && typeof error === "object" && "_tag" in error && error._tag === "SessionNotFoundError")
         || String(error).includes("NotFoundError");
+}
+
+function injectContinuation<M extends ConversationMessage, S extends SystemText>(
+    event: { system: S[]; messages: M[] },
+    continuation: string,
+): void {
+    const containsContinuation = (part: unknown) => Boolean(
+        part && typeof part === "object" && "text" in part
+        && typeof part.text === "string" && part.text.includes("<memento-continuation"),
+    );
+    if (event.system.some(containsContinuation) || event.messages.some((message) => message.content.some(containsContinuation))) {
+        return;
+    }
+    const part = { type: "text", text: continuation };
+    const userIndex = event.messages.findIndex((message) => message.role === "user");
+    if (userIndex < 0) {
+        event.system = [...event.system, part as S];
+        return;
+    }
+    const original = event.messages[userIndex];
+    event.messages = [...event.messages];
+    event.messages[userIndex] = cloneMessage(original, [part, ...original.content]);
 }
 
 export default Plugin.define({
@@ -124,7 +147,7 @@ export default Plugin.define({
         });
         const ensureRegistered = async (sessionID: string) => {
             try {
-                await ingestor.ensureRegistered(sessionID);
+                return await ingestor.ensureRegistered(sessionID);
             } catch (error) {
                 log(`Failed to register session ${sessionID}`, error);
             }
@@ -133,8 +156,14 @@ export default Plugin.define({
             if (!await ownsSession(event.sessionID)) {
                 return;
             }
-            await ensureRegistered(event.sessionID);
+            const continuation = await ensureRegistered(event.sessionID);
+            if (continuation) {
+                injectContinuation(event, continuation);
+            }
             await switchController.onContext(event);
+            if (continuation) {
+                injectContinuation(event, continuation);
+            }
         });
         const compactionRegistration = await ctx.session.hook("compaction", async (event) => {
             if (!await ownsSession(event.sessionID)) {

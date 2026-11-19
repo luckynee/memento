@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import type { Plugin } from "@opencode/plugin";
+import { frameContinuation } from "../src/commands";
 import plugin, { projectKey } from "../src/index";
 
 test("uses the canonical project path when available", () => {
@@ -7,6 +8,102 @@ test("uses the canonical project path when available", () => {
     expect(projectKey({ id: "id", canonical: "" })).toBe("id");
     expect(projectKey({ id: "id", canonical: null })).toBe("id");
     expect(projectKey({ id: "id" })).toBe("id");
+});
+
+test("context claims inject once, preserve existing continuation, and coexist with switch rewrites", async () => {
+    const values = new Map<string, unknown>();
+    const instructions = new Map<string, string>();
+    const hooks = new Map<string, (event: any) => Promise<void>>();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url, init) => {
+        const path = new URL(String(url)).pathname;
+        if (path === "/v1/continuations/claim") {
+            const { session } = JSON.parse(String(init?.body));
+            return Response.json(session === "unclaimed"
+                ? { claimed: false }
+                : { claimed: true, parent_harness: "codex", parent: "parent", digest: "parent digest" });
+        }
+        if (path === "/v1/digest") {
+            return Response.json({ text: "switch digest", segments: 1 });
+        }
+        return Response.json({});
+    }) as typeof fetch;
+    const registration = () => ({ async dispose() {} });
+    const ctx = {
+        options: { jev: false, reconcile: false, tailUserTurns: 1 },
+        location: { project: { id: "p" } },
+        storage: {
+            async get(key: string) { return values.get(key); },
+            async set(key: string, value: unknown) { values.set(key, value); },
+        },
+        session: {
+            async get() { return { projectID: "p", time: { created: 0 } }; },
+            async context({ sessionID }: { sessionID: string }) {
+                return sessionID === "switched"
+                    ? [{ type: "assistant", model: { providerID: "p", id: "old" } }]
+                    : [];
+            },
+            async hook(name: string, handler: (event: any) => Promise<void>) { hooks.set(name, handler); return registration(); },
+            instructions: { entry: { async put({ sessionID, key, value }: { sessionID: string; key: string; value: string }) {
+                expect(key).toBe("memento-continuation");
+                instructions.set(sessionID, value);
+            } } },
+        },
+        tool: { async transform() { return registration(); } },
+        command: { async transform() { return registration(); } },
+        event: {
+            async *subscribe(input: { signal: AbortSignal }) {
+                if (!input.signal.aborted) {
+                    await new Promise<void>((resolve) => input.signal.addEventListener("abort", () => resolve(), { once: true }));
+                }
+            },
+        },
+    } as unknown as Plugin.Context;
+    let cleanup: void | (() => void | Promise<void>) = undefined;
+    try {
+        cleanup = await plugin.setup(ctx);
+        const continuation = frameContinuation("codex", "parent", "parent digest");
+        const user = { id: "u", role: "user", content: [{ type: "text", text: "hello" }] };
+        const first = { sessionID: "first", model: { providerID: "p", id: "new" }, system: [] as { type: string; text: string }[], messages: [user] };
+        await hooks.get("context")!(first);
+        expect(instructions.get("first")).toBe(continuation);
+        expect(first.messages[0]).not.toBe(user);
+        expect(user.content).toEqual([{ type: "text", text: "hello" }]);
+        expect(first.messages[0].content).toEqual([{ type: "text", text: continuation }, ...user.content]);
+        const second = { ...first, system: [{ type: "text", text: continuation }], messages: [user] };
+        await hooks.get("context")!(second);
+        expect(second.system).toEqual([{ type: "text", text: continuation }]);
+        expect(second.messages).toEqual([user]);
+        const unclaimed = { ...first, sessionID: "unclaimed", messages: [user] };
+        await hooks.get("context")!(unclaimed);
+        expect(unclaimed.messages[0]).toBe(user);
+        const existingSystem = { ...first, sessionID: "existing-system", system: [{ type: "text", text: continuation }], messages: [user] };
+        await hooks.get("context")!(existingSystem);
+        expect(existingSystem.messages[0]).toBe(user);
+        const existingMessage = { ...first, sessionID: "existing-message", messages: [{ ...user, content: [{ type: "text", text: continuation }] }] };
+        await hooks.get("context")!(existingMessage);
+        expect(existingMessage.messages[0].content).toHaveLength(1);
+        const noUser = { ...first, sessionID: "no-user", messages: [] };
+        await hooks.get("context")!(noUser);
+        expect(noUser.system).toEqual([{ type: "text", text: continuation }]);
+        const switched = {
+            ...first,
+            sessionID: "switched",
+            messages: [
+                { ...user, id: "oldest" },
+                { ...user, id: "recent" },
+                { ...user, id: "current" },
+            ],
+        };
+        await hooks.get("context")!(switched);
+        expect(switched.messages.map((message) => message.id)).toEqual(["recent", "current"]);
+        expect(switched.messages[0].content[0].text).toBe(continuation);
+        expect(switched.messages[0].content[1].text).toContain("<memento-digest>");
+        expect(switched.messages[0].content[1].text).toContain("switch digest");
+    } finally {
+        await cleanup?.();
+        globalThis.fetch = originalFetch;
+    }
 });
 
 test("step ended dispatches ingestion and cleanup stops the subscription", async () => {
