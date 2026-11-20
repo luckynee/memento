@@ -111,7 +111,7 @@ Harness scaffolding is not session memory, and stored text is untrusted when it 
 - `SegmentPolicy.scaffold_strip_tags` removes `<system-reminder>`, `<skill_content>`, `<environment_context>`, `<user_instructions>`, `<command-message>`, `<command-name>`, `<local-command-stdout|stderr|caveat>`, `<subagent>`, and memento's own `<memento-*>` wrappers from user and assistant text (an unclosed tag strips to the end); `scaffold_unwrap_tags` keeps the inner text of `<command-args>`. Text that is empty after stripping is skipped.
 - `ignored_tools` (`skill`, `memory_search`, `question`, `execute`) and `self_command_prefixes` (`memento `, `mementod `) prevent ingesting skill bodies and memento's own output.
 - The digest contains user requests, assistant-authored decisions, constraints and notes, the latest todo list, changed and inspected file paths, and a few recent commands with exit status and a short (160 char) output tail, failures first. Other tool output (file contents, subagent reports) never reaches it; file reads are stored as path pointers only. Search results may include tool output because they arrive as tool output.
-- Continuation framing (CLI hooks and OpenCode adapter) states that the digest omits full command output and file contents, tells the model to search memory before concluding something was not recorded, and to read or grep workspace files for code details. The CLI hook prints a runnable `memento search "<query>" --harness ... --project ... --session ...` with the real, shell-quoted values.
+- Continuation framing (CLI hooks and OpenCode adapter) states that the digest omits full command output and file contents, tells the model to answer only the current user message because past requests are already-handled history, to search memory before concluding something was not recorded, and to read or grep workspace files for code details. The CLI hook prints a runnable `memento search "<query>" --harness ... --project ... --session ...` with the real, shell-quoted values.
 - Every `<memento-` or `</memento-` sequence in rendered text is escaped to `&lt;`, so stored text cannot close the wrapper. Digest, continuation, and search output are framed as reference data, not instructions, with current instructions taking precedence.
 - Residual risk: assistant-authored text that quotes an attack is still shown (escaped and framed). Optional future step: a Jev `predicate` screen at ingest for text addressed to an AI model.
 
@@ -150,9 +150,9 @@ Search:
 | Header (harness, project, lineage) | fixed | | |
 | Constraints and decisions | 27% | newest entries that fit | chronological |
 | Current tasks | 8% | latest `task` entry only | as stored |
-| User requests | 32% | newest entries that fit; an entry longer than 1500 chars is truncated deterministically | chronological |
-| Files changed | 7% | distinct paths across all `file_change` `paths`, newest change first | newest first, preserving path order within a change |
 | Recent notes | 8% | newest `assistant_note` entries that fit | chronological |
+| Past user requests (already handled) | 32% | newest entries that fit; an entry longer than 600 chars is truncated deterministically | chronological |
+| Files changed | 7% | distinct paths across all `file_change` `paths`, newest change first | newest first, preserving path order within a change |
 | Recent commands | 11% | up to 5 `command` entries, failures first then newest; command line (160 chars), `(exit: N)` or `(failed)` when known, 160-char output tail | newest first |
 | Files inspected | 7% | distinct `file_ref` paths not already under Files changed | newest first |
 
