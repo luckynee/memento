@@ -212,12 +212,12 @@ export default Plugin.define({
         };
         const reconcileSessions = async () => {
             try {
-                const { sessions } = await client.listSessions("opencode", project);
+                const { sessions } = await client.listSessions(options.harness, project);
                 for (const session of sessions) {
                     if (controller.signal.aborted) {
                         return;
                     }
-                    if (session.harness !== "opencode" || session.project !== project || typeof session.session !== "string") {
+                    if (session.harness !== options.harness || session.project !== project || typeof session.session !== "string") {
                         continue;
                     }
                     let reason: string | undefined;
@@ -232,7 +232,7 @@ export default Plugin.define({
                         }
                     }
                     if (reason && !controller.signal.aborted) {
-                        await releaseSession(session.session, reason, "opencode");
+                        await releaseSession(session.session, reason, options.harness);
                     }
                 }
             } catch (error) {

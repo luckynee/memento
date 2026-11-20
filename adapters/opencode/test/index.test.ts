@@ -575,9 +575,12 @@ test("startup and periodic reconciliation release deleted sessions and subagents
         const request = new URL(String(url));
         requests.push(request.pathname);
         if (request.pathname === "/v1/sessions") {
-            expect(request.searchParams.get("harness")).toBe("opencode");
-            expect(request.searchParams.get("project")).toBe("/project");
-            return Response.json({ sessions: ["missing", "tagged", "child", "unknown", "fork"].map((session) => ({ harness: "opencode", project: "/project", session })) });
+            requests.push(request.search);
+            return Response.json({ sessions: [
+                ...["missing", "tagged", "child", "unknown", "fork"].map((session) => ({ harness: "custom", project: "/project", session })),
+                { harness: "opencode", project: "/project", session: "other-harness" },
+                { harness: "custom", project: "/other-project", session: "other-project" },
+            ] });
         }
         if (request.pathname === "/v1/sessions/release") {
             releases.push(JSON.parse(String(init?.body)));
@@ -621,10 +624,11 @@ test("startup and periodic reconciliation release deleted sessions and subagents
     try {
         cleanup = await plugin.setup(ctx);
         await completed;
+        expect(requests).toContain("?harness=custom&project=%2Fproject");
         expect(releases).toEqual([
-            { harness: "opencode", project: "/project", session: "missing", reason: "deleted" },
-            { harness: "opencode", project: "/project", session: "tagged", reason: "deleted" },
-            { harness: "opencode", project: "/project", session: "child", reason: "subagent" },
+            { harness: "custom", project: "/project", session: "missing", reason: "deleted" },
+            { harness: "custom", project: "/project", session: "tagged", reason: "deleted" },
+            { harness: "custom", project: "/project", session: "child", reason: "subagent" },
         ]);
         for (const session of ["missing", "tagged", "child"]) {
             expect(keys.every((key) => !values.has(`memento/${key}/${session}`))).toBe(true);

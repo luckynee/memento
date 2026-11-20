@@ -23,7 +23,7 @@ export function createContinueCommand(deps: {
                 throw new Error("memento-continue requires a parent session id");
             }
             const separator = input.indexOf("/");
-            const parentHarness = separator < 0 ? "opencode" : input.slice(0, separator);
+            const parentHarness = separator < 0 ? deps.harness : input.slice(0, separator);
             const parent = separator < 0 ? input : input.slice(separator + 1);
             if (!parentHarness || !parent || (separator >= 0 && parent.includes("/"))) {
                 throw new Error("memento-continue requires a parent in <harness>/<session> format");

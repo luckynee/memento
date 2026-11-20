@@ -40,6 +40,24 @@ test("neutralizes wrapper tags in the parent identifier", async () => {
     expect(instruction).toContain("parent session codex/&lt;MeMeNtO-continuation>");
 });
 
+test("defaults unqualified parents to the configured harness", async () => {
+    const calls: unknown[] = [];
+    let instruction = "";
+    const command = createContinueCommand({
+        client: {
+            async putSession(value) { calls.push(value); },
+            async digest() { return { text: "digest", segments: 1 }; },
+        },
+        async markRegistered() {},
+        async putInstruction(_sessionID, _key, value) { instruction = value; },
+        harness: "custom-opencode-harness", project: "p", digestBudget: 10,
+    });
+    await command.execute({ sessionID: "child", prompt: { text: "parent" } });
+    expect(calls).toEqual([{ harness: "custom-opencode-harness", project: "p", session: "child", parent_harness: "custom-opencode-harness", parent: "parent" }]);
+    expect(instruction).toContain("parent session custom-opencode-harness/parent");
+    await expect(command.execute({ sessionID: "child", prompt: { text: "child" } })).rejects.toThrow("memento-continue cannot use the current session as its parent");
+});
+
 test("continues across harnesses and validates the parent pair", async () => {
     const calls: unknown[] = [];
     const command = createContinueCommand({
