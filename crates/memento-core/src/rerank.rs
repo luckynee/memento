@@ -166,6 +166,16 @@ fn is_identifier_character(ch: char) -> bool {
 }
 
 fn is_identifier(token: &str) -> bool {
+    if token.contains('-')
+        && token.split('-').all(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|ch| ch.is_alphabetic() && ch.is_lowercase())
+        })
+    {
+        return false;
+    }
     let chars: Vec<char> = token.chars().collect();
     let mixed_digits =
         chars.iter().any(|ch| ch.is_alphabetic()) && chars.iter().any(|ch| ch.is_numeric());
@@ -388,6 +398,46 @@ mod tests {
     }
 
     #[test]
+    fn lowercase_hyphenated_words_are_not_identifiers() {
+        for token in ["sign-off", "half-even", "follow-up", "invoice-worker"] {
+            assert!(!is_identifier(token), "{token}");
+        }
+    }
+
+    #[test]
+    fn technical_identifiers_remain_identifiers() {
+        for token in [
+            "X-Tide-Sig-v2",
+            "tw_recovery_v3",
+            "src/invoice-worker.rs",
+            "mod::name",
+            "item2",
+            "camelCase",
+            "invoice-Worker",
+        ] {
+            assert!(is_identifier(token), "{token}");
+        }
+    }
+
+    #[test]
+    fn lowercase_hyphenated_prose_does_not_boost_file_changes() {
+        let mut decision = candidate("decision", 0, 1.0);
+        decision.segment.kind = Kind::Decision;
+        decision.segment.text = "QA approval owner is Dana.".into();
+        let mut file_change = candidate("file_change", 0, 0.8);
+        file_change.segment.kind = Kind::FileChange;
+        file_change.segment.text = "Update sign-off documentation.".into();
+        let hits = rerank(
+            "QA sign-off owner",
+            vec![decision, file_change],
+            &RerankConfig::default(),
+            2,
+        );
+        assert_eq!(hits[0].kind, Kind::Decision);
+        assert_eq!(hits[1].kind, Kind::FileChange);
+    }
+
+    #[test]
     fn identifier_boundaries_cover_all_identifier_characters() {
         for ch in ['a', '2', 'é', '_', '-'] {
             assert!(!contains_identifier(&format!("{ch}item2"), "item2"));
@@ -419,7 +469,7 @@ mod tests {
             "foo.bar",
             "foo/bar",
             "foo::bar",
-            "foo-bar",
+            "foo-Bar",
             "foo2",
             "camelCase",
         ] {
