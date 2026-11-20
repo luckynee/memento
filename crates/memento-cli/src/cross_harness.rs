@@ -1151,6 +1151,18 @@ fn pending_marker(state: &Path, harness: &str, session: &str) -> PathBuf {
         .join(format!("{}-{}", sanitize(harness), sanitize(session)))
 }
 
+fn new_pending_marker(base: &Path) -> Result<PathBuf, CliError> {
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|error| CliError::other(format!("invalid system time: {error}")))?
+        .as_nanos();
+    let name = base
+        .file_name()
+        .ok_or_else(|| CliError::other("pending marker has no filename"))?
+        .to_string_lossy();
+    Ok(base.with_file_name(format!("{name}.{}-{nanos}", std::process::id())))
+}
+
 fn auto_gc_stamp(state: &Path, project: &str, now: u64) -> Result<bool, CliError> {
     fs::create_dir_all(state)
         .map_err(|error| CliError::other(format!("cannot create {}: {error}", state.display())))?;
@@ -1474,27 +1486,10 @@ fn gc(cli: &Cli, args: &GcArgs) -> Result<(), CliError> {
         .map_err(|error| CliError::other(format!("invalid daemon sessions: {error}")))?;
         for record in records {
             let marker = pending_marker(&state, harness, &record.session);
-            let presence = match fs::read_to_string(&marker) {
-                Ok(contents) => match contents.trim().parse::<u64>() {
-                    Ok(created)
-                        if SystemTime::now()
-                            .duration_since(SystemTime::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs()
-                            .saturating_sub(created)
-                            < 60 =>
-                    {
-                        SessionPresence::Unknown("pending import".into())
-                    }
-                    Ok(_) => detect_session(&record, &cursors, &claude, &codex, &opencode, &agy),
-                    Err(_) => SessionPresence::Unknown("invalid pending marker".into()),
-                },
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    detect_session(&record, &cursors, &claude, &codex, &opencode, &agy)
-                }
-                Err(error) => {
-                    SessionPresence::Unknown(format!("cannot read pending marker: {error}"))
-                }
+            let presence = match has_pending_markers(&marker, !args.dry_run) {
+                Ok(true) => SessionPresence::Unknown("pending import".into()),
+                Ok(false) => detect_session(&record, &cursors, &claude, &codex, &opencode, &agy),
+                Err(error) => SessionPresence::Unknown(error.message),
             };
             let (status, detail) = match presence {
                 SessionPresence::Alive => ("alive", None),
@@ -1604,12 +1599,51 @@ fn write_pending_marker(path: &Path) -> Result<(), CliError> {
     save_atomic(path, created.to_string().as_bytes())
 }
 
-fn wait_for_pending_marker(path: &Path, timeout: Duration) -> Result<bool, CliError> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let contents = match fs::read_to_string(path) {
+fn has_pending_markers(base: &Path, remove_stale: bool) -> Result<bool, CliError> {
+    let parent = base
+        .parent()
+        .ok_or_else(|| CliError::other("pending marker has no parent"))?;
+    let name = base
+        .file_name()
+        .ok_or_else(|| CliError::other("pending marker has no filename"))?
+        .to_string_lossy();
+    let prefix = format!("{name}.");
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(CliError::other(format!(
+                "cannot list pending markers in {}: {error}",
+                parent.display()
+            )));
+        }
+    };
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|error| CliError::other(format!("invalid system time: {error}")))?
+        .as_secs();
+    let mut pending = false;
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| CliError::other(format!("cannot list pending markers: {error}")))?;
+        let filename = entry.file_name();
+        let filename = filename.to_string_lossy();
+        let suffix = filename.strip_prefix(&prefix);
+        let is_unique = suffix.is_some_and(|suffix| {
+            suffix.split_once('-').is_some_and(|(pid, nanos)| {
+                !pid.is_empty()
+                    && !nanos.is_empty()
+                    && pid.bytes().all(|byte| byte.is_ascii_digit())
+                    && nanos.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        });
+        if filename != name && !is_unique {
+            continue;
+        }
+        let path = entry.path();
+        let contents = match fs::read_to_string(&path) {
             Ok(contents) => contents,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => {
                 return Err(CliError::other(format!(
                     "cannot read pending marker {}: {error}",
@@ -1623,12 +1657,21 @@ fn wait_for_pending_marker(path: &Path, timeout: Duration) -> Result<bool, CliEr
                 path.display()
             ))
         })?;
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_err(|error| CliError::other(format!("invalid system time: {error}")))?
-            .as_secs();
         if now.saturating_sub(created) >= 60 {
-            let _ = fs::remove_file(path);
+            if remove_stale {
+                let _ = fs::remove_file(path);
+            }
+        } else {
+            pending = true;
+        }
+    }
+    Ok(pending)
+}
+
+fn wait_for_pending_marker(path: &Path, timeout: Duration) -> Result<bool, CliError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !has_pending_markers(path, true)? {
             return Ok(true);
         }
         if Instant::now() >= deadline {
@@ -1641,10 +1684,10 @@ fn wait_for_pending_marker(path: &Path, timeout: Duration) -> Result<bool, CliEr
 }
 
 #[cfg(unix)]
-fn spawn_import(cli: &Cli, args: &ImportArgs, state: &Path) -> Result<(), CliError> {
+fn spawn_import(cli: &Cli, args: &ImportArgs, state: &Path, marker: &Path) -> Result<(), CliError> {
     let executable = env::current_exe()
         .map_err(|error| CliError::other(format!("cannot determine executable path: {error}")))?;
-    spawn_import_with_executable(cli, args, state, &executable)
+    spawn_import_with_executable(cli, args, state, marker, &executable)
 }
 
 #[cfg(unix)]
@@ -1652,6 +1695,7 @@ fn spawn_import_with_executable(
     cli: &Cli,
     args: &ImportArgs,
     state: &Path,
+    marker: &Path,
     executable: &Path,
 ) -> Result<(), CliError> {
     use std::os::unix::process::CommandExt;
@@ -1668,6 +1712,7 @@ fn spawn_import_with_executable(
         .arg(&cli.url)
         .arg("--timeout-secs")
         .arg(cli.timeout_secs.to_string())
+        .env("MEMENTO_PENDING_MARKER", marker)
         .stdin(Stdio::null())
         .stdout(log.map_or_else(Stdio::null, Stdio::from))
         .stderr(stderr.map_or_else(Stdio::null, Stdio::from))
@@ -2021,9 +2066,78 @@ struct HookInput {
     #[serde(alias = "hookEventName")]
     hook_event_name: String,
     source: Option<String>,
+    #[serde(alias = "lastUserInput")]
+    last_user_input: Option<String>,
     agent_id: Option<String>,
     #[serde(default)]
     is_subagent: bool,
+}
+
+#[cfg(test)]
+fn agy_parent_conversation(record: &Value) -> Option<String> {
+    if record.get("type")?.as_str()? != "SYSTEM_MESSAGE" {
+        return None;
+    }
+    let content = record.get("content")?.as_str()?;
+    let sender = content
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("sender="))?;
+    let parts = sender.split('-').collect::<Vec<_>>();
+    if parts.len() != 5
+        || parts.iter().map(|part| part.len()).collect::<Vec<_>>() != [8, 4, 4, 4, 12]
+        || !parts
+            .iter()
+            .all(|part| part.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return None;
+    }
+    Some(sender.to_owned())
+}
+
+fn is_subagent_hook(harness: Harness, input: &HookInput) -> Result<bool, CliError> {
+    if input.is_subagent || input.agent_id.as_deref().is_some_and(|id| !id.is_empty()) {
+        return Ok(true);
+    }
+    if !matches!(harness, Harness::Agy)
+        || input
+            .last_user_input
+            .as_deref()
+            .is_some_and(|text| !text.is_empty())
+    {
+        return Ok(false);
+    }
+    let Some(path) = &input.transcript_path else {
+        return Ok(true);
+    };
+    let path = resolve_agy_transcript(path);
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => {
+            return Err(CliError::other(format!(
+                "cannot read agy transcript {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|error| {
+            CliError::other(format!(
+                "cannot read agy transcript {}: {error}",
+                path.display()
+            ))
+        })?;
+        let record: Value = serde_json::from_str(&line).map_err(|error| {
+            CliError::other(format!(
+                "invalid agy transcript {}: {error}",
+                path.display()
+            ))
+        })?;
+        if record.get("type").and_then(Value::as_str) == Some("USER_INPUT") {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn escape_wrapper(text: &str, strip_controls: bool) -> String {
@@ -2080,7 +2194,7 @@ fn handle_hook(
     state: &Path,
     sync_import: bool,
 ) -> Result<Option<Value>, CliError> {
-    if input.is_subagent || input.agent_id.as_deref().is_some_and(|id| !id.is_empty()) {
+    if is_subagent_hook(harness, input)? {
         return Ok(Some(json!({})));
     }
     match input.hook_event_name.as_str() {
@@ -2189,9 +2303,13 @@ fn handle_hook(
                 if sync_import {
                     import(cli, &args, client, state)?;
                 } else {
-                    let marker = pending_marker(state, harness.name(), &input.session_id);
+                    let marker = new_pending_marker(&pending_marker(
+                        state,
+                        harness.name(),
+                        &input.session_id,
+                    ))?;
                     write_pending_marker(&marker)?;
-                    if let Err(error) = spawn_import(cli, &args, state) {
+                    if let Err(error) = spawn_import(cli, &args, state, &marker) {
                         let _ = fs::remove_file(&marker);
                         eprintln!("warning: {}; importing synchronously", error.message);
                         import(cli, &args, client, state)?;
@@ -2526,9 +2644,13 @@ fn generic_hook(
                 } else {
                     #[cfg(unix)]
                     {
-                        let marker = pending_marker(&state, harness, &input.session_id);
+                        let marker = new_pending_marker(&pending_marker(
+                            &state,
+                            harness,
+                            &input.session_id,
+                        ))?;
                         write_pending_marker(&marker)?;
-                        if let Err(error) = spawn_import(cli, &args, &state) {
+                        if let Err(error) = spawn_import(cli, &args, &state, &marker) {
                             let _ = fs::remove_file(&marker);
                             eprintln!("warning: {}; importing synchronously", error.message);
                             import(cli, &args, &client, &state)?;
@@ -2757,14 +2879,8 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
         crate::Command::HookImport(args) => {
             let state = state_dir()?;
             let result = client(cli, false).and_then(|client| import(cli, args, &client, &state));
-            if let Some(session) = &args.session {
-                let _ = fs::remove_file(pending_marker(
-                    &state,
-                    args.identity_harness
-                        .as_deref()
-                        .unwrap_or(args.harness.name()),
-                    session,
-                ));
+            if let Some(marker) = env::var_os("MEMENTO_PENDING_MARKER") {
+                let _ = fs::remove_file(marker);
             }
             result?;
         }
@@ -2833,9 +2949,7 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
                     };
                     let input: HookInput = serde_json::from_str(&raw)
                         .map_err(|error| CliError::other(format!("invalid hook JSON: {error}")))?;
-                    if input.is_subagent
-                        || input.agent_id.as_deref().is_some_and(|id| !id.is_empty())
-                    {
+                    if is_subagent_hook(harness, &input)? {
                         return Ok(Some(json!({})));
                     }
                     if input.hook_event_name == "SessionEnd" && !matches!(harness, Harness::Agy) {
@@ -2995,6 +3109,7 @@ mod tests {
         let mut input: HookInput = serde_json::from_value(json!({
             "conversationId":"child",
             "cwd":temp.path(),
+            "lastUserInput":"hello",
             "hookEventName":"SessionStart"
         }))
         .unwrap();
@@ -3696,6 +3811,7 @@ mod tests {
             cwd: Some(temp.path().to_path_buf()),
             hook_event_name: "SessionStart".into(),
             source: None,
+            last_user_input: None,
             agent_id: None,
             is_subagent: false,
         };
@@ -3757,6 +3873,7 @@ mod tests {
             cwd: Some(temp.path().to_path_buf()),
             hook_event_name: "Stop".into(),
             source: None,
+            last_user_input: None,
             agent_id: None,
             is_subagent: false,
         };
@@ -3839,6 +3956,57 @@ mod tests {
         fs::write(&marker, b"1").unwrap();
         assert!(wait_for_pending_marker(&marker, Duration::from_secs(1)).unwrap());
         assert!(!marker.exists());
+        let first = marker.with_file_name(format!(
+            "{}.1-1",
+            marker.file_name().unwrap().to_string_lossy()
+        ));
+        let second = marker.with_file_name(format!(
+            "{}.1-2",
+            marker.file_name().unwrap().to_string_lossy()
+        ));
+        write_pending_marker(&first).unwrap();
+        write_pending_marker(&second).unwrap();
+        fs::remove_file(&first).unwrap();
+        assert!(!wait_for_pending_marker(&marker, Duration::from_millis(10)).unwrap());
+        fs::write(&first, b"1").unwrap();
+        assert!(!wait_for_pending_marker(&marker, Duration::from_millis(10)).unwrap());
+        assert!(!first.exists());
+        fs::remove_file(&second).unwrap();
+        assert!(wait_for_pending_marker(&marker, Duration::from_millis(10)).unwrap());
+    }
+
+    #[test]
+    fn agy_subagent_hooks_require_empty_input_and_no_user_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("logs/transcript_full.jsonl");
+        let mut input: HookInput = serde_json::from_value(json!({
+            "conversationId":"child", "transcriptPath":temp.path(),
+            "lastUserInput":"", "hookEventName":"SessionStart"
+        }))
+        .unwrap();
+        assert!(is_subagent_hook(Harness::Agy, &input).unwrap());
+        fs::create_dir(transcript.parent().unwrap()).unwrap();
+        let system = json!({"type":"SYSTEM_MESSAGE","content":"[Message] sender=12345678-1234-1234-1234-123456789abc content=task"});
+        fs::write(&transcript, format!("{system}\n")).unwrap();
+        input.hook_event_name = "Stop".into();
+        assert!(is_subagent_hook(Harness::Agy, &input).unwrap());
+        assert_eq!(
+            agy_parent_conversation(&system).as_deref(),
+            Some("12345678-1234-1234-1234-123456789abc")
+        );
+        assert_eq!(
+            agy_parent_conversation(&json!({"type":"SYSTEM_MESSAGE","content":"sender=invalid"})),
+            None
+        );
+        fs::write(
+            &transcript,
+            format!("{system}\n{}\n", json!({"type":"USER_INPUT"})),
+        )
+        .unwrap();
+        assert!(!is_subagent_hook(Harness::Agy, &input).unwrap());
+        fs::remove_file(&transcript).unwrap();
+        input.last_user_input = Some("hello".into());
+        assert!(!is_subagent_hook(Harness::Agy, &input).unwrap());
     }
 
     #[test]

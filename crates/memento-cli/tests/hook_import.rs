@@ -19,6 +19,18 @@ fn wait_until(mut condition: impl FnMut() -> bool) {
     }
 }
 
+fn marker_exists(base: &Path) -> bool {
+    let Some(parent) = base.parent() else {
+        return false;
+    };
+    let prefix = format!("{}.", base.file_name().unwrap().to_string_lossy());
+    fs::read_dir(parent).ok().is_some_and(|entries| {
+        entries
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+    })
+}
+
 fn read_request(stream: &std::net::TcpStream) -> Value {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut line = String::new();
@@ -71,7 +83,7 @@ fn detached_stop_returns_before_ingest_and_clears_marker() {
         let (mut stream, _) = listener.accept().unwrap();
         let body = read_request(&stream);
         request_sender
-            .send((marker_before_ingest.exists(), body))
+            .send((marker_exists(&marker_before_ingest), body))
             .unwrap();
         release_receiver
             .recv_timeout(Duration::from_secs(10))
@@ -106,17 +118,19 @@ fn detached_stop_returns_before_ingest_and_clears_marker() {
         .unwrap();
     assert!(marker_existed);
     assert_eq!(body["session"], "test-session");
-    assert!(marker.exists());
+    assert!(marker_exists(&marker));
     release_sender.send(()).unwrap();
     server.join().unwrap();
-    wait_until(|| !marker.exists());
+    wait_until(|| !marker_exists(&marker));
     assert!(temp.path().join("state/memento/cursors.json").exists());
 }
 
 #[test]
 fn failed_detached_import_clears_marker() {
     let temp = tempfile::tempdir().unwrap();
-    let marker = temp.path().join("state/memento/pending/codex-test-session");
+    let marker = temp
+        .path()
+        .join("state/memento/pending/codex-test-session.1-2");
     fs::create_dir_all(marker.parent().unwrap()).unwrap();
     fs::write(&marker, b"1").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_memento"))
@@ -124,6 +138,7 @@ fn failed_detached_import_clears_marker() {
         .arg(temp.path().join("missing.jsonl"))
         .args(["--session", "test-session"])
         .env("XDG_STATE_HOME", temp.path().join("state"))
+        .env("MEMENTO_PENDING_MARKER", &marker)
         .output()
         .unwrap();
     assert!(!output.status.success());
