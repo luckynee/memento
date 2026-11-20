@@ -175,7 +175,7 @@ All routes under `http://127.0.0.1:7377`. Optional bearer token via `MEMENTO_TOK
 | `POST /v1/ingest` | neutral ingest schema | `{ segments: n, skipped: n }` |
 | `POST /v1/search` | `{ harness, project, session, query, scope?, k?, kinds? }` (empty harness and session allowed for project/global) | `{ hits: [{ id, score, kind, text, harness, session, ts, path? }] }` |
 | `GET /v1/digest` | `?harness&project&session&budget` | `{ text, segments }` |
-| `POST /v1/forget` | `{ harness, project?, session?, scope: "session" or "lineage" or "project" }` | `{ deleted: n }` |
+| `POST /v1/forget` | `{ harness, project?, session?, scope: "session" or "lineage" or "project", dry_run? }` | `{ deleted: n, would_delete: n, sessions: [{ harness, session }] }`; dry runs report matching segments and sessions without deleting or collecting |
 | `GET /v1/stats` | `?harness?&project?&session?` | counts by kind |
 
 Errors: `{ "error": { "code": "...", "message": "..." } }` with 4xx/5xx.
@@ -188,10 +188,11 @@ Errors: `{ "error": { "code": "...", "message": "..." } }` with 4xx/5xx.
 - `stats [--harness H] [--project P] [--session S]` (`{ total, by_kind }`; current project by default, all harnesses when omitted)
 - `sessions list --harness H [--project P]`
 - `sessions link --harness H --project P --child S --parent P2 [--parent-harness H2] [--title T] [--retention continuation|keep]`
+- `sessions keep --harness H --session S [--project P] [--off]` (checks the session exists and is not deleted, then sets `keep` or restores `continuation`; project defaults to the current project)
 - `sessions lineage --harness H --session S`
 - `search <query> [--harness H] [--project P] [--session S] [--scope session|lineage|project|global] [--k 8] [--kind KIND]...` (current project by default; session and lineage require harness and session)
 - `digest [--harness H --session S] [--project P] [--budget N]` (current project and its most recently active non-deleted session by default; selected session reported on stderr)
-- `forget --harness H [--project P] (--session S | --lineage S | --whole-project) [--yes]` (`--whole-project` requires `--project`; without `--yes` it asks on a TTY and refuses otherwise)
+- `forget --harness H [--project P] (--session S | --lineage S | --whole-project) [--yes] [--dry-run]` (`--whole-project` requires `--project`; without `--yes` it asks on a TTY and refuses otherwise; dry runs never prompt and report matching segments and sessions)
 - `gc [--project DIR] [--dry-run] [--json]` releases sessions whose harness data is gone.
 - `ingest --file turns.json|-` (neutral schema, for harnesses without a plugin)
 - `install-hooks claude-code|codex|agy [--project DIR | --user] [--dry-run]`

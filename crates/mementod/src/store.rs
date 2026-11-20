@@ -481,24 +481,28 @@ impl Store {
             .collect()
     }
 
-    pub async fn delete_segments(&self, filter: &ScopeFilter) -> Result<u64> {
+    pub async fn count_segments(&self, filter: &ScopeFilter) -> Result<u64> {
         let filter = filter.to_filter()?;
-        let count = self
+        Ok(self
             .client
             .count(
                 CountPointsBuilder::new(&self.segments_collection)
-                    .filter(filter.clone())
+                    .filter(filter)
                     .exact(true),
             )
             .await
-            .context("counting segments before deletion")?
+            .context("counting segments")?
             .result
             .context("missing count result")?
-            .count;
+            .count)
+    }
+
+    pub async fn delete_segments(&self, filter: &ScopeFilter) -> Result<u64> {
+        let count = self.count_segments(filter).await?;
         self.client
             .delete_points(
                 DeletePointsBuilder::new(&self.segments_collection)
-                    .points(filter)
+                    .points(filter.to_filter()?)
                     .wait(true),
             )
             .await

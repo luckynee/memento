@@ -1369,6 +1369,24 @@ async fn forget(
         sessions,
         ..Default::default()
     };
+    if request.dry_run {
+        let segments = state.app.store.count_segments(&filter).await;
+        let would_delete =
+            usize::try_from(store_result(&state, segments).await?).map_err(ApiError::internal)?;
+        let records = state.app.store.list_sessions_filtered(filter.clone()).await;
+        let mut sessions = store_result(&state, records)
+            .await?
+            .iter()
+            .map(session_key)
+            .collect::<Vec<_>>();
+        sessions.sort();
+        sessions.dedup();
+        return Ok(Json(ForgetResponse {
+            deleted: 0,
+            would_delete,
+            sessions,
+        }));
+    }
     let deleted = state.app.store.delete_segments(&filter).await;
     let deleted = store_result(&state, deleted).await?;
     let result = state.app.store.delete_sessions(&filter).await;
@@ -1386,6 +1404,8 @@ async fn forget(
     }
     Ok(Json(ForgetResponse {
         deleted: usize::try_from(deleted).map_err(ApiError::internal)?,
+        would_delete: 0,
+        sessions: Vec::new(),
     }))
 }
 

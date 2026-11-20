@@ -1144,6 +1144,30 @@ async fn cross_harness_workflow(address: &str, store: &Store) {
             .any(|(_, record)| record.target_harness.is_none())
     );
 
+    let preview = call(
+        "POST",
+        "/v1/forget",
+        json!({"harness":"claude-code","session":"same","scope":"lineage","dry_run":true}),
+    )
+    .await
+    .1;
+    assert_eq!(preview["deleted"], 0);
+    assert_eq!(preview["would_delete"], 1);
+    assert!(
+        preview["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|session| { session["harness"] == "claude-code" && session["session"] == "same" })
+    );
+    assert!(
+        store
+            .get_session("claude-code", "same")
+            .await
+            .unwrap()
+            .is_some()
+    );
+
     let forgotten = call(
         "POST",
         "/v1/forget",

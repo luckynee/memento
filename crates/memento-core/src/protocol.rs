@@ -217,6 +217,8 @@ pub struct ForgetRequest {
     pub project: Option<String>,
     pub session: Option<String>,
     pub scope: ForgetScope,
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,6 +232,10 @@ pub enum ForgetScope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForgetResponse {
     pub deleted: usize,
+    #[serde(default)]
+    pub would_delete: usize,
+    #[serde(default)]
+    pub sessions: Vec<SessionKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

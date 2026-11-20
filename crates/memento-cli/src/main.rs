@@ -125,6 +125,17 @@ enum SessionsCommand {
         #[arg(long, value_enum, help = "Child session retention mode")]
         retention: Option<RetentionArg>,
     },
+    #[command(about = "Set session retention")]
+    Keep {
+        #[arg(long, help = "Harness identifier")]
+        harness: String,
+        #[arg(long, help = "Session identifier")]
+        session: String,
+        #[arg(long, help = "Project identifier (default: current project)")]
+        project: Option<String>,
+        #[arg(long, help = "Restore continuation retention")]
+        off: bool,
+    },
     #[command(about = "Show session ancestors")]
     Lineage {
         #[arg(long, help = "Harness identifier")]
@@ -249,6 +260,8 @@ struct ForgetArgs {
     whole_project: bool,
     #[arg(long, help = "Skip confirmation")]
     yes: bool,
+    #[arg(long, help = "Report what would be forgotten without deleting")]
+    dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -370,6 +383,7 @@ fn build_request(
         Command::Sessions { command } => match command {
             SessionsCommand::List { .. } => (Method::GET, vec!["v1", "sessions"]),
             SessionsCommand::Link { .. } => (Method::PUT, vec!["v1", "sessions"]),
+            SessionsCommand::Keep { .. } => (Method::PUT, vec!["v1", "sessions"]),
             SessionsCommand::Lineage { harness, session } => (
                 Method::GET,
                 vec!["v1", "sessions", harness, session, "lineage"],
@@ -443,6 +457,20 @@ fn build_request(
             }
             request.json(&body)
         }
+        Command::Sessions {
+            command:
+                SessionsCommand::Keep {
+                    harness,
+                    session,
+                    project,
+                    off,
+                },
+        } => request.json(&json!({
+            "harness": harness,
+            "project": project_or_current(project)?,
+            "session": session,
+            "retention": if *off { Retention::Continuation } else { Retention::Keep }
+        })),
         Command::Search(args) => {
             validate_search(args)?;
             request.json(&SearchRequest {
@@ -490,6 +518,7 @@ fn build_request(
                 project: args.project.clone(),
                 session,
                 scope,
+                dry_run: args.dry_run,
             })
         }
         Command::Ingest(_) => {
@@ -585,6 +614,22 @@ fn render(command: &Command, body: &str) -> Result<String, CliError> {
             ))
         }
         Command::Sessions {
+            command: SessionsCommand::Keep { .. },
+        } => {
+            let record: SessionRecord = parse_response(body)?;
+            Ok(format!(
+                "{}  {}  {}  retention: {}",
+                record.harness,
+                record.project,
+                record.session,
+                if record.retention == Retention::Keep {
+                    "keep"
+                } else {
+                    "continuation"
+                }
+            ))
+        }
+        Command::Sessions {
             command: SessionsCommand::List { .. },
         } => {
             let response: Value = parse_response(body)?;
@@ -661,9 +706,15 @@ fn render(command: &Command, body: &str) -> Result<String, CliError> {
             let response: DigestResponse = parse_response(body)?;
             Ok(response.text)
         }
-        Command::Forget(_) => {
+        Command::Forget(args) => {
             let response: ForgetResponse = parse_response(body)?;
-            Ok(format!("deleted: {}", response.deleted))
+            if args.dry_run {
+                let mut lines = vec![format!("would delete: {}", response.would_delete)];
+                lines.extend(response.sessions.iter().map(ToString::to_string));
+                Ok(lines.join("\n"))
+            } else {
+                Ok(format!("deleted: {}", response.deleted))
+            }
         }
         Command::Ingest(_) => {
             let response: IngestResponse = parse_response(body)?;
@@ -695,6 +746,54 @@ fn render(command: &Command, body: &str) -> Result<String, CliError> {
         | Command::InstallHooks(_)
         | Command::InstallSkills(_) => Err(CliError::other("not a legacy response")),
     }
+}
+
+fn confirm_keep_session(client: &Client, cli: &Cli) -> Result<(), CliError> {
+    let Command::Sessions {
+        command:
+            SessionsCommand::Keep {
+                harness,
+                session,
+                project,
+                ..
+            },
+    } = &cli.command
+    else {
+        return Ok(());
+    };
+    let project = project_or_current(project)?;
+    let mut request = client
+        .get(endpoint(&cli.url, &["v1", "sessions"])?)
+        .query(&[("harness", harness.as_str()), ("project", project.as_str())]);
+    if let Some(token) = &cli.token {
+        request = request.bearer_auth(token);
+    }
+    let response = request
+        .send()
+        .map_err(|error| CliError::request(error, &cli.url))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .map_err(|error| CliError::other(format!("cannot read session list: {error}")))?;
+    if !status.is_success() {
+        return Err(response_error(status, &body));
+    }
+    #[derive(Deserialize)]
+    struct SessionsResponse {
+        sessions: Vec<SessionRecord>,
+    }
+    let records: SessionsResponse = parse_response(&body)?;
+    if !records.sessions.iter().any(|record| {
+        record.harness == *harness
+            && record.project == project
+            && record.session == *session
+            && record.deleted_at.is_none()
+    }) {
+        return Err(CliError::other(format!(
+            "session {harness}/{session} does not exist or is deleted in project {project}"
+        )));
+    }
+    Ok(())
 }
 
 fn select_digest_session(client: &Client, cli: &mut Cli) -> Result<(), CliError> {
@@ -761,7 +860,9 @@ fn run(mut cli: Cli) -> Result<(), CliError> {
     ) {
         return cross_harness::run(&cli);
     }
-    if let Command::Forget(args) = &cli.command {
+    if let Command::Forget(args) = &cli.command
+        && !args.dry_run
+    {
         let stdin = io::stdin();
         if !confirm_forget(&mut stdin.lock(), stdin.is_terminal(), args.yes)? {
             return Err(CliError::other("forget aborted"));
@@ -776,6 +877,7 @@ fn run(mut cli: Cli) -> Result<(), CliError> {
         .build()
         .map_err(|error| CliError::other(format!("cannot create HTTP client: {error}")))?;
     select_digest_session(&client, &mut cli)?;
+    confirm_keep_session(&client, &cli)?;
     let request = build_request(&client, &cli, ingest.as_ref())?;
     let response = client
         .execute(request)
@@ -1153,17 +1255,17 @@ mod tests {
             (
                 vec!["--session", "s"],
                 None,
-                json!({"harness":"h","project":null,"session":"s","scope":"session"}),
+                json!({"harness":"h","project":null,"session":"s","scope":"session","dry_run":false}),
             ),
             (
                 vec!["--lineage", "s"],
                 Some("p"),
-                json!({"harness":"h","project":"p","session":"s","scope":"lineage"}),
+                json!({"harness":"h","project":"p","session":"s","scope":"lineage","dry_run":false}),
             ),
             (
                 vec!["--whole-project"],
                 Some("p"),
-                json!({"harness":"h","project":"p","session":null,"scope":"project"}),
+                json!({"harness":"h","project":"p","session":null,"scope":"project","dry_run":false}),
             ),
         ] {
             let mut args = vec!["forget", "--harness", "h"];
@@ -1225,6 +1327,81 @@ mod tests {
         assert!(confirm_forget(&mut Cursor::new("Y\n"), true, false).unwrap());
         assert!(!confirm_forget(&mut Cursor::new("\n"), true, false).unwrap());
         assert!(!confirm_forget(&mut Cursor::new("yes\n"), true, false).unwrap());
+    }
+
+    #[test]
+    fn keep_request_preserves_other_fields_and_forget_preview_renders() {
+        for (off, retention) in [(false, "keep"), (true, "continuation")] {
+            let mut args = vec![
+                "sessions",
+                "keep",
+                "--harness",
+                "h",
+                "--session",
+                "s",
+                "--project",
+                "p",
+            ];
+            if off {
+                args.push("--off");
+            }
+            assert_eq!(
+                body(&request(&args)),
+                json!({"harness":"h","session":"s","project":"p","retention":retention})
+            );
+        }
+        let cli = parse(&["forget", "--harness", "h", "--session", "s", "--dry-run"]);
+        assert_eq!(
+            body(&build_request(&Client::new(), &cli, None).unwrap())["dry_run"],
+            true
+        );
+        assert_eq!(
+            render(
+                &cli.command,
+                r#"{"deleted":0,"would_delete":2,"sessions":[{"harness":"h","session":"s"}]}"#
+            )
+            .unwrap(),
+            "would delete: 2\nh/s"
+        );
+    }
+
+    #[test]
+    fn keep_checks_session_before_update() {
+        for (response, expected) in [
+            (
+                r#"{"sessions":[{"harness":"h","project":"p","session":"s","parent":null,"parent_harness":null,"title":null,"created":null}]}"#,
+                true,
+            ),
+            (r#"{"sessions":[]}"#, false),
+            (
+                r#"{"sessions":[{"harness":"h","project":"p","session":"s","parent":null,"parent_harness":null,"title":null,"created":null,"deleted_at":"2026-11-20T00:00:00Z"}]}"#,
+                false,
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                serve_once(
+                    listener,
+                    "GET",
+                    "/v1/sessions?harness=h&project=p",
+                    response,
+                )
+            });
+            let mut cli = parse(&[
+                "sessions",
+                "keep",
+                "--harness",
+                "h",
+                "--session",
+                "s",
+                "--project",
+                "p",
+            ]);
+            cli.url = url;
+            assert_eq!(confirm_keep_session(&Client::new(), &cli).is_ok(), expected);
+            server.join().unwrap();
+        }
     }
 
     fn serve_once(
