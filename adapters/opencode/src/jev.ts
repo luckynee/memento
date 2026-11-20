@@ -10,14 +10,11 @@ const scaffoldStripTags = new Set([
 export function stripScaffolding(text: string): string {
     let output = "";
     let position = 0;
-    const stripped: string[] = [];
+    const tags: { start: number; end: number; name: string; closing: boolean }[] = [];
     while (true) {
         const start = text.indexOf("<", position);
         if (start < 0) {
             break;
-        }
-        if (stripped.length === 0) {
-            output += text.slice(position, start);
         }
         const match = /^<(\/?)([a-zA-Z0-9_-]+)(?=>|\s)/u.exec(text.slice(start));
         let end = start + (match?.[0].length ?? 1);
@@ -35,31 +32,46 @@ export function stripScaffolding(text: string): string {
             }
         }
         if (!match || end > text.length || text[end - 1] !== ">" || quote) {
-            if (stripped.length === 0) {
-                output += "<";
-            }
             position = start + 1;
             continue;
         }
-        const name = match[2].toLowerCase();
-        if (scaffoldStripTags.has(name)) {
-            if (match[1]) {
-                if (stripped[stripped.length - 1] === name) {
-                    stripped.pop();
-                } else if (stripped.length === 0) {
-                    output += text.slice(start, end);
-                }
-            } else {
-                stripped.push(name);
-            }
-        } else if (stripped.length === 0 && name !== "command-args") {
-            output += text.slice(start, end);
-        }
+        tags.push({ start, end, name: match[2].toLowerCase(), closing: match[1] === "/" });
         position = end;
     }
-    if (stripped.length === 0) {
-        output += text.slice(position);
+    const matchingEnds = new Map<number, number>();
+    const openings = new Map<string, number[]>();
+    for (const [index, tag] of tags.entries()) {
+        if (!scaffoldStripTags.has(tag.name)) {
+            continue;
+        }
+        if (tag.closing) {
+            const opening = openings.get(tag.name)?.pop();
+            if (opening !== undefined) {
+                matchingEnds.set(opening, tag.end);
+            }
+        } else {
+            const sameName = openings.get(tag.name) ?? [];
+            sameName.push(index);
+            openings.set(tag.name, sameName);
+        }
     }
+    position = 0;
+    for (const [index, tag] of tags.entries()) {
+        if (tag.start < position) {
+            continue;
+        }
+        output += text.slice(position, tag.start);
+        const end = matchingEnds.get(index);
+        if (end !== undefined) {
+            position = end;
+        } else {
+            if (tag.name !== "command-args") {
+                output += text.slice(tag.start, tag.end);
+            }
+            position = tag.end;
+        }
+    }
+    output += text.slice(position);
     return output === text ? output : output.trim();
 }
 

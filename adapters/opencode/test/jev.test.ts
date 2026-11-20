@@ -50,6 +50,26 @@ test("user classification requires confidence and uses request instead of note",
     expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "assistant text")).toBe("decision");
 });
 
+test("scaffold regression preserves unclosed prose", () => {
+    const text = "We noticed <system-reminder> and kept the important decision.";
+    expect(stripScaffolding(text)).toBe(text);
+});
+
+test("scaffold regression preserves backticked mention", () => {
+    const text = "Check how `<system-reminder>` works before changing this.";
+    expect(stripScaffolding(text)).toBe(text);
+});
+
+test("scaffold regression handles interleaved names", () => {
+    const text = "Header <system-reminder>mentions <subagent> tag</system-reminder> IMPORTANT DECISION";
+    expect(stripScaffolding(text)).toBe("Header  IMPORTANT DECISION");
+});
+
+test("scaffold regression strips a complete block after an unclosed tag", () => {
+    const text = "Before <system-reminder> keep <subagent>hidden</subagent> after";
+    expect(stripScaffolding(text)).toBe("Before <system-reminder> keep  after");
+});
+
 test("strips the default Rust scaffolding tags and unwraps command arguments", () => {
     const tags = [
         "system-reminder", "skill_content", "environment_context", "user_instructions",
@@ -65,11 +85,11 @@ test("strips the default Rust scaffolding tags and unwraps command arguments", (
         ["a<subagent>outer<subagent>inner</subagent>end</subagent>b", "ab"],
         ["a<subagent>x</subagent><skill_content>y</skill_content>b", "ab"],
         ["a<subagent>x<system-reminder>y</system-reminder>z</subagent>b", "ab"],
-        ["a<system-reminder attr='x'>unfinished", "a"],
+        ["a<system-reminder attr='x'>unfinished", "a<system-reminder attr='x'>unfinished"],
         ["a<system-reminderish>keep</system-reminderish>b", "a<system-reminderish>keep</system-reminderish>b"],
         ["é<COMMAND-ARGS>🙂</COMMAND-ARGS>界", "é🙂界"],
         ["a</subagent>b", "a</subagent>b"],
-        [" a<subagent>unfinished", "a"],
+        [" a<subagent>unfinished", " a<subagent>unfinished"],
         [" a<subagent attr='unfinished>", " a<subagent attr='unfinished>"],
         ["  unchanged  ", "  unchanged  "],
     ];

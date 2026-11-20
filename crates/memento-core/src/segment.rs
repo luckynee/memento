@@ -109,38 +109,49 @@ fn scaffold_tag(text: &str, start: usize) -> Option<ScaffoldTag<'_>> {
 pub(crate) fn strip_scaffolding(text: &str, policy: &SegmentPolicy) -> String {
     let mut output = String::new();
     let mut position = 0;
-    let mut stripped = Vec::new();
+    let mut tags = Vec::new();
     while let Some(relative) = text[position..].find('<') {
         let start = position + relative;
-        if stripped.is_empty() {
-            output.push_str(&text[position..start]);
-        }
-        let Some(tag) = scaffold_tag(text, start) else {
-            if stripped.is_empty() {
-                output.push('<');
-            }
+        if let Some(tag) = scaffold_tag(text, start) {
+            position = tag.end;
+            tags.push((start, tag));
+        } else {
             position = start + 1;
-            continue;
-        };
+        }
+    }
+    let mut matching_ends = vec![None; tags.len()];
+    let mut openings = std::collections::HashMap::<String, Vec<usize>>::new();
+    for (index, (_, tag)) in tags.iter().enumerate() {
         let name = tag.name.to_ascii_lowercase();
         if policy.scaffold_strip_tags.contains(&name) {
             if tag.closing {
-                if stripped.last() == Some(&name) {
-                    stripped.pop();
-                } else if stripped.is_empty() {
-                    output.push_str(&text[start..tag.end]);
+                if let Some(opening) = openings.get_mut(&name).and_then(Vec::pop) {
+                    matching_ends[opening] = Some(tag.end);
                 }
             } else {
-                stripped.push(name);
+                openings.entry(name).or_default().push(index);
             }
-        } else if stripped.is_empty() && !policy.scaffold_unwrap_tags.contains(&name) {
-            output.push_str(&text[start..tag.end]);
         }
-        position = tag.end;
     }
-    if stripped.is_empty() {
-        output.push_str(&text[position..]);
+    position = 0;
+    for (index, (start, tag)) in tags.iter().enumerate() {
+        if *start < position {
+            continue;
+        }
+        output.push_str(&text[position..*start]);
+        let name = tag.name.to_ascii_lowercase();
+        if let Some(end) = matching_ends[index] {
+            position = end;
+        } else {
+            if !policy.scaffold_unwrap_tags.contains(&name)
+                || policy.scaffold_strip_tags.contains(&name)
+            {
+                output.push_str(&text[*start..tag.end]);
+            }
+            position = tag.end;
+        }
     }
+    output.push_str(&text[position..]);
     if output == text {
         output
     } else {
@@ -1197,6 +1208,37 @@ mod tests {
     }
 
     #[test]
+    fn scaffold_regression_unclosed_prose() {
+        let text = "We noticed <system-reminder> and kept the important decision.";
+        assert_eq!(strip_default_scaffolding(text), text);
+    }
+
+    #[test]
+    fn scaffold_regression_backticked_mention() {
+        let text = "Check how `<system-reminder>` works before changing this.";
+        assert_eq!(strip_default_scaffolding(text), text);
+    }
+
+    #[test]
+    fn scaffold_regression_interleaved_names() {
+        let text =
+            "Header <system-reminder>mentions <subagent> tag</system-reminder> IMPORTANT DECISION";
+        assert_eq!(
+            strip_default_scaffolding(text),
+            "Header  IMPORTANT DECISION"
+        );
+    }
+
+    #[test]
+    fn scaffold_regression_unclosed_then_complete() {
+        let text = "Before <system-reminder> keep <subagent>hidden</subagent> after";
+        assert_eq!(
+            strip_default_scaffolding(text),
+            "Before <system-reminder> keep  after"
+        );
+    }
+
+    #[test]
     fn scaffold_unwrap_nested_adjacent_case_and_unclosed() {
         let policy = SegmentPolicy::default();
         let cases = [
@@ -1214,7 +1256,10 @@ mod tests {
                 "a<subagent>x<system-reminder>y</system-reminder>z</subagent>b",
                 "ab",
             ),
-            ("a<system-reminder attr='x'>unfinished", "a"),
+            (
+                "a<system-reminder attr='x'>unfinished",
+                "a<system-reminder attr='x'>unfinished",
+            ),
             (
                 "a<system-reminderish>keep</system-reminderish>b",
                 "a<system-reminderish>keep</system-reminderish>b",
@@ -1255,8 +1300,9 @@ mod tests {
             true,
         ));
         let outcome = run(items, &policy);
-        assert_eq!(outcome.skipped, 9);
-        assert_eq!(outcome.segments.len(), 1);
-        assert_eq!(outcome.segments[0].text, "memento-other");
+        assert_eq!(outcome.skipped, 8);
+        assert_eq!(outcome.segments.len(), 2);
+        assert_eq!(outcome.segments[0].text, "<subagent>unclosed");
+        assert_eq!(outcome.segments[1].text, "memento-other");
     }
 }
