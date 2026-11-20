@@ -726,7 +726,6 @@ fn render(command: &Command, body: &str) -> Result<String, CliError> {
                         .text
                         .chars()
                         .map(|ch| if ch.is_whitespace() { ' ' } else { ch })
-                        .take(160)
                         .collect();
                     let kind =
                         serde_json::to_value(hit.kind).expect("kind serialization is infallible");
@@ -1070,6 +1069,32 @@ mod tests {
             "total  0"
         );
         assert!(render(&cli.command, r#"{"total":0,"by_kind":[]}"#).is_err());
+    }
+
+    #[test]
+    fn search_output_preserves_full_hit_text_on_one_line() {
+        let cli = parse(&["search", "sandbox"]);
+        let preamble = "é".repeat(210);
+        let text = format!("{preamble}\nits sandbox key prefix is\tTEST_");
+        let response = json!({
+            "hits": [{
+                "id": "00000000-0000-0000-0000-000000000001",
+                "score": 0.75,
+                "kind": "decision",
+                "text": text,
+                "harness": "claude",
+                "session": "s",
+                "ts": "2026-11-18T10:00:00Z",
+                "path": "src/a.rs"
+            }]
+        });
+        let output = render(&cli.command, &response.to_string()).unwrap();
+        assert_eq!(
+            output,
+            format!(
+                "0.750  decision  claude/s  2026-11-18 10:00:00 UTC  src/a.rs  {preamble} its sandbox key prefix is TEST_"
+            )
+        );
     }
 
     #[test]
