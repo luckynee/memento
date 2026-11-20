@@ -898,24 +898,57 @@ fn select_digest_session(client: &Client, cli: &mut Cli) -> Result<(), CliError>
         sessions: Vec<SessionRecord>,
     }
     let response: SessionsResponse = parse_response(&body)?;
-    let session = response
+    let mut sessions: Vec<_> = response
         .sessions
         .into_iter()
         .filter(|record| record.project == project && record.deleted_at.is_none())
-        .max_by(|left, right| {
-            left.last_active_at
-                .cmp(&right.last_active_at)
-                .then_with(|| left.harness.cmp(&right.harness))
-                .then_with(|| left.session.cmp(&right.session))
-        })
+        .collect();
+    sessions.sort_by(|left, right| {
+        right
+            .last_active_at
+            .cmp(&left.last_active_at)
+            .then_with(|| right.harness.cmp(&left.harness))
+            .then_with(|| right.session.cmp(&left.session))
+    });
+    let mut session = sessions
+        .first()
         .ok_or_else(|| CliError::other(format!("no active sessions in project {project}")))?;
+    for candidate in sessions.iter().take(10) {
+        let mut request = client.get(endpoint(&cli.url, &["v1", "stats"])?).query(&[
+            ("harness", candidate.harness.as_str()),
+            ("project", project.as_str()),
+            ("session", candidate.session.as_str()),
+        ]);
+        if let Some(token) = &cli.token {
+            request = request.bearer_auth(token);
+        }
+        let stats = request
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .and_then(reqwest::blocking::Response::text)
+            .ok()
+            .and_then(|body| parse_response::<StatsResponse>(&body).ok());
+        let Some(stats) = stats else {
+            break;
+        };
+        if stats
+            .by_kind
+            .iter()
+            .any(|(kind, count)| kind != "user_request" && *count > 0)
+        {
+            session = candidate;
+            break;
+        }
+    }
     eprintln!("digest session: {}/{}", session.harness, session.session);
+    let harness = session.harness.clone();
+    let session = session.session.clone();
     let Command::Digest(args) = &mut cli.command else {
         unreachable!()
     };
     args.project = Some(project);
-    args.harness = Some(session.harness);
-    args.session = Some(session.session);
+    args.harness = Some(harness);
+    args.session = Some(session);
     Ok(())
 }
 
@@ -1649,6 +1682,171 @@ mod tests {
             assert_eq!(body["scope"], "lineage");
         }
         write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+    }
+
+    fn digest_selection_server(
+        stats: Vec<(&'static str, &'static str)>,
+    ) -> (String, thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("cannot accept request: {error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let path = line.split_whitespace().nth(1).unwrap().to_owned();
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                let response = if path == "/v1/sessions?project=p" {
+                    r#"{"sessions":[{"harness":"h","project":"p","session":"older","last_active_at":"2026-11-19T00:00:00Z"},{"harness":"h","project":"p","session":"newer","last_active_at":"2026-11-20T00:00:00Z"}]}"#
+                } else {
+                    stats
+                        .iter()
+                        .find(|(expected, _)| *expected == path)
+                        .map(|(_, response)| *response)
+                        .unwrap_or("{}")
+                };
+                requests.push(path);
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+            }
+            requests
+        });
+        (url, server)
+    }
+
+    #[test]
+    fn digest_selection_skips_question_only_session() {
+        let (url, server) = digest_selection_server(vec![
+            (
+                "/v1/stats?harness=h&project=p&session=newer",
+                r#"{"total":1,"by_kind":{"user_request":1}}"#,
+            ),
+            (
+                "/v1/stats?harness=h&project=p&session=older",
+                r#"{"total":1,"by_kind":{"assistant_note":1}}"#,
+            ),
+        ]);
+        let mut cli = parse(&["digest", "--project", "p"]);
+        cli.url = url;
+        let result = select_digest_session(&Client::new(), &mut cli);
+        let requests = server.join().unwrap();
+        result.unwrap();
+        let Command::Digest(args) = cli.command else {
+            panic!("expected digest command");
+        };
+        assert_eq!(args.session.as_deref(), Some("older"));
+        assert_eq!(
+            requests,
+            [
+                "/v1/sessions?project=p",
+                "/v1/stats?harness=h&project=p&session=newer",
+                "/v1/stats?harness=h&project=p&session=older",
+            ]
+        );
+    }
+
+    #[test]
+    fn digest_selection_falls_back_to_newest_session() {
+        let (url, server) = digest_selection_server(vec![
+            (
+                "/v1/stats?harness=h&project=p&session=newer",
+                r#"{"total":1,"by_kind":{"user_request":1,"assistant_note":0}}"#,
+            ),
+            (
+                "/v1/stats?harness=h&project=p&session=older",
+                r#"{"total":0,"by_kind":{}}"#,
+            ),
+        ]);
+        let mut cli = parse(&["digest", "--project", "p"]);
+        cli.url = url;
+        let result = select_digest_session(&Client::new(), &mut cli);
+        let requests = server.join().unwrap();
+        result.unwrap();
+        let Command::Digest(args) = cli.command else {
+            panic!("expected digest command");
+        };
+        assert_eq!(args.session.as_deref(), Some("newer"));
+        assert_eq!(
+            requests,
+            [
+                "/v1/sessions?project=p",
+                "/v1/stats?harness=h&project=p&session=newer",
+                "/v1/stats?harness=h&project=p&session=older",
+            ]
+        );
+    }
+
+    #[test]
+    fn digest_selection_falls_back_when_stats_fail() {
+        let (url, server) = digest_selection_server(vec![
+            (
+                "/v1/stats?harness=h&project=p&session=newer",
+                r#"{"total":1,"by_kind":{"user_request":1}}"#,
+            ),
+            ("/v1/stats?harness=h&project=p&session=older", "invalid"),
+        ]);
+        let mut cli = parse(&["digest", "--project", "p"]);
+        cli.url = url;
+        let result = select_digest_session(&Client::new(), &mut cli);
+        let requests = server.join().unwrap();
+        result.unwrap();
+        let Command::Digest(args) = cli.command else {
+            panic!("expected digest command");
+        };
+        assert_eq!(args.session.as_deref(), Some("newer"));
+        assert_eq!(
+            requests,
+            [
+                "/v1/sessions?project=p",
+                "/v1/stats?harness=h&project=p&session=newer",
+                "/v1/stats?harness=h&project=p&session=older",
+            ]
+        );
+    }
+
+    #[test]
+    fn digest_selection_explicit_session_makes_no_stats_calls() {
+        let (url, server) = digest_selection_server(vec![]);
+        let mut cli = parse(&[
+            "digest",
+            "--project",
+            "p",
+            "--harness",
+            "h",
+            "--session",
+            "explicit",
+        ]);
+        cli.url = url;
+        let result = select_digest_session(&Client::new(), &mut cli);
+        let requests = server.join().unwrap();
+        result.unwrap();
+        let Command::Digest(args) = cli.command else {
+            panic!("expected digest command");
+        };
+        assert_eq!(args.session.as_deref(), Some("explicit"));
+        assert!(requests.is_empty(), "{requests:?}");
     }
 
     #[test]

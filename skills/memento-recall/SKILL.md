@@ -19,7 +19,7 @@ Use when earlier session context may answer a question or guide continued work.
    memento stats
    ```
 
-2. Search defaults to all harnesses in the current project. Use `--scope global` for all projects, or `--harness H --session S` for lineage and add `--scope session` for one session. Digest selects the most recently active session and reports it on stderr; use `--harness H --session S` to select one explicitly.
+2. Search defaults to all harnesses in the current project. Use `--scope global` for all projects, or `--harness H --session S` for lineage and add `--scope session` for one session. Digest checks up to 10 most recently active non-deleted sessions and selects the first with a non-`user_request` segment, falling back to the most recently active if none qualifies or a stats request fails; it reports the selected session on stderr. Use `--harness H --session S` to select one explicitly.
 3. OpenCode `memory_search`, MCP `memory_search`, and MCP `memory_digest` are alternatives. Narrow or broaden the search scope only as needed.
 
 ## Verify

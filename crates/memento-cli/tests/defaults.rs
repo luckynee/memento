@@ -92,6 +92,21 @@ fn defaults_use_cwd_and_digest_selects_latest_active_session() {
         let (line, _) = read_request(&stream);
         let target = line.split_whitespace().nth(1).unwrap();
         let query = reqwest::Url::parse(&format!("http://localhost{target}")).unwrap();
+        assert_eq!(query.path(), "/v1/stats");
+        assert_eq!(
+            query.query_pairs().collect::<Vec<_>>(),
+            vec![
+                ("harness".into(), "codex".into()),
+                ("project".into(), expected_project.clone().into()),
+                ("session".into(), "latest".into()),
+            ]
+        );
+        respond(&mut stream, &json!({"total":1,"by_kind":{"decision":1}}));
+
+        let (mut stream, _) = listener.accept().unwrap();
+        let (line, _) = read_request(&stream);
+        let target = line.split_whitespace().nth(1).unwrap();
+        let query = reqwest::Url::parse(&format!("http://localhost{target}")).unwrap();
         assert_eq!(query.path(), "/v1/digest");
         let pairs = query.query_pairs().collect::<Vec<_>>();
         assert!(pairs.contains(&("harness".into(), "codex".into())));

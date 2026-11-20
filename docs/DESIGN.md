@@ -200,7 +200,7 @@ The release binary embeds the OpenCode plugin bundle, harness skills, and daemon
 - `sessions keep --harness H --session S [--project P] [--off]` (checks the session exists and is not deleted, then sets `keep` or restores `continuation`; project defaults to the current project)
 - `sessions lineage --harness H --session S`
 - `search <query> [--harness H] [--project P] [--session S] [--scope session|lineage|project|global] [--k 8] [--kind KIND]...` (current project by default; session and lineage require harness and session)
-- `digest [--harness H --session S] [--project P] [--budget N] [--profile default|subagent]` (current project and its most recently active non-deleted session by default; selected session reported on stderr)
+- `digest [--harness H --session S] [--project P] [--budget N] [--profile default|subagent]` (current project by default; checks up to 10 most recently active non-deleted sessions and selects the first with a non-`user_request` segment, falling back to the most recently active if none qualifies or a stats request fails; selected session reported on stderr)
 - `forget --harness H [--project P] (--session S | --lineage S | --whole-project) [--yes] [--dry-run]` (`--whole-project` requires `--project`; without `--yes` it asks on a TTY and refuses otherwise; dry runs never prompt and report matching segments and sessions)
 - `gc [--project DIR] [--dry-run] [--json]` releases sessions whose harness data is gone.
 - `ingest --file turns.json|-` (neutral schema, for harnesses without a plugin)
