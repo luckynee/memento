@@ -28,7 +28,7 @@ use memento_core::{
     segment::{SegmentPolicy, segment_items},
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, oneshot};
 
 use crate::{
     config::Config,
@@ -44,11 +44,22 @@ pub struct AppState {
 }
 
 #[derive(Clone)]
-struct RouterState {
+pub struct RouterState {
     app: AppState,
     registry_lock: Arc<Mutex<()>>,
     operation_lock: Arc<RwLock<()>>,
     session_locks: Arc<std::sync::Mutex<HashMap<SessionKey, Weak<Mutex<()>>>>>,
+}
+
+impl RouterState {
+    pub fn new(app: AppState) -> Self {
+        Self {
+            app,
+            registry_lock: Arc::new(Mutex::new(())),
+            operation_lock: Arc::new(RwLock::new(())),
+            session_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
 }
 
 fn validate_link(
@@ -84,31 +95,35 @@ fn validate_link(
 }
 
 pub fn router(state: AppState) -> Router {
-    let state = RouterState {
-        app: state,
-        registry_lock: Arc::new(Mutex::new(())),
-        operation_lock: Arc::new(RwLock::new(())),
-        session_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
-    };
-    if state.app.config.stale_secs > 0 {
-        let sweep_state = state.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-                sweep_state.app.config.stale_sweep_secs.max(1),
-            ));
-            interval.tick().await;
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            loop {
-                if sweep_projects(&sweep_state, None, false, Utc::now())
-                    .await
-                    .is_err()
-                {
-                    tracing::error!("background stale sweep failed");
-                }
-                interval.tick().await;
-            }
-        });
+    router_with_state(RouterState::new(state))
+}
+
+pub async fn run_stale_sweep(state: RouterState, mut shutdown: oneshot::Receiver<()>) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+        state.app.config.stale_sweep_secs.max(1),
+    ));
+    interval.tick().await;
+    tokio::select! {
+        _ = &mut shutdown => return,
+        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
     }
+    loop {
+        if let Err(error) = sweep_projects(&state, None, false, Utc::now()).await {
+            tracing::error!(
+                code = error.code,
+                message = error.message,
+                "background stale sweep failed"
+            );
+        }
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => return,
+            _ = interval.tick() => {}
+        }
+    }
+}
+
+pub fn router_with_state(state: RouterState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/sessions", get(list_sessions).put(put_session))
@@ -1542,6 +1557,41 @@ async fn stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stale_sweep_stops_after_cancellation() {
+        let client = qdrant_client::Qdrant::from_url("http://127.0.0.1:6334")
+            .build()
+            .unwrap();
+        let state = RouterState::new(AppState {
+            store: Arc::new(Store::new(
+                client,
+                "sweep_test",
+                Arc::new(crate::embed::FakeEmbedder),
+            )),
+            config: Config {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                qdrant_url: "http://127.0.0.1:6334".into(),
+                token: None,
+                collection_prefix: "sweep_test".into(),
+                cache_dir: None,
+                duplicate_cosine_threshold: 0.95,
+                duplicate_jaccard_threshold: 0.8,
+                stale_secs: 1,
+                stale_sweep_secs: 3600,
+            },
+            policy: Default::default(),
+            rerank: Default::default(),
+        });
+        let (sender, receiver) = oneshot::channel();
+        let sweep = tokio::spawn(run_stale_sweep(state, receiver));
+        tokio::task::yield_now().await;
+        sender.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), sweep)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     #[test]
     fn bearer_authentication() {

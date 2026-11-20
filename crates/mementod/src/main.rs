@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use mementod::{
     config::Config,
     embed::FastEmbedder,
-    routes::{AppState, backfill_activity, router},
+    routes::{AppState, RouterState, backfill_activity, router_with_state, run_stale_sweep},
     store::Store,
 };
 use qdrant_client::Qdrant;
@@ -46,7 +46,7 @@ async fn main() -> Result<()> {
     backfill_activity(&store, chrono::Utc::now())
         .await
         .context("backfilling session activity")?;
-    let router = router(AppState {
+    let state = RouterState::new(AppState {
         store: Arc::new(store),
         config: config.clone(),
         policy: Default::default(),
@@ -55,11 +55,25 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .context("binding HTTP listener")?;
+    let (sweep_shutdown, receiver) = tokio::sync::oneshot::channel();
+    let sweep_handle = if config.stale_secs > 0 {
+        let handle = tokio::spawn(run_stale_sweep(state.clone(), receiver));
+        Some(handle)
+    } else {
+        None
+    };
+    let router = router_with_state(state);
     tracing::info!(address = %config.bind, "serving HTTP");
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown())
-        .await
-        .context("serving HTTP")?;
+    let server_result = axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            shutdown().await;
+            drop(sweep_shutdown);
+        })
+        .await;
+    if let Some(handle) = sweep_handle {
+        handle.await.context("joining background stale sweep")?;
+    }
+    server_result.context("serving HTTP")?;
     Ok(())
 }
 
