@@ -69,10 +69,10 @@ describe("daemon client", () => {
             }) as typeof fetch,
         });
         const identity = { harness: "h", project: "p", session: "s" };
-        await client.putSession({ ...identity, parent: "parent", require_parent: true });
+        await client.putSession({ ...identity, parent: "parent", parent_cutoff: "2026-11-20T12:00:00.000Z", require_parent: true });
         expect(await client.releaseSession(identity)).toEqual({ released: true, removed: [{ harness: "h", session: "s" }] });
         expect(calls).toEqual([
-            { path: "/v1/sessions", method: "PUT", body: { ...identity, parent: "parent", require_parent: true } },
+            { path: "/v1/sessions", method: "PUT", body: { ...identity, parent: "parent", parent_cutoff: "2026-11-20T12:00:00.000Z", require_parent: true } },
             { path: "/v1/sessions/release", method: "POST", body: identity },
         ]);
     });

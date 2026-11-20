@@ -7,7 +7,7 @@ import type { IngestItem } from "../src/transcript";
 const user = (id: string) => ({ id, type: "user", time: { created: 0 }, text: id });
 const assistant = (id: string, text: string) => ({ id, type: "assistant", time: { created: 0 }, content: [{ type: "text", text }] });
 
-function setup(decide?: DecisionsFn, loadSession?: (sessionID: string) => Promise<{ fork?: { sessionID: string }; time: { created: number } }>) {
+function setup(decide?: DecisionsFn, loadSession?: (sessionID: string) => Promise<{ fork?: { sessionID: string }; time: { created: number | Date | string } }>) {
     const values = new Map<string, unknown>();
     const contexts = new Map<string, unknown[]>();
     const puts: unknown[] = [];
@@ -51,9 +51,34 @@ describe("incremental ingestion", () => {
         ]);
         await fake.ingestor.ensureRegistered("fork");
         await fake.ingestor.flush("fork");
-        expect(fake.puts).toEqual([{ harness: "opencode", project: "p", session: "fork", parent_harness: "opencode", parent: "parent", require_parent: true }]);
+        expect(fake.puts).toEqual([{ harness: "opencode", project: "p", session: "fork", parent_harness: "opencode", parent: "parent", parent_cutoff: "1970-01-01T00:00:00.100Z", require_parent: true }]);
         expect(fake.ingests[0].items.map((item) => item.source_id)).toEqual(["new-user", "new-assistant:text:0"]);
         expect(fake.values.get("memento/ingest/fork")).toBe("new-assistant");
+    });
+
+    test("normalizes numeric, Date, and string fork creation times", async () => {
+        for (const created of [100, new Date(100), "1970-01-01T01:00:00.100+01:00"]) {
+            const fake = setup(undefined, async () => ({ fork: { sessionID: "parent" }, time: { created } }));
+            fake.contexts.set("fork", [
+                { ...user("copied"), time: { created: 99 } },
+                { ...user("new"), time: { created: 100 } },
+            ]);
+            await fake.ingestor.flush("fork");
+            expect(fake.puts).toEqual([{ harness: "opencode", project: "p", session: "fork", parent_harness: "opencode", parent: "parent", parent_cutoff: "1970-01-01T00:00:00.100Z", require_parent: true }]);
+            expect(JSON.parse(String(fake.values.get("memento/fork/fork")))).toEqual({ sessionID: "parent", created: 100 });
+            expect(fake.ingests[0].items.map((item) => item.source_id)).toEqual(["new"]);
+        }
+    });
+
+    test("invalid fork creation times log and backfill without a parent", async () => {
+        for (const created of [Number.NaN, new Date(Number.NaN), "invalid", 9e15]) {
+            const fake = setup(undefined, async () => ({ fork: { sessionID: "parent" }, time: { created } }));
+            fake.contexts.set("fork", [user("copied")]);
+            await fake.ingestor.flush("fork");
+            expect(fake.puts).toEqual([{ harness: "opencode", project: "p", session: "fork" }]);
+            expect(fake.ingests[0].items.map((item) => item.source_id)).toEqual(["copied"]);
+            expect(fake.errors).toHaveLength(1);
+        }
     });
 
     test("backfills a fork when its parent is unavailable", async () => {
@@ -83,7 +108,7 @@ describe("incremental ingestion", () => {
         });
         await ingestor.flush("fork");
         expect(puts).toEqual([
-            { harness: "opencode", project: "p", session: "fork", parent_harness: "opencode", parent: "parent", require_parent: true },
+            { harness: "opencode", project: "p", session: "fork", parent_harness: "opencode", parent: "parent", parent_cutoff: "1970-01-01T00:00:00.100Z", require_parent: true },
             { harness: "opencode", project: "p", session: "fork" },
         ]);
         expect(values.has("memento/fork/fork")).toBe(false);

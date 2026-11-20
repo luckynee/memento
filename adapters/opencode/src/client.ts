@@ -17,6 +17,7 @@ export type SessionIdentity = {
 export type SessionRecord = SessionIdentity & {
     parent?: string;
     parent_harness?: string;
+    parent_cutoff?: string;
     require_parent?: boolean;
     retention?: string;
     title?: string;

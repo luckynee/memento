@@ -14,7 +14,7 @@ export function createIngestor(deps: {
     client: Pick<MementoClient, "putSession" | "ingest" | "claimContinuation">;
     storage: Storage;
     loadContext(sessionID: string): Promise<unknown[]>;
-    loadSession?(sessionID: string): Promise<{ fork?: { sessionID: string }; time: { created: number } }>;
+    loadSession?(sessionID: string): Promise<{ fork?: { sessionID: string }; time: { created: number | Date | string } }>;
     putInstruction(sessionID: string, key: string, value: string): Promise<unknown>;
     decide?: DecisionsFn;
     jevModel: JevModel;
@@ -63,11 +63,12 @@ export function createIngestor(deps: {
             try {
                 const session = await deps.loadSession(sessionID);
                 if (session.fork) {
+                    const created = new Date(session.time.created).getTime();
                     if (typeof session.fork.sessionID !== "string" || !session.fork.sessionID
-                        || typeof session.time?.created !== "number" || !Number.isFinite(session.time.created)) {
+                        || !Number.isFinite(created)) {
                         throw new Error("Fork parent or creation time is missing");
                     }
-                    fork = { sessionID: session.fork.sessionID, created: session.time.created };
+                    fork = { sessionID: session.fork.sessionID, created };
                     await deps.storage.set(`memento/fork/${sessionID}`, JSON.stringify(fork));
                 }
             } catch (error) {
@@ -114,7 +115,7 @@ export function createIngestor(deps: {
             try {
                 await deps.client.putSession({
                     ...identity,
-                    ...(fork && !hasClaimedParent ? { parent_harness: deps.harness, parent: fork.sessionID, require_parent: true } : {}),
+                    ...(fork && !hasClaimedParent ? { parent_harness: deps.harness, parent: fork.sessionID, parent_cutoff: new Date(fork.created).toISOString(), require_parent: true } : {}),
                 });
             } catch (error) {
                 if (!fork || hasClaimedParent || !(error instanceof MementoError) || error.code !== "parent_unavailable") {
