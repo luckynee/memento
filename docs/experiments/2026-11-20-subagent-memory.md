@@ -49,3 +49,38 @@ Claude Code:
 agy (Gemini 4 Argon) recommended default-on for OpenCode and Claude Code with a filtered digest (declarative decisions and constraints, no raw past imperatives or the parent's in-flight delegation turn), Codex opt-in until tested, and flagged the same validity limits.
 
 Scripts used: `/tmp/memento-exp/scripts/{exp.py,claude_exp.py,claude_subagent_hook.py,analyze.py}` (ephemeral).
+
+## Round 2: long noisy parent, natural delegation (2026-11-20)
+
+Setup changes:
+- Parent: 40 real turns per harness (file edits, commands, chatter, 10 decisions, two of them corrected later: retries 5 -> 7 with 250 ms backoff, TTL 30 s -> 45 s). Each trial forks the parent and resets the workspace to the parent's files.
+- Natural delegation: the parent writes the subagent prompt itself ("delegate this to the X subagent"). The number of agreed facts the parent put into the prompt was measured (not possible for Codex: its `spawn_agent` message is encrypted in the rollout).
+- Conditions: `none`, `digest` (full parent digest), `filtered` (`profile=subagent`: no parent in-flight request, no acknowledgements under 40 chars). Codex also `native` (`fork_turns="all"`, memento off); Codex memento conditions ask the parent for `fork_turns="none"`.
+- Product code under test: OpenCode adapter `subagentMemoryAgents` (cd627ed1), CLI `SubagentStart` hooks (b5a7fc93), Codex fork linking (fb585812), 12000-char subagent budget (72246d2e). Models: OpenCode and Codex `gpt-6-luna`, Claude Code Haiku, parent and child the same.
+- Stopped early at 133 trials (target about 300); cells hold 2-6 valid trials. Stronger models (GPT-6.1 Terra, Sonnet) were dropped on request; their 11 pilot trials are excluded.
+
+Bugs found by the pilot and fixed before the counted run: Codex forks were not linked to their parent (memory nearly empty); a 6000-char subagent budget dropped 4-5 of 10 facts on a 40-turn parent; the implement task lacked quota limits, so GPT-6.1 Terra refused in every condition.
+
+Results (quality = facts in `docs/CONVENTIONS.md` out of 11 for recall, convention checks out of 9 for implement; tokens and seconds are subagent means):
+
+| harness | condition | recall | implement | control | first request tokens | total prompt tokens recall / implement | subagent secs recall / implement |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| OpenCode | none | 6.0 | 6.25 | 4/4 | 12,441 | 165k / 283k | 32.6 / 63.4 |
+| OpenCode | digest | 11.0 | 6.75 | 4/4 | 15,004 | 149k / 201k | 22.9 / 45.2 |
+| OpenCode | filtered | 11.0 | 5.0 | 4/4 | 14,906 | 112k / 181k | 21.7 / 35.8 |
+| Claude Code | none | 11.0 | 7.5 | 6/6 | 14,630 | 42k / 103k | 7.6 / 19.0 |
+| Claude Code | digest | 11.0 | 7.33 | 5/5 | 15,846 | 56k / 102k | 13.6 / 23.4 |
+| Claude Code | filtered | 11.0 | 7.0 | 5/5 | 15,873 | 57k / 123k | 12.4 / 24.1 |
+| Codex | none | 7.5 | 6.67 | 3/3 | 18,860 | 172k / 147k | 31.8 / 39.4 |
+| Codex | digest | 11.0 | 8.67 | 3/3 | 21,467 | 76k / 135k | 15.0 / 32.3 |
+| Codex | filtered | 10.75 | 6.67 | 3/3 | 21,398 | 82k / 133k | 15.4 / 33.3 |
+| Codex | native | 11.0 | 8.0 (n=1) | 3/3 | 92,006 | 231k / 1,041k | 13.3 / 75.3 |
+
+- The parent's own prompt decides most of the outcome. Claude Haiku parents put all 10 facts into every recall prompt, so memory changed nothing there. OpenCode `gpt-6-luna` parents often passed few: with at most 3 facts in the prompt, recall was 2.67/11 without memory (n=3) and 11/11 with it.
+- Memory made subagents cheaper overall in OpenCode and Codex: a larger first request (+2.5k tokens), but fewer exploration steps, lower total prompt tokens and shorter runs. In Claude Code it added about 1.2k tokens and 4-6 s with no quality change.
+- Codex `native` full-context forking matched memento's recall quality at 4.3 times the first-request tokens (92k vs 21k).
+- `filtered` gave no measurable benefit over `digest` and scored lower on implement in OpenCode and Codex.
+- Old values were never used as current: all 19 docs that mentioned 5 attempts or 30 s marked them as superseded.
+- Off-task: 0 "Noted."-style answers in 133 trials; one OpenCode `filtered` implement produced no file.
+- Codex parents did not delegate (or no subagent was recorded) in 10 of 44 trials, spread across conditions.
+- Limits: small cells after the early stop, cheap models only, one parent session per harness.
