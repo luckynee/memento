@@ -165,6 +165,24 @@ test("caches empty digest without injecting", async () => {
     expect(values.get("memento/subagent/child")).toBe("");
 });
 
+test("caches a header-only zero-segment digest without injecting", async () => {
+    const { deps, calls, values } = fixture();
+    deps.client.digest = async () => {
+        calls.push("header-only");
+        return { text: "# Session memory (memento)\nharness: opencode | project: project | lineage: root", segments: 0 };
+    };
+    const controller = createSubagentMemoryController(deps);
+    const first = event();
+    const second = event();
+    const before = JSON.stringify(first);
+    await controller.onContext(first);
+    await createSubagentMemoryController(deps).onContext(second);
+    expect(values.get("memento/subagent/child")).toBe("");
+    expect(JSON.stringify(first)).toBe(before);
+    expect(JSON.stringify(second)).toBe(before);
+    expect(calls.filter((call) => call === "header-only")).toHaveLength(1);
+});
+
 test("lookup, root, flush, digest, and storage errors leave the request untouched and log", async () => {
     for (const failure of ["lookup", "root", "flush", "digest", "get", "set"] as const) {
         const { deps, logs } = fixture();

@@ -66,7 +66,7 @@ export function createSubagentMemoryController(deps: {
             budget: deps.budget,
             ...(mode === "filtered" ? { profile: "subagent" as const } : {}),
         });
-        const text = digest.text.trim() ? frameParentMemory(digest.text) : "";
+        const text = digest.segments > 0 && digest.text.trim() ? frameParentMemory(digest.text) : "";
         await deps.storage.set(key, text);
         return text || undefined;
     }
