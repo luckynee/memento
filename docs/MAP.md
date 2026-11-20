@@ -8,15 +8,15 @@
 | `crates/memento-core/src/segment.rs` | `SegmentPolicy` (tool sets, truncation and chunk limits) and `segment_items` |
 | `crates/memento-core/src/ids.rs` | `POINT_NAMESPACE`: changing it changes every stored point id |
 | `crates/memento-core/src/lineage.rs` | `ancestors`, `descendants`, `would_create_cycle` |
-| `crates/memento-core/src/rerank.rs` | RRF normalization + recency rerank (no wall clock); question `user_request` factor 0.6, absence-only factor 0.4 |
+| `crates/memento-core/src/rerank.rs` | RRF normalization + recency rerank (no wall clock); question `user_request` factor 0.6, absence-only factor 0.4; identifier bonus proportional to token-boundary matches |
 | `crates/memento-core/src/absence.rs` | `is_absence_statement`: shared by digest (skip) and rerank (penalty); phrase heuristics, not semantic |
 | `crates/memento-core/src/digest.rs` | `render_digest`, `merge_chunks`; byte-stable output |
-| `crates/mementod/src/routes.rs` | All HTTP routes, bearer auth, error mapping |
+| `crates/mementod/src/routes.rs` | All HTTP routes, bearer auth, error mapping; `RouterState` (shared locks) and `run_stale_sweep`, started and joined by `main.rs` (`router()` spawns nothing) |
 | `crates/mementod/src/store.rs` | Qdrant schema, segment upsert (dense + bm25 Document), hybrid RRF candidates, session registry, continuation slots per `(project, target_harness)` (`list_continuations` keeps legacy project-only ids) |
 | `crates/mementod/src/embed.rs` | `Embedder` trait, `FastEmbedder` (spawn_blocking), `FakeEmbedder` for tests |
 | `crates/mementod/tests/` | Live Qdrant tests, gated on `MEMENTO_TEST_QDRANT_URL` |
 | `crates/memento-cli/src/main.rs` | `memento` CLI, HTTP client of mementod |
-| `adapters/opencode/src/` | OpenCode V2 plugin: `client`, `transcript`, `ingest`, `session-ownership`, `switch` (pure rewrite), `switch-controller`, `subagent-memory` (opt-in parent digest for child sessions), `tools`, `commands`, `options`, `index` |
+| `adapters/opencode/src/` | OpenCode V2 plugin: `client`, `transcript`, `ingest`, `session-ownership` (`normalizeDirectory` for `global` projects), `jev` (`stripScaffolding`, `forEachJevItem` 4-way concurrency for ingest and search), `switch` (pure rewrite), `switch-controller`, `subagent-memory` (opt-in parent digest for child sessions), `tools`, `commands`, `options`, `index` |
 | `adapters/opencode/test/` | `bun test` suites (mocked daemon and Jev) |
 | `deploy/` | `Dockerfile` (rust:1.95-trixie builder, debian:trixie-slim + libc++1 runtime, model baked by `mementod warmup`), `compose.yaml` (source builds) |
 
@@ -41,7 +41,7 @@
 - `memento/ingest/<sessionID>`: ingest cursor
 - `memento/registered/<sessionID>`: session registered with the daemon
 - `memento/switch/<sessionID>`: `{ origin, lastModel, snapshots: { "<provider>/<id>": { cutMessageID, digest, compacted?, lastMessageID?, lastRequestAt? } } }`
-- `memento/subagent/<childID>`: frozen framed parent digest for a child session (`subagentMemory: "digest"`)
+- `memento/subagent/<childID>`: frozen framed parent digest for a child session (`subagentMemory: "digest"`); `""` when the parent digest had zero segments
 
 ## Cross-harness pieces
 
@@ -96,3 +96,7 @@
 - Subagent memory A/B 2026-11-20: see `docs/experiments/2026-11-20-subagent-memory.md` (digest injection 4/4 recall vs 0/4 without; tool-only recall 0/4, `memory_search` never called).
 - Bundled OpenCode plugin (`bun build src/index.ts --target=bun`, about 360 KB) default-exports the same plain `{ id, setup }` object as the source module (bun import probe, 2026-11-20); loading it in a live OpenCode instance is not yet verified. Release workflow and install-from-GitHub flow not yet run against a real release.
 - `adapters/opencode/src/jev.ts` `stripScaffolding` mirrors the Rust `strip_scaffolding` default tag set in `crates/memento-core/src/segment.rs`; keep both in sync.
+- OpenCode v2.3.2 `GET /api/location` probe, 2026-11-20 (recorded in the audit verification): `project.canonical` equals `memento project-key` for committed repos, linked worktrees, symlinked repos, and plain or symlinked non-git directories; only a symlinked no-commit repo (`id: global`) differed, now handled by `normalizeDirectory`.
+- `MAX_LINEAGE_DEPTH` (64) is enforced for every descendant by `routes.rs::validate_link` on `PUT /v1/sessions` and `POST /v1/continuations/claim` (`too_deep`); `lineage::would_create_cycle` checks cycles only.
+- Building several worktrees with one shared `CARGO_TARGET_DIR` reused stale workspace-crate test binaries (2026-11-20: new tests missing from output). Use a per-checkout target or `cargo clean -p <crate>` before trusting results.
+- Live Qdrant integration tests ran 2026-11-20 against a throwaway `qdrant/qdrant:v1.20.2` container (`MEMENTO_TEST_QDRANT_URL=http://127.0.0.1:16334`); do not point them at the managed `memento-qdrant-1` store.
