@@ -256,9 +256,15 @@ fn client(cli: &Cli, hook: bool) -> Result<Client, CliError> {
 struct Transcript {
     session: Option<String>,
     cwd: Option<PathBuf>,
+    codex_forks: HashMap<String, CodexFork>,
     items: Vec<IngestItem>,
     pending: HashMap<String, PendingCall>,
     complete_offset: u64,
+}
+
+struct CodexFork {
+    parent: String,
+    cutoff: DateTime<Utc>,
 }
 
 struct PendingCall {
@@ -819,6 +825,22 @@ impl Transcript {
         };
         let payload = record.get("payload").unwrap_or(&Value::Null);
         if kind == "session_meta" {
+            if let (Some(id), Some(parent), Some(cutoff)) = (
+                payload.get("id").and_then(Value::as_str),
+                payload.get("forked_from_id").and_then(Value::as_str),
+                payload
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .and_then(|value| value.parse().ok())
+                    .or_else(|| timestamp(record)),
+            ) && !parent.trim().is_empty()
+                && parent != id
+            {
+                self.codex_forks.entry(id.to_owned()).or_insert(CodexFork {
+                    parent: parent.to_owned(),
+                    cutoff,
+                });
+            }
             if self.session.is_none() {
                 self.session = payload
                     .get("id")
@@ -1057,20 +1079,7 @@ fn parse_transcript(path: &Path, harness: Harness, offset: u64) -> Result<Transc
                     }
                     Harness::Codex => {
                         if record.get("type").and_then(Value::as_str) == Some("session_meta") {
-                            let payload = &record["payload"];
-                            if parsed.session.is_none() {
-                                parsed.session = payload
-                                    .get("id")
-                                    .or_else(|| payload.get("session_id"))
-                                    .and_then(Value::as_str)
-                                    .map(str::to_owned);
-                            }
-                            if parsed.cwd.is_none() {
-                                parsed.cwd = payload
-                                    .get("cwd")
-                                    .and_then(Value::as_str)
-                                    .map(PathBuf::from);
-                            }
+                            parsed.codex(&record, start);
                         }
                     }
                     Harness::Agy => {}
@@ -1983,6 +1992,31 @@ fn import(
     import_with_classification(cli, args, client, state, true)
 }
 
+fn link_codex_fork(cli: &Cli, client: &Client, project: &str, session: &str, fork: &CodexFork) {
+    let registration = json!({
+        "harness":"codex",
+        "project":project,
+        "session":session,
+        "parent":fork.parent,
+        "parent_harness":"codex",
+        "parent_cutoff":fork.cutoff,
+        "parent_if_unset":true
+    });
+    if let Err(error) = http(
+        client,
+        cli,
+        Method::PUT,
+        &["v1", "sessions"],
+        Some(&registration),
+        &[],
+    ) {
+        eprintln!(
+            "warning: cannot link Codex fork {session}: {}",
+            error.message
+        );
+    }
+}
+
 fn import_with_classification(
     cli: &Cli,
     args: &ImportArgs,
@@ -2062,7 +2096,7 @@ fn import_with_classification(
     let session = args
         .session
         .clone()
-        .or(parsed.session)
+        .or(parsed.session.clone())
         .or_else(|| previous.map(|cursor| cursor.session.clone()))
         .ok_or_else(|| CliError::other("transcript has no session id; supply --session"))?;
     if previous.is_some_and(|cursor| {
@@ -2081,6 +2115,12 @@ fn import_with_classification(
         ));
     }
     let project = project_key(args.project.as_deref().or(parsed.cwd.as_deref()))?;
+    if matches!(args.harness, Harness::Codex)
+        && args.identity_harness.as_deref().unwrap_or("codex") == "codex"
+        && let Some(fork) = parsed.codex_forks.get(&session)
+    {
+        link_codex_fork(cli, client, &project, &session, fork);
+    }
     let mut request = IngestRequest {
         harness: args
             .identity_harness
@@ -2372,6 +2412,21 @@ fn handle_hook(
                 Some(&claim),
                 &[],
             )?)?;
+            if matches!(harness, Harness::Codex)
+                && let Some(path) = input.transcript_path.as_deref()
+            {
+                match parse_transcript(path, Harness::Codex, 0) {
+                    Ok(parsed) => {
+                        if let Some(fork) = parsed.codex_forks.get(&input.session_id) {
+                            link_codex_fork(cli, client, &project, &input.session_id, fork);
+                        }
+                    }
+                    Err(error) => eprintln!(
+                        "warning: cannot inspect Codex fork rollout: {}",
+                        error.message
+                    ),
+                }
+            }
             if response.claimed {
                 let parent_harness = response
                     .parent_harness
@@ -3679,6 +3734,89 @@ mod tests {
 
     fn cli(url: &str) -> Cli {
         Cli::try_parse_from(["memento", "--url", url, "health"]).unwrap()
+    }
+
+    #[test]
+    fn codex_fork_import_links_with_cutoff_and_repeats_after_cursor() {
+        let temp = tempfile::tempdir().unwrap();
+        let (url, server) = mock(vec![
+            r#"{"parent":"parent"}"#,
+            r#"{"segments":2,"skipped":0}"#,
+            r#"{"parent":"claimed","parent_harness":"opencode"}"#,
+        ]);
+        let cli = cli(&url);
+        let client = client(&cli, false).unwrap();
+        let args = ImportArgs {
+            harness: Harness::Codex,
+            transcript: fixture("codex-fork.jsonl"),
+            session: None,
+            project: Some(temp.path().to_path_buf()),
+            full: false,
+            identity_harness: None,
+        };
+        import_with_classification(&cli, &args, &client, temp.path(), false).unwrap();
+        import_with_classification(&cli, &args, &client, temp.path(), false).unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests[0]["session"], "fork");
+        assert_eq!(requests[0]["parent"], "parent");
+        assert_eq!(requests[0]["parent_harness"], "codex");
+        assert_eq!(requests[0]["parent_cutoff"], "2026-11-20T10:00:00Z");
+        assert_eq!(requests[0]["parent_if_unset"], true);
+        assert_eq!(requests[1]["items"].as_array().unwrap().len(), 2);
+        assert_eq!(requests[2], requests[0]);
+    }
+
+    #[test]
+    fn codex_fork_session_start_respects_claim_and_skips_subagents() {
+        let temp = tempfile::tempdir().unwrap();
+        let (url, server) = mock(vec![
+            r#"{"claimed":true,"parent_harness":"opencode","parent":"claimed","digest":"remember"}"#,
+            r#"{"parent":"claimed","parent_harness":"opencode"}"#,
+        ]);
+        let cli = cli(&url);
+        let client = client(&cli, true).unwrap();
+        let mut input: HookInput = serde_json::from_value(json!({
+            "session_id":"fork","cwd":temp.path(),"transcript_path":fixture("codex-fork.jsonl"),
+            "hook_event_name":"SessionStart"
+        }))
+        .unwrap();
+        let output = handle_hook(&cli, Harness::Codex, &input, &client, temp.path(), true)
+            .unwrap()
+            .unwrap();
+        assert!(
+            output["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+                .contains("opencode/claimed")
+        );
+        input.agent_id = Some("subagent".into());
+        assert_eq!(
+            handle_hook(&cli, Harness::Codex, &input, &client, temp.path(), true).unwrap(),
+            Some(json!({}))
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests[1]["parent_if_unset"], true);
+        assert_eq!(requests[1]["parent"], "parent");
+    }
+
+    #[test]
+    fn codex_fork_metadata_matches_session_and_nonfork_is_unchanged() {
+        let parsed = parse_transcript(&fixture("codex.jsonl"), Harness::Codex, 0).unwrap();
+        assert!(parsed.codex_forks.is_empty());
+        let parsed =
+            parse_transcript(&fixture("codex-fork.jsonl"), Harness::Codex, u64::MAX).unwrap();
+        assert!(!parsed.codex_forks.contains_key("other-session"));
+        assert_eq!(parsed.codex_forks["fork"].parent, "parent");
+        let mut parsed = Transcript::default();
+        for parent in ["", "same"] {
+            parsed.codex(
+                &json!({"type":"session_meta","payload":{
+                    "id":"same","forked_from_id":parent,"timestamp":"2026-11-20T10:00:00Z"
+                }}),
+                0,
+            );
+        }
+        assert!(parsed.codex_forks.is_empty());
     }
 
     #[test]

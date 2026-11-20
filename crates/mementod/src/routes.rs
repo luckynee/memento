@@ -314,6 +314,8 @@ struct SessionUpdate {
     title: Option<String>,
     #[serde(default)]
     require_parent: bool,
+    #[serde(default)]
+    parent_if_unset: bool,
 }
 
 async fn put_session(
@@ -709,15 +711,27 @@ async fn merge_session(
         collected_at: None,
     });
     record.project = update.project;
-    if let Some(parent) = update.parent {
+    let apply_parent = !update.parent_if_unset
+        || record.parent.is_none()
+        || update.parent.as_ref().is_some_and(|parent| {
+            record.parent.as_ref() == Some(parent)
+                && record.parent_harness.as_deref().unwrap_or(&record.harness)
+                    == update.parent_harness.as_deref().unwrap_or(&record.harness)
+        });
+    if apply_parent && let Some(parent) = update.parent {
         record.parent = Some(parent);
-        record.parent_cutoff = update.parent_cutoff;
+        if !update.parent_if_unset || update.parent_cutoff.is_some() {
+            record.parent_cutoff = update.parent_cutoff;
+        }
         record.parent_harness = Some(
             update
                 .parent_harness
                 .unwrap_or_else(|| record.harness.clone()),
         );
-    } else if let Some(parent_harness) = update.parent_harness {
+    } else if apply_parent
+        && !update.parent_if_unset
+        && let Some(parent_harness) = update.parent_harness
+    {
         if record.parent_harness.as_deref().unwrap_or(&record.harness) != parent_harness {
             record.parent_cutoff = None;
         }
@@ -725,7 +739,7 @@ async fn merge_session(
         if update.parent_cutoff.is_some() {
             record.parent_cutoff = update.parent_cutoff;
         }
-    } else if update.parent_cutoff.is_some() {
+    } else if apply_parent && !update.parent_if_unset && update.parent_cutoff.is_some() {
         record.parent_cutoff = update.parent_cutoff;
     }
     if record.parent.is_none() {
@@ -924,6 +938,7 @@ async fn claim_continuation(
             retention: None,
             title: None,
             require_parent: false,
+            parent_if_unset: false,
         },
     )
     .await?;

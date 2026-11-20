@@ -216,8 +216,70 @@ async fn run_workflow(address: &str, store: &Store) {
     regression_workflow(address, store).await;
     continuation_slots_workflow(address, store).await;
     fork_cutoff_workflow(address).await;
+    conditional_fork_workflow(address).await;
     release_workflow(address).await;
     stale_workflow(address, store).await;
+}
+
+async fn conditional_fork_workflow(address: &str) {
+    let call = |method: &'static str, path: &'static str, body: Value| async move {
+        request(address, method, path, Some("test-token"), &body.to_string()).await
+    };
+    let fork = json!({
+        "harness":"codex","project":"conditional-fork","session":"conditional-child",
+        "parent":"unknown-fork-parent","parent_harness":"codex",
+        "parent_cutoff":"2026-11-20T10:00:00Z","parent_if_unset":true
+    });
+    let linked = call("PUT", "/v1/sessions", fork.clone()).await;
+    assert_eq!(linked.0, 200);
+    assert_eq!(linked.1["parent"], "unknown-fork-parent");
+    assert_eq!(linked.1["parent_cutoff"], "2026-11-20T10:00:00Z");
+    let repeated = call("PUT", "/v1/sessions", fork.clone()).await;
+    assert_eq!(repeated.1["parent_cutoff"], linked.1["parent_cutoff"]);
+    let mut without_cutoff = fork.clone();
+    without_cutoff
+        .as_object_mut()
+        .unwrap()
+        .remove("parent_cutoff");
+    assert_eq!(
+        call("PUT", "/v1/sessions", without_cutoff).await.1["parent_cutoff"],
+        linked.1["parent_cutoff"]
+    );
+    assert_eq!(
+        call(
+            "PUT",
+            "/v1/sessions",
+            json!({"project":"conditional-fork","harness":"opencode","session":"conditional-claimed"})
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        call(
+            "PUT",
+            "/v1/continuations",
+            json!({"project":"conditional-fork","parent_harness":"opencode","parent_session":"conditional-claimed"})
+        )
+        .await
+        .0,
+        200
+    );
+    let claim = call(
+        "POST",
+        "/v1/continuations/claim",
+        json!({"project":"conditional-fork","harness":"codex","session":"conditional-child"}),
+    )
+    .await;
+    assert_eq!(claim.1["claimed"], true);
+    let mut update = fork;
+    update["title"] = json!("updated");
+    let preserved = call("PUT", "/v1/sessions", update).await;
+    assert_eq!(preserved.0, 200);
+    assert_eq!(preserved.1["parent"], "conditional-claimed");
+    assert_eq!(preserved.1["parent_harness"], "opencode");
+    assert!(preserved.1["parent_cutoff"].is_null());
+    assert_eq!(preserved.1["title"], "updated");
 }
 
 async fn fork_cutoff_workflow(address: &str) {
