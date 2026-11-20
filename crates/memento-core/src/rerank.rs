@@ -84,19 +84,21 @@ pub fn rerank(
             } else {
                 0.0
             };
-            let exact_match = !identifiers.is_empty()
-                && identifiers.iter().all(|identifier| {
-                    candidate.segment.text.contains(identifier)
+            let matched_identifiers = identifiers
+                .iter()
+                .filter(|identifier| {
+                    contains_identifier(&candidate.segment.text, identifier)
                         || candidate
                             .segment
                             .path
                             .as_deref()
-                            .is_some_and(|path| path.contains(identifier))
-                });
-            let bonus = if exact_match {
-                config.exact_match_bonus
-            } else {
+                            .is_some_and(|path| contains_identifier(path, identifier))
+                })
+                .count();
+            let bonus = if identifiers.is_empty() {
                 0.0
+            } else {
+                config.exact_match_bonus * matched_identifiers as f32 / identifiers.len() as f32
             };
             (
                 normalized + config.recency_weight * decay + bonus,
@@ -143,6 +145,24 @@ fn is_question(text: &str) -> bool {
             .iter()
             .any(|question_word| word.eq_ignore_ascii_case(question_word))
         })
+}
+
+fn contains_identifier(text: &str, identifier: &str) -> bool {
+    text.match_indices(identifier).any(|(start, matched)| {
+        let before = text[..start].chars().next_back();
+        let after = text[start + matched.len()..].chars().next();
+        !before.is_some_and(is_identifier_character)
+            && (!after.is_some_and(is_identifier_character)
+                || after == Some('.')
+                    && !text[start + matched.len() + 1..]
+                        .chars()
+                        .next()
+                        .is_some_and(|ch| ch.is_alphanumeric()))
+    })
+}
+
+fn is_identifier_character(ch: char) -> bool {
+    ch.is_alphanumeric() || matches!(ch, '_' | '.' | '-')
 }
 
 fn is_identifier(token: &str) -> bool {
@@ -321,7 +341,40 @@ mod tests {
     }
 
     #[test]
-    fn identifiers_require_all_case_sensitive_matches_in_text_or_path() {
+    fn identifier_boundary_match_ranks_above_substrings() {
+        let mut false_match = candidate("false", 0, 1.0);
+        false_match.segment.kind = Kind::AssistantNote;
+        false_match.segment.text = "sha1_v100_legacy and my_route_handler_old".into();
+        let mut true_match = candidate("true", 0, 0.8);
+        true_match.segment.kind = Kind::AssistantNote;
+        true_match.segment.text = "Implemented route_handler for payment ledger.".into();
+        let hits = rerank(
+            "v1 route_handler",
+            vec![false_match, true_match],
+            &RerankConfig::default(),
+            2,
+        );
+        assert_eq!(
+            hits[0].text,
+            "Implemented route_handler for payment ledger."
+        );
+        assert!((hits[0].score - 1.2).abs() < 0.00001);
+        assert!((hits[1].score - 1.15).abs() < 0.00001);
+    }
+
+    #[test]
+    fn partial_identifier_matches_receive_proportional_bonus() {
+        let hits = rerank(
+            "v1 route_handler",
+            vec![candidate("route_handler", 0, 1.0)],
+            &RerankConfig::default(),
+            1,
+        );
+        assert!((hits[0].score - 1.4).abs() < 0.00001, "{}", hits[0].score);
+    }
+
+    #[test]
+    fn identifiers_score_proportional_case_sensitive_matches_in_text_or_path() {
         let mut matched = candidate("match", 0, 1.0);
         matched.segment.text = "run camelCase with item2 and mod::name".into();
         matched.segment.path = Some("src/invoice-worker.rs".into());
@@ -330,8 +383,23 @@ mod tests {
         let query = r#""camelCase", (src/invoice-worker.rs) item2 mod::name"#;
         let hits = rerank(query, vec![partial, matched], &RerankConfig::default(), 2);
         assert!((hits[0].score - 1.65).abs() < 0.00001);
-        assert!((hits[1].score - 1.15).abs() < 0.00001);
+        assert!((hits[1].score - 1.525).abs() < 0.00001);
         assert!(hits[0].text.contains("camelCase"));
+    }
+
+    #[test]
+    fn identifier_boundaries_cover_all_identifier_characters() {
+        for ch in ['a', '2', 'é', '_', '-'] {
+            assert!(!contains_identifier(&format!("{ch}item2"), "item2"));
+            assert!(!contains_identifier(&format!("item2{ch}"), "item2"));
+        }
+        assert!(contains_identifier("(item2),", "item2"));
+        assert!(contains_identifier("item2.", "item2"));
+        assert!(!contains_identifier("item2.rs", "item2"));
+        assert!(contains_identifier("xitem2 item2", "item2"));
+        assert!(!contains_identifier("Item2", "item2"));
+        assert!(contains_identifier("edited src/foo.rs today", "foo.rs"));
+        assert!(contains_identifier("mod::item2", "item2"));
     }
 
     #[test]
