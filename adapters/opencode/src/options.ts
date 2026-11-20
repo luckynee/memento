@@ -34,7 +34,7 @@ export function resolveOptions(raw: Record<string, unknown>) {
         tailUserTurns,
         tailCharBudget,
         digestBudget,
-        subagentMemory: isSubagentMemoryMode(raw.subagentMemory) ? raw.subagentMemory : "off" as const,
+        subagentMemory: isSubagentMemoryMode(raw.subagentMemory) ? raw.subagentMemory : "digest" as const,
         subagentMemoryAgents,
         subagentDigestBudget,
         enabled: typeof raw.enabled === "boolean" ? raw.enabled : true,

@@ -425,7 +425,7 @@ test("subagents skip session processing while search uses the root and forks rem
     }) as typeof fetch;
     const registration = () => ({ async dispose() {} });
     const ctx = {
-        options: { jev: false, reconcile: false },
+        options: { jev: false, reconcile: false, subagentMemory: "off" },
         location: { project: { id: "p" } },
         storage: {
             async get(key: string) { return values.get(key); },
