@@ -12,23 +12,19 @@ Design and verified contracts: [docs/DESIGN.md](docs/DESIGN.md). Code map: [docs
 
 ```sh
 docker compose -f deploy/compose.yaml -p memento up -d --build
-curl -s http://127.0.0.1:7377/health
 cargo install --path crates/memento-cli
 cd adapters/opencode && bun install
+cd ../..
+memento setup
 ```
 
-Add the plugin to `~/.config/opencode/opencode.jsonc` (or a project `.opencode/opencode.jsonc`):
+The wizard detects installed harnesses, chooses project or user scope, configures subagent memory, and optionally installs skills. It previews changes before confirmation. To configure without prompts:
 
-```jsonc
-{
-    "plugins": [
-        {
-            "package": "/absolute/path/to/memento-pool/adapters/opencode",
-            "options": { "url": "http://127.0.0.1:7377" }
-        }
-    ]
-}
+```sh
+memento setup --harness opencode,codex --scope project --project DIR --opencode-plugin /absolute/path/to/memento-pool/adapters/opencode --skills-source /absolute/path/to/memento-pool/skills --yes --dry-run
 ```
+
+Remove `--dry-run` to apply. If automatic discovery fails, provide `--opencode-plugin` and `--skills-source`, or set `MEMENTO_OPENCODE_PLUGIN` and `MEMENTO_SKILLS_DIR`. JSONC files containing comments or trailing commas are left unchanged; setup prints the plugin snippet for manual insertion.
 
 ## Daily use
 
@@ -45,13 +41,15 @@ The project key is the main checkout path (`memento project-key`), identical acr
 
 | Harness | Writes memory | Reads memory | Setup |
 | --- | --- | --- | --- |
-| OpenCode | plugin (step/turn events) | digest after model switch, `memory_search`, continuation claim | plugin entry above |
+| OpenCode | plugin (step/turn events) | digest after model switch, `memory_search`, continuation claim | `memento setup` |
 | Claude Code | `Stop` hook starts a detached transcript import | `SessionStart` hook injects a claimed continuation | `memento install-hooks claude-code --project DIR` (or `--user`) |
 | Codex | `Stop` hook starts a detached rollout import | `SessionStart` hook (also re-injects after compaction) | `memento install-hooks codex --project DIR` (or `--user`); trust the project (`codex --trust` or `/hooks`) |
 | agy | `Stop` hook imports the transcript | `SessionStart` hook injects a claimed continuation | `memento install-hooks agy --project DIR` (or `--user`) |
 | Generic | `turn_end` imports a supported transcript or neutral items | `session_start` returns claimed context for the harness to inject | Wire JSON lifecycle events to `memento hook generic --harness NAME`; see [contract](docs/DESIGN.md#generic-hook-contract) |
 
 Any harness can use the CLI directly: `memento import claude-code|codex|agy --transcript PATH` (incremental cursor), `memento search`, `memento digest`. MCP is optional for agy and other MCP-capable harnesses; for agy, configure `agy mcp add memento -- /path/to/memento-mcp --harness agy`.
+
+OpenCode and Codex provide parent memory to subagents by default; Claude Code is opt-in with `memento install-hooks claude-code --subagent-memory digest`. Use `--subagent-memory off` when installing Codex hooks to disable it, or set the OpenCode `subagentMemory` option to `"off"`. Both also support `"filtered"`; agy does not support subagent memory.
 
 ### Cleanup
 

@@ -16,6 +16,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 mod cross_harness;
+mod setup;
 
 #[derive(Debug, Parser)]
 #[command(name = "memento", about = "Client for the mementod memory daemon")]
@@ -51,6 +52,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(about = "Set up harnesses interactively")]
+    Setup(setup::SetupArgs),
     #[command(about = "Check daemon health")]
     Health,
     #[command(about = "Show memory counts by kind")]
@@ -397,7 +400,8 @@ fn build_request(
         Command::Digest(_) => (Method::GET, vec!["v1", "digest"]),
         Command::Forget(_) => (Method::POST, vec!["v1", "forget"]),
         Command::Ingest(_) => (Method::POST, vec!["v1", "ingest"]),
-        Command::ProjectKey { .. }
+        Command::Setup(_)
+        | Command::ProjectKey { .. }
         | Command::Gc(_)
         | Command::Import(_)
         | Command::HookImport(_)
@@ -535,7 +539,8 @@ fn build_request(
         Command::Ingest(_) => {
             request.json(ingest.ok_or_else(|| CliError::other("missing ingest input"))?)
         }
-        Command::ProjectKey { .. }
+        Command::Setup(_)
+        | Command::ProjectKey { .. }
         | Command::Gc(_)
         | Command::Import(_)
         | Command::HookImport(_)
@@ -748,7 +753,8 @@ fn render(command: &Command, body: &str) -> Result<String, CliError> {
             );
             Ok(lines.join("\n"))
         }
-        Command::ProjectKey { .. }
+        Command::Setup(_)
+        | Command::ProjectKey { .. }
         | Command::Gc(_)
         | Command::Import(_)
         | Command::HookImport(_)
@@ -858,6 +864,9 @@ fn select_digest_session(client: &Client, cli: &mut Cli) -> Result<(), CliError>
 }
 
 fn run(mut cli: Cli) -> Result<(), CliError> {
+    if let Command::Setup(args) = &cli.command {
+        return setup::run(&cli, args);
+    }
     if matches!(
         &cli.command,
         Command::ProjectKey { .. }

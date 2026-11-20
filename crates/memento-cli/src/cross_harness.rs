@@ -106,6 +106,7 @@ impl SubagentMemory {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum InstallSubagentMemory {
+    Off,
     Digest,
     Filtered,
 }
@@ -113,6 +114,7 @@ pub enum InstallSubagentMemory {
 impl InstallSubagentMemory {
     fn name(self) -> &'static str {
         match self {
+            Self::Off => "off",
             Self::Digest => "digest",
             Self::Filtered => "filtered",
         }
@@ -141,15 +143,15 @@ pub struct HookArgs {
 #[derive(Debug, Args)]
 pub struct InstallArgs {
     #[arg(value_enum, help = "Hook harness")]
-    harness: Harness,
+    pub(super) harness: Harness,
     #[arg(long, conflicts_with = "user", help = "Project directory")]
-    project: Option<PathBuf>,
+    pub(super) project: Option<PathBuf>,
     #[arg(long, help = "Install in the user's home directory")]
-    user: bool,
+    pub(super) user: bool,
     #[arg(long, help = "Print merged JSON without writing")]
-    dry_run: bool,
+    pub(super) dry_run: bool,
     #[arg(long, value_enum, help = "Install optional subagent parent memory")]
-    subagent_memory: Option<InstallSubagentMemory>,
+    pub(super) subagent_memory: Option<InstallSubagentMemory>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -164,15 +166,15 @@ pub enum SkillHarness {
 #[derive(Debug, Args)]
 pub struct InstallSkillsArgs {
     #[arg(long, value_enum, default_value = "all", help = "Target harness")]
-    harness: SkillHarness,
+    pub(super) harness: SkillHarness,
     #[arg(long, conflicts_with = "user", help = "Project directory")]
-    project: Option<PathBuf>,
+    pub(super) project: Option<PathBuf>,
     #[arg(long, help = "Install in the user's home directory")]
-    user: bool,
+    pub(super) user: bool,
     #[arg(long, help = "Source skills directory")]
-    source: Option<PathBuf>,
+    pub(super) source: Option<PathBuf>,
     #[arg(long, help = "Report without writing")]
-    dry_run: bool,
+    pub(super) dry_run: bool,
 }
 
 pub(super) fn project_key(dir: Option<&Path>) -> Result<String, CliError> {
@@ -1124,7 +1126,7 @@ fn home_dir() -> Result<PathBuf, CliError> {
         .ok_or_else(|| CliError::other("HOME is not set"))
 }
 
-fn save_atomic(path: &Path, contents: &[u8]) -> Result<(), CliError> {
+pub(super) fn save_atomic(path: &Path, contents: &[u8]) -> Result<(), CliError> {
     #[cfg(unix)]
     let mode = match fs::metadata(path) {
         Ok(metadata) => Some(metadata.permissions().mode() & 0o7777),
@@ -2544,6 +2546,79 @@ fn handle_hook(
     }
 }
 
+fn memento_hook_command(command: &str, harness: Harness) -> bool {
+    let bytes = command.as_bytes();
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut started = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match quote {
+            Some(b'\'') if byte == b'\'' => quote = None,
+            Some(b'\'') => word.push(byte as char),
+            Some(b'"') if byte == b'"' => quote = None,
+            Some(b'"') if byte == b'\\' => {
+                index += 1;
+                if index == bytes.len() {
+                    return false;
+                }
+                word.push(bytes[index] as char);
+            }
+            Some(b'"') => {
+                if matches!(byte, b'$' | b'`') {
+                    return false;
+                }
+                word.push(byte as char);
+            }
+            None if byte.is_ascii_whitespace() => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                    started = false;
+                }
+            }
+            None if matches!(byte, b'\'' | b'"') => {
+                quote = Some(byte);
+                started = true;
+            }
+            None if byte == b'\\' => {
+                index += 1;
+                if index == bytes.len() {
+                    return false;
+                }
+                word.push(bytes[index] as char);
+                started = true;
+            }
+            None if matches!(
+                byte,
+                b'|' | b'&' | b';' | b'<' | b'>' | b'(' | b')' | b'$' | b'`'
+            ) =>
+            {
+                return false;
+            }
+            None => {
+                word.push(byte as char);
+                started = true;
+            }
+            Some(_) => unreachable!(),
+        }
+        index += 1;
+    }
+    if quote.is_some() {
+        return false;
+    }
+    if started {
+        words.push(word);
+    }
+    words.len() >= 3
+        && Path::new(&words[0])
+            .file_name()
+            .is_some_and(|name| name == "memento")
+        && words[1] == "hook"
+        && words[2] == harness.name()
+}
+
 fn merge_hooks(
     existing: &mut Value,
     harness: Harness,
@@ -2575,10 +2650,30 @@ fn merge_hooks(
             .as_object_mut()
             .ok_or_else(|| CliError::other("agy memento hook must be an object"))?;
         for event in ["SessionStart", "Stop"] {
-            hook.insert(
-                event.into(),
-                json!([{"type":"command","command":command,"timeout":30}]),
-            );
+            let handlers = hook
+                .entry(event)
+                .or_insert_with(|| json!([]))
+                .as_array_mut()
+                .ok_or_else(|| CliError::other(format!("agy {event} hooks must be an array")))?;
+            let mut found = false;
+            handlers.retain_mut(|handler| {
+                if handler
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| memento_hook_command(value, harness))
+                {
+                    if found {
+                        return false;
+                    }
+                    found = true;
+                    handler["command"] = json!(command);
+                    handler["timeout"] = json!(30);
+                }
+                true
+            });
+            if !found {
+                handlers.push(json!({"type":"command","command":command,"timeout":30}));
+            }
         }
         return Ok(());
     }
@@ -2591,7 +2686,6 @@ fn merge_hooks(
         let groups = value
             .as_array_mut()
             .ok_or_else(|| CliError::other("hook settings SubagentStart must be an array"))?;
-        let prefix = format!("{command} --subagent-memory ");
         let mut changed = false;
         groups.retain_mut(|group| {
             if let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) {
@@ -2600,11 +2694,7 @@ fn merge_hooks(
                     !handler
                         .get("command")
                         .and_then(Value::as_str)
-                        .is_some_and(|value| {
-                            value == command
-                                || value == format!("{prefix}digest")
-                                || value == format!("{prefix}filtered")
-                        })
+                        .is_some_and(|value| memento_hook_command(value, harness))
                 });
                 changed |= old_len != handlers.len();
                 old_len == handlers.len() || !handlers.is_empty()
@@ -2616,7 +2706,9 @@ fn merge_hooks(
             hooks.remove("SubagentStart");
         }
     }
-    if let Some(mode) = subagent_memory {
+    if let Some(mode @ (InstallSubagentMemory::Digest | InstallSubagentMemory::Filtered)) =
+        subagent_memory
+    {
         let groups = hooks
             .entry("SubagentStart")
             .or_insert_with(|| json!([]))
@@ -2637,7 +2729,10 @@ fn merge_hooks(
             if let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) {
                 let old_len = handlers.len();
                 handlers.retain(|handler| {
-                    handler.get("command").and_then(Value::as_str) != Some(command.as_str())
+                    !handler
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| memento_hook_command(value, harness))
                 });
                 changed |= old_len != handlers.len();
                 old_len == handlers.len() || !handlers.is_empty()
@@ -2656,11 +2751,20 @@ fn merge_hooks(
             .as_array_mut()
             .ok_or_else(|| CliError::other(format!("hook settings {event} must be an array")))?;
         let mut found = false;
-        for group in groups.iter_mut() {
+        groups.retain_mut(|group| {
             if let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) {
-                for handler in handlers {
-                    if handler.get("command").and_then(Value::as_str) == Some(command.as_str()) {
+                let old_len = handlers.len();
+                handlers.retain_mut(|handler| {
+                    if handler
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| memento_hook_command(value, harness))
+                    {
+                        if found {
+                            return false;
+                        }
                         found = true;
+                        handler["command"] = json!(command);
                         if event == "Stop" {
                             if let Some(handler) = handler.as_object_mut() {
                                 handler.remove("async");
@@ -2670,9 +2774,13 @@ fn merge_hooks(
                             }
                         }
                     }
-                }
+                    true
+                });
+                old_len == handlers.len() || !handlers.is_empty()
+            } else {
+                true
             }
-        }
+        });
         if found {
             continue;
         }
@@ -2696,7 +2804,11 @@ fn merge_hooks(
     Ok(())
 }
 
-fn install(args: &InstallArgs, home: &Path, executable: &Path) -> Result<Option<String>, CliError> {
+pub(super) fn install(
+    args: &InstallArgs,
+    home: &Path,
+    executable: &Path,
+) -> Result<Option<String>, CliError> {
     let base = if args.user {
         home.to_path_buf()
     } else {
@@ -2755,7 +2867,11 @@ fn install(args: &InstallArgs, home: &Path, executable: &Path) -> Result<Option<
         })?,
         None => json!({}),
     };
-    merge_hooks(&mut value, args.harness, executable, args.subagent_memory)?;
+    let subagent_memory = args.subagent_memory.or(match args.harness {
+        Harness::Codex => Some(InstallSubagentMemory::Digest),
+        _ => None,
+    });
+    merge_hooks(&mut value, args.harness, executable, subagent_memory)?;
     let output = serde_json::to_string_pretty(&value)
         .map_err(|error| CliError::other(format!("cannot serialize hooks: {error}")))?;
     if args.dry_run {
@@ -3042,7 +3158,7 @@ fn copy_skill(source: &Path, target: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
-fn install_skills(args: &InstallSkillsArgs, home: &Path) -> Result<(), CliError> {
+pub(super) fn install_skills(args: &InstallSkillsArgs, home: &Path) -> Result<(), CliError> {
     let source = args
         .source
         .clone()
@@ -4004,6 +4120,81 @@ mod tests {
     }
 
     #[test]
+    fn reinstall_recognizes_old_paths_and_preserves_unrelated_handlers() {
+        for harness in [Harness::ClaudeCode, Harness::Codex] {
+            let old = format!(
+                "'/old directory/memento' hook {} --old-flag",
+                harness.name()
+            );
+            let unrelated = format!("/bin/other hook {} --label memento", harness.name());
+            let mut value = json!({"hooks": {
+                "SessionStart": [{"hooks":[{"command":old},{"command":unrelated}]}],
+                "Stop": [{"hooks":[{"command":old,"async":true},{"command":unrelated}]}],
+                "SessionEnd": [{"hooks":[{"command":old},{"command":unrelated}]}],
+                "SubagentStart": [{"hooks":[{"command":old},{"command":unrelated}]}]
+            }});
+            merge_hooks(
+                &mut value,
+                harness,
+                Path::new("/new/memento"),
+                Some(InstallSubagentMemory::Off),
+            )
+            .unwrap();
+            for event in ["SessionStart", "Stop"] {
+                let handlers = value["hooks"][event][0]["hooks"].as_array().unwrap();
+                assert_eq!(handlers.len(), 2);
+                assert_eq!(
+                    handlers[0]["command"],
+                    format!("/new/memento hook {}", harness.name())
+                );
+                assert_eq!(handlers[1]["command"], unrelated);
+            }
+            assert!(value["hooks"]["Stop"][0]["hooks"][0].get("async").is_none());
+            for event in ["SessionEnd", "SubagentStart"] {
+                assert_eq!(
+                    value["hooks"][event][0]["hooks"],
+                    json!([{"command":unrelated}])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn memento_hook_matching_requires_command_shape() {
+        for command in [
+            "memento hook codex",
+            "\"/old path/memento\" hook codex --flag",
+            "'/old path/memento' hook codex",
+        ] {
+            assert!(memento_hook_command(command, Harness::Codex));
+        }
+        for command in [
+            "/bin/other hook codex memento",
+            "/bin/not-memento hook codex",
+            "/bin/memento hook claude-code",
+            "/bin/memento hook codex; other",
+            "echo /bin/memento hook codex",
+            "\"/bin/memento hook codex\"",
+        ] {
+            assert!(!memento_hook_command(command, Harness::Codex));
+        }
+    }
+
+    #[test]
+    fn agy_reinstall_updates_old_paths_without_removing_other_handlers() {
+        let mut value = json!({"memento":{"SessionStart":[{"command":"'/old path/memento' hook agy --old"},{"command":"/bin/other memento"}],"Stop":[{"command":"/old/memento hook agy"},{"command":"/bin/other memento"}]}});
+        merge_hooks(&mut value, Harness::Agy, Path::new("/new/memento"), None).unwrap();
+        for event in ["SessionStart", "Stop"] {
+            assert_eq!(value["memento"][event].as_array().unwrap().len(), 2);
+            assert_eq!(
+                value["memento"][event][0]["command"],
+                "/new/memento hook agy"
+            );
+            assert_eq!(value["memento"][event][1]["command"], "/bin/other memento");
+        }
+    }
+
+    #[test]
     fn claude_fixture_pairs_tools_and_filters_scaffolding() {
         let parsed = parse_transcript(&fixture("claude.jsonl"), Harness::ClaudeCode, 0).unwrap();
         assert_eq!(parsed.session.as_deref(), Some("claude-session"));
@@ -4635,6 +4826,10 @@ mod tests {
                 .is_none()
         );
         assert!(merged["hooks"].get("SessionEnd").is_none());
+        assert_eq!(
+            merged["hooks"]["SubagentStart"][0]["hooks"][0]["command"],
+            "/usr/bin/memento hook codex --subagent-memory digest"
+        );
         install(&args, temp.path(), Path::new("/usr/bin/memento")).unwrap();
         assert_eq!(fs::read(&path).unwrap(), first);
         assert_eq!(fs::read(path.with_extension("json.bak")).unwrap(), original);
@@ -4661,6 +4856,15 @@ mod tests {
                 .is_none()
         );
         assert!(!temp.path().join(".claude/settings.json").exists());
+        assert!(output["hooks"].get("SubagentStart").is_none());
+
+        let disabled = InstallArgs {
+            subagent_memory: Some(InstallSubagentMemory::Off),
+            ..args
+        };
+        install(&disabled, temp.path(), Path::new("/usr/bin/memento")).unwrap();
+        let disabled: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(disabled["hooks"].get("SubagentStart").is_none());
     }
 
     #[test]
