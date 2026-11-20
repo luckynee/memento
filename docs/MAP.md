@@ -18,7 +18,23 @@
 | `crates/memento-cli/src/main.rs` | `memento` CLI, HTTP client of mementod |
 | `adapters/opencode/src/` | OpenCode V2 plugin: `client`, `transcript`, `ingest`, `session-ownership`, `switch` (pure rewrite), `switch-controller`, `subagent-memory` (opt-in parent digest for child sessions), `tools`, `commands`, `options`, `index` |
 | `adapters/opencode/test/` | `bun test` suites (mocked daemon and Jev) |
-| `deploy/` | `Dockerfile` (rust:1.95-trixie builder, debian:trixie-slim + libc++1 runtime, model baked by `mementod warmup`), `compose.yaml` |
+| `deploy/` | `Dockerfile` (rust:1.95-trixie builder, debian:trixie-slim + libc++1 runtime, model baked by `mementod warmup`), `compose.yaml` (source builds) |
+
+## Distribution
+
+| Path | Purpose |
+| --- | --- |
+| `Cargo.toml` `[workspace.package] version` | Single version for all crates; release tag must be `v<version>` |
+| `crates/memento-cli/build.rs` | Embeds `adapters/opencode/dist/index.js` (or `MEMENTO_OPENCODE_BUNDLE`) when present; sets `MEMENTO_TARGET` |
+| `crates/memento-cli/src/assets.rs` | Embedded skills, plugin bundle writer (`<data>/memento/opencode-plugin/`), compose renderer |
+| `crates/memento-cli/assets/compose.yaml` | Managed daemon template; image `ghcr.io/luckynee/mementod:<version>` or `MEMENTO_DAEMON_IMAGE`; project `memento` |
+| `crates/memento-cli/src/daemon.rs` | `memento daemon up/down/status/logs/pull`; `managed_refresh_steps` |
+| `crates/memento-cli/src/receipt.rs` | `${XDG_CONFIG_HOME:-~/.config}/memento/install.json`: installer fields `method`, `bin_dir`, `version` plus `setup` |
+| `crates/memento-cli/src/setup.rs::reapply_saved_setup` | Non-interactive re-apply of saved setup (hidden `reapply-setup`), used by `update --refresh` |
+| `crates/memento-cli/src/update.rs` | `memento update`: GitHub release lookup (`MEMENTO_RELEASES_API`, `MEMENTO_DOWNLOAD_BASE` test overrides), sha256, guarded binary swap, refresh |
+| `crates/memento-cli/src/doctor.rs` | `memento doctor [--offline]` and hidden `write-receipt` (called by `install.sh`) |
+| `install.sh` | POSIX installer: `memento-<target>.tar.gz` + `.sha256`, `MEMENTO_VERSION`, `MEMENTO_INSTALL_DIR`, `MEMENTO_NO_SETUP` |
+| `.github/workflows/` | `ci.yml` (fmt, clippy, test, adapter, shellcheck); `release.yml` (tag: musl/darwin tarballs, multi-arch GHCR image, GitHub release) |
 
 ## Adapter storage keys
 
@@ -78,4 +94,5 @@
 - Claude Code 2.1.328 `SubagentStart` `hookSpecificOutput.additionalContext` reaches the subagent (verified 2026-11-20 with Haiku: parent-only facts answered, first request +about 700 tokens). `SubagentStop` input carries `agent_transcript_path` (`~/.claude/projects/<project>/<session>/subagents/agent-<agent_id>.jsonl`); `session_id` and `transcript_path` are the parent's.
 - Fork cutoff verified live 2026-11-20: an OpenCode fork registered with `parent_cutoff` = the fork's `time.created`; its lineage search and digest kept the parent's pre-fork fact and excluded a fact the parent recorded after the fork, while the parent's own search still found it.
 - Subagent memory A/B 2026-11-20: see `docs/experiments/2026-11-20-subagent-memory.md` (digest injection 4/4 recall vs 0/4 without; tool-only recall 0/4, `memory_search` never called).
+- Bundled OpenCode plugin (`bun build src/index.ts --target=bun`, about 360 KB) default-exports the same plain `{ id, setup }` object as the source module (bun import probe, 2026-11-20); loading it in a live OpenCode instance is not yet verified. Release workflow and install-from-GitHub flow not yet run against a real release.
 - `adapters/opencode/src/jev.ts` `stripScaffolding` mirrors the Rust `strip_scaffolding` default tag set in `crates/memento-core/src/segment.rs`; keep both in sync.

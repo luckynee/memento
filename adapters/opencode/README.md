@@ -1,7 +1,16 @@
 # OpenCode adapter
 
 This plugin stores session messages in memento and recalls them when continuing work.
-Run `bun install` in this directory, then add the plugin to `opencode.jsonc`:
+The recommended installation is `memento setup`, which installs and configures the
+embedded plugin bundle without requiring Bun:
+
+```sh
+memento setup
+```
+
+For development checkouts, run `bun install` in this directory and use
+`memento setup --opencode-plugin /path/to/memento-pool/adapters/opencode`.
+Alternatively, add the checkout plugin to `opencode.jsonc` manually:
 
 ```jsonc
 {

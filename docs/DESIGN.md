@@ -169,7 +169,7 @@ All routes under `http://127.0.0.1:7377`. Optional bearer token via `MEMENTO_TOK
 
 | Method and path | Body or query | Response |
 | --- | --- | --- |
-| `GET /health` | | `{ "ok": true, "qdrant": true }` |
+| `GET /health` | | `{ "ok": true, "qdrant": true, "version"?: "x.y.z" }` |
 | `PUT /v1/sessions` | `{ harness, project, session, parent?, parent_harness?, parent_cutoff?, require_parent?, parent_if_unset?, retention?, title? }`; `parent_cutoff` is an RFC 3339 timestamp; absent fields keep stored values, except an explicit parent link without a cutoff clears it; `parent_if_unset` atomically applies parent fields only when the stored parent is absent or matches, preserving an existing cutoff when none is supplied; `created` is set once | session record |
 | `GET /v1/sessions` | `?harness?&project?&include_deleted?` | `{ sessions: [...] }` |
 | `POST /v1/sessions/release` | `{ harness, project, session, reason? }` | `{ released, removed: [{ harness, session }] }` |
@@ -187,6 +187,12 @@ Errors: `{ "error": { "code": "...", "message": "..." } }` with 4xx/5xx.
 
 `memento [--url URL] <command>`; `MEMENTO_URL` default `http://127.0.0.1:7377`.
 
+The release binary embeds the OpenCode plugin bundle, harness skills, and daemon Compose definition. `memento setup` installs the plugin under `${XDG_DATA_HOME:-~/.local/share}/memento/opencode-plugin/`, configures OpenCode to load it, installs embedded skills by default, and saves choices in `${XDG_CONFIG_HOME:-~/.config}/memento/install.json`. The receipt also records installer method, binary directory, and version. `--opencode-plugin DIR`, `--skills-source DIR`, `MEMENTO_OPENCODE_PLUGIN`, and `MEMENTO_SKILLS_DIR` override embedded assets for development checkouts. `install-skills --source DIR` accepts an optional source override. Setup can offer to start the managed daemon; `--start-daemon` requests that in non-interactive use.
+
+`memento daemon up|down|status|logs [-f]|pull` manages the embedded Compose definition at `${XDG_DATA_HOME:-~/.local/share}/memento/compose.yaml` through `docker compose -p memento`; `up` waits for health. The daemon image defaults to `ghcr.io/luckynee/mementod:<cli version>` and can be overridden with `MEMENTO_DAEMON_IMAGE`. Qdrant v1.20.2 uses the existing `memento_qdrant_storage` volume. `MEMENTO_TOKEN`, `MEMENTO_STALE_DAYS`, and `MEMENTO_STALE_SWEEP_SECS` pass through to the daemon.
+
+`memento update` checks the latest GitHub release, verifies the archive SHA-256, replaces `memento` and `memento-mcp` for installer-managed installs, then runs `update --refresh` to reapply saved setup and pull/restart a managed daemon. `--check`, `--version <x.y.z>`, and `--refresh` control these actions. Binary replacement requires a script-install receipt and execution from its recorded binary directory; Cargo installs should use Cargo or the installer. `memento doctor [--offline]` reports installation receipt, latest release, Docker/Compose, daemon health, plugin and saved setup status; `--offline` skips the latest-release check, and failures make it exit 1.
+
 - `health`
 - `stats [--harness H] [--project P] [--session S]` (`{ total, by_kind }`; current project by default, all harnesses when omitted)
 - `sessions list --harness H [--project P]`
@@ -198,9 +204,9 @@ Errors: `{ "error": { "code": "...", "message": "..." } }` with 4xx/5xx.
 - `forget --harness H [--project P] (--session S | --lineage S | --whole-project) [--yes] [--dry-run]` (`--whole-project` requires `--project`; without `--yes` it asks on a TTY and refuses otherwise; dry runs never prompt and report matching segments and sessions)
 - `gc [--project DIR] [--dry-run] [--json]` releases sessions whose harness data is gone.
 - `ingest --file turns.json|-` (neutral schema, for harnesses without a plugin)
-- `setup [--harness opencode,codex,...] [--scope project|user] [--project DIR] [--subagent-memory opencode=on,codex=on,...] [--skills|--no-skills] [--skills-source DIR] [--opencode-plugin DIR] [--yes] [--dry-run]` checks daemon health, selects detected harnesses and scope, previews changes, and confirms before applying. JSONC that cannot be preserved is left untouched with a manual plugin snippet. Without a TTY, `--yes`, `--harness`, and `--scope` are required. To add a harness, add a registry entry with detection, capabilities, plan and apply.
+- `setup [--harness opencode,codex,...] [--scope project|user] [--project DIR] [--subagent-memory opencode=on,codex=on,...] [--skills|--no-skills] [--skills-source DIR] [--opencode-plugin DIR] [--yes] [--start-daemon] [--dry-run]` checks daemon health, selects detected harnesses and scope, previews changes, and confirms before applying. JSONC that cannot be preserved is left untouched with a manual plugin snippet. Without a TTY, `--yes`, `--harness`, and `--scope` are required. To add a harness, add a registry entry with detection, capabilities, plan and apply.
 - `install-hooks claude-code|codex|agy [--project DIR | --user] [--dry-run] [--subagent-memory off|digest|filtered]` (subagent memory only for Claude Code and Codex)
-- `install-skills [--harness opencode|claude-code|codex|agy|all] [--project DIR | --user] --source DIR [--dry-run]`
+- `install-skills [--harness opencode|claude-code|codex|agy|all] [--project DIR | --user] [--source DIR] [--dry-run]` (embedded skills by default)
 - Global: `--url`, `--token`, `--json`, `--timeout-secs`.
 
 ## OpenCode adapter
@@ -223,9 +229,10 @@ Location: `adapters/opencode/` (Promise plugin, `@opencode/plugin`). Verified co
 
 ## Deployment
 
-- `deploy/compose.yaml`: `qdrant` (`qdrant/qdrant:v1.20.2`, named volume for `/qdrant/storage`, no host port by default) and `mementod` (port `127.0.0.1:7377`, `depends_on` qdrant healthy).
+- `deploy/compose.yaml`: `qdrant` (`qdrant/qdrant:v1.20.2`, named volume for `/qdrant/storage`, no host port by default) and `mementod` (port `127.0.0.1:7377`, `depends_on` qdrant healthy). The binary embeds this Compose configuration; the managed CLI writes it to `${XDG_DATA_HOME:-~/.local/share}/memento/compose.yaml` and invokes `docker compose -p memento`. The named volume remains `memento_qdrant_storage`, preserving data from the former checkout-based Compose invocation.
 - Qdrant healthcheck without curl: `bash -c ':> /dev/tcp/127.0.0.1/6333'` (image is Debian based; verify bash presence during implementation).
 - `mementod` image: multi-stage, glibc Debian builder and runtime (ORT prebuilt binaries are glibc only and need libc++). The embedding model is downloaded at build time by `mementod warmup` into `/opt/memento/models` (`FASTEMBED_CACHE_DIR`), so containers start offline.
+- Release build: one workspace version in the root `Cargo.toml`; pushing tag `v<version>` runs `.github/workflows/release.yml`. It builds the OpenCode bundle with Bun for embedding by `crates/memento-cli/build.rs`, four target archives and SHA-256 files, multi-architecture `ghcr.io/luckynee/mementod:<version>` and `latest` images, and a GitHub release with `install.sh`. CI runs Rust format, clippy and tests, adapter Bun tests and TypeScript checks, and shellcheck. The installer and updater require a published release.
 
 ## Cross-harness (v1.1)
 

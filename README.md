@@ -11,24 +11,36 @@ Design and verified contracts: [docs/DESIGN.md](docs/DESIGN.md). Code map: [docs
 ## Quick start
 
 ```sh
+curl -fsSL https://github.com/luckynee/memento/releases/latest/download/install.sh | sh
+```
+
+The installer downloads `memento` and `memento-mcp`, verifies the SHA-256 checksum, and runs `memento setup` when a terminal is available. Setup guides harness configuration and can start the managed daemon. Docker with Compose is required for the daemon. The installer requires a published GitHub release.
+
+Override install settings with `MEMENTO_VERSION` (for example `0.2.0` or `v0.2.0`), `MEMENTO_INSTALL_DIR` (default `~/.local/bin`), or `MEMENTO_NO_SETUP=1`.
+
+### Install and update
+
+Run `memento setup` to configure detected harnesses, install embedded skills and the embedded OpenCode plugin, and optionally start the managed daemon. The wizard previews changes before confirmation. `memento setup --start-daemon` starts the managed daemon without prompting; for non-interactive setup, also specify `--yes --harness ... --scope ...`.
+
+Alternatively, configure harnesses manually with `memento install-hooks <harness>` and `memento install-skills`, then add the installed OpenCode plugin at `${XDG_DATA_HOME:-~/.local/share}/memento/opencode-plugin/` to `opencode.jsonc` (see [Other harnesses](#other-harnesses) and [adapters/opencode/README.md](adapters/opencode/README.md)). Your own tooling can use the generic hook, `memento import`/`memento ingest`, MCP, or the daemon HTTP API ([docs/DESIGN.md](docs/DESIGN.md)).
+
+```sh
+memento update
+memento doctor
+memento daemon up|down|status|logs [-f]|pull
+```
+
+`memento update --check` checks for an available update, `--version <x.y.z>` selects a release, and `--refresh` reapplies saved setup without replacing binaries. Updates replace binaries only for installer-managed installs; Cargo installs should use `cargo install --path crates/memento-cli` or the installer. A managed daemon is pulled and restarted during refresh. `memento doctor --offline` skips the latest-release check.
+
+### From source
+
+```sh
 docker compose -f deploy/compose.yaml -p memento up -d --build
 cargo install --path crates/memento-cli
 cd adapters/opencode && bun install
-cd ../..
 ```
 
-Then connect your harnesses in one of two ways. Both produce the same configuration.
-
-- Guided: run `memento setup`.
-- Manual: run `memento install-hooks <harness>` and `memento install-skills` yourself and add the OpenCode plugin entry to `opencode.jsonc` (see [Other harnesses](#other-harnesses) and [adapters/opencode/README.md](adapters/opencode/README.md)). Your own harness or tooling can instead use the generic hook, `memento import`/`memento ingest`, MCP, or the daemon HTTP API ([docs/DESIGN.md](docs/DESIGN.md)).
-
-The wizard detects installed harnesses, chooses project or user scope, configures subagent memory, and optionally installs skills. It previews changes before confirmation. To configure without prompts:
-
-```sh
-memento setup --harness opencode,codex --scope project --project DIR --opencode-plugin /absolute/path/to/memento-pool/adapters/opencode --skills-source /absolute/path/to/memento-pool/skills --yes --dry-run
-```
-
-Remove `--dry-run` to apply. If automatic discovery fails, provide `--opencode-plugin` and `--skills-source`, or set `MEMENTO_OPENCODE_PLUGIN` and `MEMENTO_SKILLS_DIR`. JSONC files containing comments or trailing commas are left unchanged; setup prints the plugin snippet for manual insertion.
+Run `memento setup` from the checkout. Development checkouts can pass `--opencode-plugin /path/to/memento-pool/adapters/opencode` and `--skills-source /path/to/memento-pool/skills`; the equivalent environment overrides are `MEMENTO_OPENCODE_PLUGIN` and `MEMENTO_SKILLS_DIR`. JSONC files containing comments or trailing commas are left unchanged; setup prints the plugin snippet for manual insertion.
 
 ## Daily use
 
@@ -63,11 +75,11 @@ Explicit forgetting is destructive. Preview it with `--dry-run` (reports the seg
 
 ### Skills
 
-From the repository, preview or install the bundled skills:
+Preview or install the embedded skills; `--source` is optional:
 
 ```sh
-memento install-skills --harness all --project DIR --source skills --dry-run
-memento install-skills --harness all --project DIR --source skills
+memento install-skills --harness all --project DIR --dry-run
+memento install-skills --harness all --project DIR
 ```
 
 Use `--user` instead of `--project DIR` for user-wide installation. The installer skips foreign skills. Project locations are `.opencode/skills`, `.claude/skills`, and `.agents/skills` (shared by Codex and agy); user locations are `~/.config/opencode/skills`, `~/.claude/skills`, `~/.agents/skills`, and `~/.gemini/config/skills`, respectively.
@@ -83,3 +95,7 @@ cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings && cargo
 MEMENTO_TEST_QDRANT_URL=http://127.0.0.1:16334 cargo test -p mementod
 cd adapters/opencode && bun test && bunx tsc --noEmit
 ```
+
+### Releasing
+
+Bump the workspace version in the root `Cargo.toml`, tag it `vX.Y.Z`, and push the tag to trigger the release workflow.
