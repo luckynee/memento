@@ -75,7 +75,7 @@ async fn route_workflow() {
             cache_dir: None,
             duplicate_cosine_threshold: 0.95,
             duplicate_jaccard_threshold: 0.8,
-            stale_days: 7,
+            stale_secs: 7 * 86_400,
             stale_sweep_secs: 3600,
         },
         policy: Default::default(),

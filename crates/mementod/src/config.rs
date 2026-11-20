@@ -11,7 +11,7 @@ pub struct Config {
     pub cache_dir: Option<PathBuf>,
     pub duplicate_cosine_threshold: f32,
     pub duplicate_jaccard_threshold: f32,
-    pub stale_days: u64,
+    pub stale_secs: u64,
     pub stale_sweep_secs: u64,
 }
 
@@ -38,15 +38,42 @@ impl Config {
                 .unwrap_or_else(|_| "0.8".into())
                 .parse()
                 .context("invalid MEMENTO_DUPLICATE_JACCARD_THRESHOLD")?,
-            stale_days: env::var("MEMENTO_STALE_DAYS")
-                .unwrap_or_else(|_| "7".into())
-                .parse()
-                .context("invalid MEMENTO_STALE_DAYS")?,
+            stale_secs: stale_seconds(
+                env::var("MEMENTO_STALE_SECS").ok().as_deref(),
+                env::var("MEMENTO_STALE_DAYS").ok().as_deref(),
+            )?,
             stale_sweep_secs: env::var("MEMENTO_STALE_SWEEP_SECS")
                 .unwrap_or_else(|_| "3600".into())
                 .parse::<u64>()
                 .context("invalid MEMENTO_STALE_SWEEP_SECS")?
                 .max(1),
         })
+    }
+}
+
+fn stale_seconds(seconds: Option<&str>, days: Option<&str>) -> Result<u64> {
+    if let Some(seconds) = seconds.and_then(|value| value.parse::<u64>().ok()) {
+        return Ok(seconds);
+    }
+    let days = days
+        .unwrap_or("7")
+        .parse::<u64>()
+        .context("invalid MEMENTO_STALE_DAYS")?;
+    days.checked_mul(86_400)
+        .context("MEMENTO_STALE_DAYS is too large")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stale_seconds;
+
+    #[test]
+    fn stale_seconds_precedence_and_parsing() {
+        assert_eq!(stale_seconds(None, None).unwrap(), 604_800);
+        assert_eq!(stale_seconds(Some("2"), Some("invalid")).unwrap(), 2);
+        assert_eq!(stale_seconds(Some("0"), Some("7")).unwrap(), 0);
+        assert_eq!(stale_seconds(Some("-1"), Some("2")).unwrap(), 172_800);
+        assert_eq!(stale_seconds(Some("bad"), None).unwrap(), 604_800);
+        assert!(stale_seconds(None, Some("bad")).is_err());
     }
 }

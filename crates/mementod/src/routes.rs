@@ -90,7 +90,7 @@ pub fn router(state: AppState) -> Router {
         operation_lock: Arc::new(RwLock::new(())),
         session_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
     };
-    if state.app.config.stale_days > 0 {
+    if state.app.config.stale_secs > 0 {
         let sweep_state = state.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(
@@ -392,14 +392,14 @@ fn stale_sessions(
     records: &[SessionRecord],
     slots: &[ContinuationRecord],
     now: DateTime<Utc>,
-    stale_days: u64,
+    stale_secs: u64,
 ) -> Vec<SessionKey> {
-    if stale_days == 0 {
+    if stale_secs == 0 {
         return Vec::new();
     }
-    let threshold = i64::try_from(stale_days)
+    let threshold = i64::try_from(stale_secs)
         .ok()
-        .and_then(Duration::try_days)
+        .and_then(Duration::try_seconds)
         .and_then(|duration| now.checked_sub_signed(duration))
         .unwrap_or(DateTime::<Utc>::MIN_UTC);
     let records = records
@@ -475,7 +475,7 @@ async fn sweep_projects(
         stale: Vec::new(),
         removed: Vec::new(),
     };
-    if state.app.config.stale_days == 0 {
+    if state.app.config.stale_secs == 0 {
         return Ok(response);
     }
     let _operation = state.operation_lock.write().await;
@@ -505,7 +505,7 @@ async fn sweep_projects(
             .into_iter()
             .map(|(_, slot)| slot)
             .collect::<Vec<_>>();
-        let stale = stale_sessions(&project_records, &slots, now, state.app.config.stale_days);
+        let stale = stale_sessions(&project_records, &slots, now, state.app.config.stale_secs);
         if !dry_run {
             for mut record in project_records {
                 if stale.contains(&session_key(&record)) {
@@ -1520,10 +1520,10 @@ mod tests {
         parent.last_active_at = Some(now - Duration::days(8));
         child.last_active_at = Some(now);
         let records = vec![parent.clone(), child.clone()];
-        assert!(stale_sessions(&records, &[], now, 7).is_empty());
+        assert!(stale_sessions(&records, &[], now, 7 * 86_400).is_empty());
         child.last_active_at = Some(now - Duration::days(8));
         let records = vec![parent.clone(), child.clone()];
-        assert_eq!(stale_sessions(&records, &[], now, 7).len(), 2);
+        assert_eq!(stale_sessions(&records, &[], now, 7 * 86_400).len(), 2);
         assert!(stale_sessions(&records, &[], now, 0).is_empty());
         let slot = ContinuationRecord {
             project: "project".into(),
@@ -1534,10 +1534,10 @@ mod tests {
             claimed_by: None,
             claimed_at: None,
         };
-        assert!(stale_sessions(&records, &[slot], now, 7).is_empty());
+        assert!(stale_sessions(&records, &[slot], now, 7 * 86_400).is_empty());
         child.retention = Retention::Keep;
         assert_eq!(
-            stale_sessions(&[parent.clone(), child], &[], now, 7),
+            stale_sessions(&[parent.clone(), child], &[], now, 7 * 86_400),
             vec![session_key(&parent)]
         );
     }
