@@ -78,6 +78,10 @@ function truncate(text: string): string {
 
 function truncatePart(value: unknown): unknown {
     const part = record(value);
+    if ((part?.type === "text" || part?.type === "reasoning") && typeof part.text === "string") {
+        const shortened = truncate(part.text);
+        return shortened === part.text ? value : { ...part, text: shortened };
+    }
     const result = record(part?.result);
     if (part?.type !== "tool-result" || !result) {
         return value;

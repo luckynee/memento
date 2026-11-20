@@ -120,6 +120,40 @@ describe("snapshot rewriting", () => {
         expect(content[1]).toBe(json);
     });
 
+    test("truncates oversized pre-cut text and reasoning without changing structured parts or the cut", () => {
+        const text = "a".repeat(1000) + "x".repeat(8500) + "z".repeat(500);
+        const reasoning = "b".repeat(1000) + "y".repeat(8500) + "w".repeat(500);
+        const call = { type: "tool-call", input: { query: "q".repeat(10000) } };
+        const json = { type: "tool-result", result: { type: "json", value: { output: "j".repeat(5000) } } };
+        const cut = message("cut", "user", text);
+        const after = { id: "after", role: "assistant", content: [{ type: "reasoning", text: reasoning }] };
+        const messages: ConversationMessage[] = [
+            message("old", "user", "old"),
+            message("tail", "user", text),
+            { id: "assistant", role: "assistant", content: [{ type: "reasoning", text: reasoning }, call] },
+            { id: "tool", role: "tool", content: [json] },
+            cut,
+            after,
+        ];
+        const input = { system: system(), messages };
+        const snapshot = { cutMessageID: "cut", digest: "d".repeat(2000) };
+        const before = JSON.stringify(input);
+        const result = rewriteForSwitch(input, snapshot, { ...options, tailCharBudget: 4000 });
+        const marker = "\n[... truncated by memento ...]\n";
+        expect(result.messages.map((entry) => entry.id)).toEqual(["tail", "assistant", "tool", "cut", "after"]);
+        expect(result.messages[0].content).toEqual([
+            { type: "text", text: buildDigestText(snapshot.digest) },
+            { type: "text", text: "a".repeat(1000) + marker + "z".repeat(500) },
+        ]);
+        expect(result.messages[1].content[0]).toEqual({ type: "reasoning", text: "b".repeat(1000) + marker + "w".repeat(500) });
+        expect(result.messages[1].content[1]).toBe(call);
+        expect(result.messages[2].content[0]).toBe(json);
+        expect(result.messages[3]).toBe(cut);
+        expect(result.messages[4]).toBe(after);
+        expect(JSON.stringify(result)).toBe(JSON.stringify(rewriteForSwitch(input, snapshot, { ...options, tailCharBudget: 4000 })));
+        expect(JSON.stringify(input)).toBe(before);
+    });
+
     test("compacted or missing cut hoists system text and retains other messages", () => {
         const messages = [message("initial", "assistant", "initial"), ...history(), message("sys2", "system", "after"), message("end", "user", "end")];
         for (const cutMessageID of [null, "missing"]) {
