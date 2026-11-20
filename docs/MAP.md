@@ -8,14 +8,15 @@
 | `crates/memento-core/src/segment.rs` | `SegmentPolicy` (tool sets, truncation and chunk limits) and `segment_items` |
 | `crates/memento-core/src/ids.rs` | `POINT_NAMESPACE`: changing it changes every stored point id |
 | `crates/memento-core/src/lineage.rs` | `ancestors`, `descendants`, `would_create_cycle` |
-| `crates/memento-core/src/rerank.rs` | RRF normalization + recency rerank (no wall clock) |
+| `crates/memento-core/src/rerank.rs` | RRF normalization + recency rerank (no wall clock); question `user_request` factor 0.6, absence-only factor 0.4 |
+| `crates/memento-core/src/absence.rs` | `is_absence_statement`: shared by digest (skip) and rerank (penalty); phrase heuristics, not semantic |
 | `crates/memento-core/src/digest.rs` | `render_digest`, `merge_chunks`; byte-stable output |
 | `crates/mementod/src/routes.rs` | All HTTP routes, bearer auth, error mapping |
 | `crates/mementod/src/store.rs` | Qdrant schema, segment upsert (dense + bm25 Document), hybrid RRF candidates, session registry, continuation slots per `(project, target_harness)` (`list_continuations` keeps legacy project-only ids) |
 | `crates/mementod/src/embed.rs` | `Embedder` trait, `FastEmbedder` (spawn_blocking), `FakeEmbedder` for tests |
 | `crates/mementod/tests/` | Live Qdrant tests, gated on `MEMENTO_TEST_QDRANT_URL` |
 | `crates/memento-cli/src/main.rs` | `memento` CLI, HTTP client of mementod |
-| `adapters/opencode/src/` | OpenCode V2 plugin: `client`, `transcript`, `ingest`, `session-ownership`, `switch` (pure rewrite), `switch-controller`, `tools`, `commands`, `options`, `index` |
+| `adapters/opencode/src/` | OpenCode V2 plugin: `client`, `transcript`, `ingest`, `session-ownership`, `switch` (pure rewrite), `switch-controller`, `subagent-memory` (opt-in parent digest for child sessions), `tools`, `commands`, `options`, `index` |
 | `adapters/opencode/test/` | `bun test` suites (mocked daemon and Jev) |
 | `deploy/` | `Dockerfile` (rust:1.95-trixie builder, debian:trixie-slim + libc++1 runtime, model baked by `mementod warmup`), `compose.yaml` |
 
@@ -24,6 +25,7 @@
 - `memento/ingest/<sessionID>`: ingest cursor
 - `memento/registered/<sessionID>`: session registered with the daemon
 - `memento/switch/<sessionID>`: `{ origin, lastModel, snapshots }`
+- `memento/subagent/<childID>`: frozen framed parent digest for a child session (`subagentMemory: "digest"`)
 
 ## Cross-harness pieces
 
@@ -65,10 +67,15 @@
 - Messy-data proof 2026-11-19 in `/tmp/memento-messy` (reversed decisions, corrected near-duplicate values, 5 file edits, chain OpenCode -> Claude Code -p -> Codex exec -> agy MCP -> new OpenCode on claude-agent Haiku): latest values recalled across all hops; one of three final-hop runs answered an older quoted request instead of the current one.
 - Demo tooling 2026-11-19: `opencode api POST /api/session/<id>/fork -d '{}'` clones a big session per take; `POST /api/session` takes `agent`, `model {id, providerID, variant}`, `location {directory}`. OpenCode TUI `Home`/`PageDown`/`End` scroll the transcript; TUI tabs are held by the background service (editing `tui/tabs.json` does not stick). The 2026-11-19 preview is `/home/luckynee/video/memento-pool-preview.mp4`.
 - Deletion facts (probe plugin, OpenCode 2.3.2, 2026-11-19): `session.deleted` carries only `data.sessionID` (`location` null), reaches every loaded plugin instance, fires once per deleted child, and `session.get` then throws NotFound; `session.archived` is separate; `ctx.event.subscribe` has no replay. `opencode api GET /api/session/<id>` exits 1 for both `HTTP 404 SessionNotFoundError` and `Could not reach server`. Evicting a location needs `opencode api DELETE /api/debug/location --param 'location[directory]=DIR' -H 'x-opencode-directory: DIR'`; plugin packages must be directories.
-- A git repo with no commits gets OpenCode project id `global`, shared by all such directories; the adapter also compares `location.directory` for ownership and keys global projects by directory (live verification pending).
+- A git repo with no commits gets OpenCode project id `global`, shared by all such directories; the adapter also compares `location.directory` for ownership and keys global projects by directory. Verified live 2026-11-20 on the shared service: two no-commit repos (both `projectID: global`) stored one session each under their own directory keys and nothing under `global`.
 - Codex 0.170 `archive` moves the rollout to `~/.codex/archived_sessions/`; `delete --force` removes it and its `session_index.jsonl` entry (non-interactive `delete` without `--force` refuses). Claude Code deletes transcripts silently after `cleanupPeriodDays` (default 30).
 - Release/gc verified live 2026-11-19 in `/tmp/memento-messy`: leaf delete collected (3 -> 0 segments, tombstone kept); parent with a Claude child retained and still recalled by the child; removing the child transcript + `memento gc` released the child and cascaded the parent; late Stop import into a tombstone stored nothing; archive left segments untouched; fork whose parent was collected before its first turn registered without parent and ingested the copied history.
 - Generic hooks verified live 2026-11-19 with harness `myagent`: a claim returned continuation context, ingested items were searchable with parent lineage, subagent start was not registered, and `session_deleted` cleared memory.
 - An OpenCode child with `parentID` stored zero segments and was not registered in a live 2026-11-19 check.
 - Skills verified 2026-11-19: after `memento install-skills --harness all --project DIR`, OpenCode (`GET /api/skill`), Claude Code 2.1.328, Codex 0.170.0 and agy 1.5.12 each listed the four `memento-*` skills; Claude Haiku 5.5 answered a project-memory question through `memento-recall` with `memento search "<topic>"` from the project directory. Claude Code transcripts log each tool call twice, so count unique `tool_use` ids. Search ranks earlier questions (`user_request`) that repeat the query wording above the answering note.
+- Live checks 2026-11-20 on throwaway daemons (`/tmp/memento-exp`): question `user_request` ranked below the answering note (1.312 vs 1.25) and an absence-only note below the real fact; the digest omitted the absence note and carried the "answer only the current user message" framing; `MEMENTO_STALE_SECS=8` marked and collected an idle session while a `sessions keep` session survived; `forget --dry-run` reported `would delete: 1` and deleted nothing; `sessions keep` on a missing session exits 1. With real `memento hook agy` hooks, an agy 1.5.13 main conversation was registered and imported while its `invoke_subagent` child (`sender=<main id>`) was not. Per-import pending markers are named `<harness>-<session>.<pid>-<nanos>`; a true overlap was not reproduced live (unit tests only).
+- OpenCode v2.3.2 invokes the plugin `context` hook for child sessions (verified 2026-11-20: `subagentMemory: "digest"` children answered parent-only facts and their first request grew by about 490 tokens). `opencode run` takes its Location from `$PWD`, not the process cwd; scripted runs must set `PWD`.
+- Claude Code 2.1.328 `SubagentStart` `hookSpecificOutput.additionalContext` reaches the subagent (verified 2026-11-20 with Haiku: parent-only facts answered, first request +about 700 tokens). `SubagentStop` input carries `agent_transcript_path` (`~/.claude/projects/<project>/<session>/subagents/agent-<agent_id>.jsonl`); `session_id` and `transcript_path` are the parent's.
+- Fork cutoff verified live 2026-11-20: an OpenCode fork registered with `parent_cutoff` = the fork's `time.created`; its lineage search and digest kept the parent's pre-fork fact and excluded a fact the parent recorded after the fork, while the parent's own search still found it.
+- Subagent memory A/B 2026-11-20: see `docs/experiments/2026-11-20-subagent-memory.md` (digest injection 4/4 recall vs 0/4 without; tool-only recall 0/4, `memory_search` never called).
 - `adapters/opencode/src/jev.ts` `stripScaffolding` mirrors the Rust `strip_scaffolding` default tag set in `crates/memento-core/src/segment.rs`; keep both in sync.
