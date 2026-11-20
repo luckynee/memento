@@ -229,6 +229,18 @@ describe("incremental ingestion", () => {
         expect(fake.values.get("memento/registered/s")).toBe(true);
     });
 
+    test("skips identical assistant payloads and sends grown content", async () => {
+        const fake = setup();
+        fake.contexts.set("s", [assistant("a", "first")]);
+        await fake.ingestor.flush("s");
+        await fake.ingestor.flush("s");
+        expect(fake.ingests).toHaveLength(1);
+        fake.contexts.set("s", [assistant("a", "first and more")]);
+        await fake.ingestor.flush("s");
+        expect(fake.ingests).toHaveLength(2);
+        expect(fake.ingests[1].items[0].text).toBe("first and more");
+    });
+
     test("resends growing assistant content and caches unchanged classifications", async () => {
         let calls = 0;
         const fake = setup(async () => {
@@ -239,11 +251,56 @@ describe("incremental ingestion", () => {
         await fake.ingestor.flush("s");
         await fake.ingestor.flush("s");
         expect(calls).toBe(1);
-        expect(fake.ingests).toHaveLength(2);
+        expect(fake.ingests).toHaveLength(1);
         fake.contexts.set("s", [assistant("a", "changed")]);
         await fake.ingestor.flush("s");
         expect(calls).toBe(2);
-        expect(fake.ingests[2].items[0].kind_hint).toBe("decision");
+        expect(fake.ingests[1].items[0].kind_hint).toBe("decision");
+    });
+
+    test("sends changed tool results and new messages", async () => {
+        const fake = setup();
+        const message = (output: string) => ({
+            id: "a",
+            type: "assistant",
+            time: { created: 0 },
+            content: [
+                { type: "text", text: "first" },
+                { type: "tool", id: "t", name: "bash", state: { status: "completed", input: {}, content: [{ type: "text", text: output }] } },
+            ],
+        });
+        fake.contexts.set("s", [message("before")]);
+        await fake.ingestor.flush("s");
+        fake.contexts.set("s", [message("after")]);
+        await fake.ingestor.flush("s");
+        expect(fake.ingests).toHaveLength(2);
+        expect(fake.ingests[1].items[1].tool?.output).toBe("after");
+        fake.contexts.set("s", [message("after"), user("b")]);
+        await fake.ingestor.flush("s");
+        expect(fake.ingests).toHaveLength(3);
+        expect(fake.ingests[2].items.map((item) => item.source_id)).toEqual(["a:text:0", "a:tool:t", "b"]);
+    });
+
+    test("retries a failed changed payload without caching it", async () => {
+        const fake = setup();
+        fake.contexts.set("s", [assistant("a", "first")]);
+        await fake.ingestor.flush("s");
+        fake.contexts.set("s", [assistant("a", "changed")]);
+        fake.setFail(true);
+        await expect(fake.ingestor.flush("s")).rejects.toThrow("ingest failed");
+        fake.setFail(false);
+        await fake.ingestor.flush("s");
+        expect(fake.ingests).toHaveLength(2);
+        expect(fake.ingests[1].items[0].text).toBe("changed");
+    });
+
+    test("forget clears the successful payload hash", async () => {
+        const fake = setup();
+        fake.contexts.set("s", [assistant("a", "first")]);
+        await fake.ingestor.flush("s");
+        await fake.ingestor.forget("s");
+        await fake.ingestor.flush("s");
+        expect(fake.ingests).toHaveLength(2);
     });
 
     test("classifies user items through the same gate as assistant items", async () => {

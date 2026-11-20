@@ -27,6 +27,7 @@ export function createIngestor(deps: {
         registered: boolean;
         retryClaim: boolean;
         classifications: Map<string, { hash: string; kind: string | null }>;
+        lastIngestHash?: string;
     }>();
 
     function sessionState(sessionID: string) {
@@ -184,7 +185,11 @@ export function createIngestor(deps: {
             });
         }
         if (items.length) {
-            await deps.client.ingest({ harness: deps.harness, project: deps.project, session: sessionID, items });
+            const hash = createHash("sha256").update(JSON.stringify(items)).digest("hex");
+            if (selection.nextCursor !== cursor || sessionState(sessionID).lastIngestHash !== hash) {
+                await deps.client.ingest({ harness: deps.harness, project: deps.project, session: sessionID, items });
+                sessionState(sessionID).lastIngestHash = hash;
+            }
         }
         if (selection.nextCursor !== undefined) {
             await deps.storage.set(`memento/ingest/${sessionID}`, selection.nextCursor);
