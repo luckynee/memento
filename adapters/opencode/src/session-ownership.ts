@@ -1,4 +1,21 @@
+import { realpathSync } from "node:fs";
+import { parse, resolve } from "node:path";
+
 type SessionInfo = { projectID: string; parentID?: string; agent?: string; location?: { directory?: string } };
+
+export function normalizeDirectory(directory: string): string {
+    let normalized: string;
+    try {
+        normalized = realpathSync.native(directory);
+    } catch {
+        normalized = resolve(directory);
+    }
+    const root = parse(normalized).root;
+    while (normalized.length > root.length && /[/\\]$/.test(normalized)) {
+        normalized = normalized.slice(0, -1);
+    }
+    return normalized;
+}
 
 export function createSessionOwnership(deps: {
     getSession(sessionID: string): Promise<SessionInfo>;
@@ -19,7 +36,7 @@ export function createSessionOwnership(deps: {
         }
         const directory = session.location?.directory;
         return typeof directory === "string" && directory.length > 0
-            && directory.replace(/\/$/, "") === deps.directory.replace(/\/$/, "");
+            && normalizeDirectory(directory) === normalizeDirectory(deps.directory);
     };
 
     const lookupSession = async (sessionID: string): Promise<SessionOwnership | undefined> => {

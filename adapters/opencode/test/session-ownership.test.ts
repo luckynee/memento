@@ -1,4 +1,7 @@
 import { expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createSessionOwnership } from "../src/session-ownership";
 
 test("caches owned and foreign sessions and bounds the cache", async () => {
@@ -120,7 +123,7 @@ test("bounds ancestor traversal", async () => {
     expect(await ownsSession.root("0")).toBeUndefined();
 });
 
-test("global ownership requires the same directory with at most one trailing slash ignored", async () => {
+test("global ownership requires the same normalized directory", async () => {
     const sessions: Record<string, { projectID: string; location?: { directory?: string } }> = {
         same: { projectID: "global", location: { directory: "/project/" } },
         other: { projectID: "global", location: { directory: "/other" } },
@@ -137,10 +140,53 @@ test("global ownership requires the same directory with at most one trailing sla
         log() {},
     });
     expect(await ownsSession("same")).toBe(true);
-    for (const sessionID of ["other", "missingLocation", "missingDirectory", "emptyDirectory", "multipleSlashes", "otherProject"]) {
+    expect(await ownsSession("multipleSlashes")).toBe(true);
+    for (const sessionID of ["other", "missingLocation", "missingDirectory", "emptyDirectory", "otherProject"]) {
         expect(await ownsSession(sessionID)).toBe(false);
     }
     expect(ownsSession.isOwned({ projectID: "global", location: { directory: "/project" } })).toBe(true);
+});
+
+test("global ownership resolves symlink aliases on both sides", async () => {
+    const temporaryDirectory = mkdtempSync(join(tmpdir(), "memento-ownership-"));
+    try {
+        const directory = join(temporaryDirectory, "project");
+        const alias = join(temporaryDirectory, "alias");
+        mkdirSync(directory);
+        symlinkSync(directory, alias, "dir");
+        const ownsAlias = createSessionOwnership({
+            async getSession() { return { projectID: "global", location: { directory: alias } }; },
+            projectID: "global",
+            directory,
+            log() {},
+        });
+        const ownsDirectory = createSessionOwnership({
+            async getSession() { return { projectID: "global", location: { directory } }; },
+            projectID: "global",
+            directory: alias,
+            log() {},
+        });
+        expect(await ownsAlias("alias")).toBe(true);
+        expect(await ownsDirectory("directory")).toBe(true);
+    } finally {
+        rmSync(temporaryDirectory, { recursive: true, force: true });
+    }
+});
+
+test("global ownership normalizes trailing backslashes and missing directories", async () => {
+    const temporaryDirectory = mkdtempSync(join(tmpdir(), "memento-ownership-"));
+    try {
+        const missingDirectory = join(temporaryDirectory, "missing");
+        const ownsSession = createSessionOwnership({
+            async getSession() { return { projectID: "global", location: { directory: `${missingDirectory}\\` } }; },
+            projectID: "global",
+            directory: `${missingDirectory}//`,
+            log() {},
+        });
+        expect(await ownsSession("missing")).toBe(true);
+    } finally {
+        rmSync(temporaryDirectory, { recursive: true, force: true });
+    }
 });
 
 test("non-global ownership ignores the session directory", async () => {

@@ -4,7 +4,7 @@ import { createContinueCommand, createHandoffCommand } from "./commands";
 import { createIngestor } from "./ingest";
 import { createJevGate, type DecisionsFn } from "./jev";
 import { resolveOptions } from "./options";
-import { createSessionOwnership } from "./session-ownership";
+import { createSessionOwnership, normalizeDirectory } from "./session-ownership";
 import { createSubagentMemoryController } from "./subagent-memory";
 import { cloneMessage, type ConversationMessage, type SystemText } from "./switch";
 import { createSwitchController } from "./switch-controller";
@@ -28,7 +28,7 @@ function waitForRetry(signal: AbortSignal): Promise<void> {
 
 export function projectKey(project: { id: string; canonical?: unknown }, directory: string): string {
     if (project.id === "global") {
-        return directory;
+        return normalizeDirectory(directory);
     }
     return typeof project.canonical === "string" && project.canonical.length > 0 ? project.canonical : project.id;
 }

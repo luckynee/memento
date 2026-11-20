@@ -1,5 +1,8 @@
 import { expect, test } from "bun:test";
 import type { Plugin } from "@opencode/plugin";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { frameContinuation } from "../src/commands";
 import plugin, { projectKey } from "../src/index";
 
@@ -9,6 +12,29 @@ test("uses the canonical project path when available", () => {
     expect(projectKey({ id: "id", canonical: null }, "/location")).toBe("id");
     expect(projectKey({ id: "id" }, "/location")).toBe("id");
     expect(projectKey({ id: "global", canonical: "/shared" }, "/location")).toBe("/location");
+});
+
+test("global project keys resolve directory symlinks", () => {
+    const temporaryDirectory = mkdtempSync(join(tmpdir(), "memento-project-key-"));
+    try {
+        const directory = join(temporaryDirectory, "project");
+        const alias = join(temporaryDirectory, "alias");
+        mkdirSync(directory);
+        symlinkSync(directory, alias, "dir");
+        expect(projectKey({ id: "global", canonical: "/" }, alias)).toBe(realpathSync.native(directory));
+    } finally {
+        rmSync(temporaryDirectory, { recursive: true, force: true });
+    }
+});
+
+test("global project keys resolve missing directories without throwing", () => {
+    const temporaryDirectory = mkdtempSync(join(tmpdir(), "memento-project-key-"));
+    try {
+        const missingDirectory = join(temporaryDirectory, "missing");
+        expect(projectKey({ id: "global" }, `${missingDirectory}//`)).toBe(resolve(missingDirectory));
+    } finally {
+        rmSync(temporaryDirectory, { recursive: true, force: true });
+    }
 });
 
 test("context claims inject once, preserve existing continuation, and coexist with switch rewrites", async () => {
