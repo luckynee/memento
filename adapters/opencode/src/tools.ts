@@ -1,5 +1,5 @@
 import { MementoError, type MementoClient, type SearchScope } from "./client";
-import { judgeRelevance, type DecisionsFn, type JevModel } from "./jev";
+import { forEachJevItem, judgeRelevance, type DecisionsFn, type JevModel } from "./jev";
 import { neutralizeMementoTags } from "./switch";
 
 export function createMemorySearchTool(deps: {
@@ -50,20 +50,14 @@ export function createMemorySearchTool(deps: {
                 if (deps.decide) {
                     const decide = deps.decide;
                     const proseKinds = new Set(["user_request", "assistant_note", "decision", "constraint", "task"]);
-                    try {
-                        const judgments = await Promise.all(hits.map(async (hit) => {
-                            if (!proseKinds.has(hit.kind)) {
-                                return true;
-                            }
-                            const probability = await judgeRelevance(decide, deps.jevModel, query, hit.text);
-                            if (probability === undefined) {
-                                throw new Error("Jev relevance judgment failed");
-                            }
-                            return probability >= 0.5;
-                        }));
-                        hits = hits.filter((_, index) => judgments[index]);
-                    } catch {
-                        hits = result.hits;
+                    const judgments: (number | undefined)[] = Array(hits.length).fill(undefined);
+                    await forEachJevItem(hits, async (hit, index) => {
+                        if (proseKinds.has(hit.kind)) {
+                            judgments[index] = await judgeRelevance(decide, deps.jevModel, query, hit.text);
+                        }
+                    });
+                    if (judgments.some((probability) => probability !== undefined)) {
+                        hits = hits.filter((_, index) => judgments[index] === undefined || judgments[index]! >= 0.5);
                     }
                 }
                 hits = [...hits].sort((a, b) => b.score - a.score).slice(0, 6);

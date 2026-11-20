@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { MementoError, type MementoClient } from "./client";
 import { frameContinuation } from "./commands";
-import { classifyKind, type DecisionsFn, type JevModel } from "./jev";
+import { classifyKind, forEachJevItem, type DecisionsFn, type JevModel } from "./jev";
 import { mapMessage, selectNewMessages } from "./transcript";
 
 type Storage = {
@@ -168,24 +168,20 @@ export function createIngestor(deps: {
             const decide = deps.decide;
             const textItems = items.filter((item) => item.role === "assistant" || item.role === "user");
             const cache = sessionState(sessionID).classifications;
-            let index = 0;
-            await Promise.all(Array.from({ length: Math.min(4, textItems.length) }, async () => {
-                while (index < textItems.length) {
-                    const item = textItems[index++];
-                    const hash = createHash("sha256").update(item.role).update("\0").update(item.text).digest("hex");
-                    const cached = cache.get(item.source_id);
-                    if (cached?.hash === hash) {
-                        item.kind_hint = cached.kind;
-                    } else {
-                        item.kind_hint = await classifyKind(decide, deps.jevModel, item.text, item.role as "user" | "assistant");
-                    }
-                    cache.delete(item.source_id);
-                    cache.set(item.source_id, { hash, kind: item.kind_hint });
-                    if (cache.size > 500) {
-                        cache.delete(cache.keys().next().value!);
-                    }
+            await forEachJevItem(textItems, async (item) => {
+                const hash = createHash("sha256").update(item.role).update("\0").update(item.text).digest("hex");
+                const cached = cache.get(item.source_id);
+                if (cached?.hash === hash) {
+                    item.kind_hint = cached.kind;
+                } else {
+                    item.kind_hint = await classifyKind(decide, deps.jevModel, item.text, item.role as "user" | "assistant");
                 }
-            }));
+                cache.delete(item.source_id);
+                cache.set(item.source_id, { hash, kind: item.kind_hint });
+                if (cache.size > 500) {
+                    cache.delete(cache.keys().next().value!);
+                }
+            });
         }
         if (items.length) {
             await deps.client.ingest({ harness: deps.harness, project: deps.project, session: sessionID, items });

@@ -91,6 +91,16 @@ export type DecisionsFn = (input: {
     questions: Question[];
 }) => Promise<{ answers: ReadonlyArray<Answer> }>;
 
+export async function forEachJevItem<T>(items: readonly T[], process: (item: T, index: number) => Promise<void>): Promise<void> {
+    let index = 0;
+    await Promise.all(Array.from({ length: Math.min(4, items.length) }, async () => {
+        while (index < items.length) {
+            const currentIndex = index++;
+            await process(items[currentIndex], currentIndex);
+        }
+    }));
+}
+
 export function createJevGate(deps: {
     decide: DecisionsFn;
     cooldownMs: number;

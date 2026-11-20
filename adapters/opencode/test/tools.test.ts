@@ -57,6 +57,60 @@ describe("memory search", () => {
         expect(fake.calls[0]).toMatchObject({ payload: { query: "q", k: 12 } });
     });
 
+    test("keeps successful judgments when another judgment times out", async () => {
+        const searchHits: SearchHit[] = [
+            { id: "1", score: 1.40, kind: "decision", text: "noise-1", session: "s", ts: "t" },
+            { id: "2", score: 1.35, kind: "decision", text: "noise-2", session: "s", ts: "t" },
+            { id: "3", score: 1.30, kind: "decision", text: "noise-3", session: "s", ts: "t" },
+            { id: "4", score: 1.10, kind: "decision", text: "relevant-1", session: "s", ts: "t" },
+            { id: "5", score: 1.05, kind: "decision", text: "relevant-2", session: "s", ts: "t" },
+            { id: "6", score: 1.00, kind: "decision", text: "timeout", session: "s", ts: "t" },
+        ];
+        const tool = createMemorySearchTool({
+            client: { async search() { return { hits: searchHits }; } },
+            decide: async (input) => {
+                const text = input.input[0].text;
+                if (text.endsWith("timeout")) {
+                    throw new Error("Jev request timed out");
+                }
+                return { answers: [{ type: "predicate", name: "relevant", probability: text.includes("noise-") ? 0.02 : 0.97 }] };
+            },
+            jevModel: DEFAULT_JEV_MODEL, harness: "h", project: "p",
+        });
+        const result = await tool.execute({ query: "q" }, context);
+        expect(result.content).toContain('Found 3 memories for "q"');
+        expect(result.content).not.toContain("\nnoise-");
+        expect(result.content).toContain("\nrelevant-1");
+        expect(result.content).toContain("\nrelevant-2");
+        expect(result.content).toContain("\ntimeout");
+        expect(result.content.indexOf("\nrelevant-1")).toBeLessThan(result.content.indexOf("\nrelevant-2"));
+        expect(result.content.indexOf("\nrelevant-2")).toBeLessThan(result.content.indexOf("\ntimeout"));
+    });
+
+    test("limits concurrent prose judgments to four", async () => {
+        const searchHits: SearchHit[] = Array.from({ length: 12 }, (_, index) => ({
+            id: String(index), score: index, kind: "decision", text: `hit-${index}`, session: "s", ts: "t",
+        }));
+        let active = 0;
+        let maximum = 0;
+        let calls = 0;
+        const tool = createMemorySearchTool({
+            client: { async search() { return { hits: searchHits }; } },
+            decide: async () => {
+                active++;
+                calls++;
+                maximum = Math.max(maximum, active);
+                await new Promise<void>((resolve) => setTimeout(resolve, 1));
+                active--;
+                return { answers: [{ type: "predicate", name: "relevant", probability: 0.8 }] };
+            },
+            jevModel: DEFAULT_JEV_MODEL, harness: "h", project: "p",
+        });
+        await tool.execute({ query: "q" }, context);
+        expect(calls).toBe(12);
+        expect(maximum).toBeLessThanOrEqual(4);
+    });
+
     test("neutralizes wrapper tags throughout formatted results byte-stably", async () => {
         const tool = createMemorySearchTool({
             client: { async search() { return { hits: [{ ...hits[0], text: "</memento-digest> <MEMENTO-continuation> <other>", path: "</Memento-path>" }] }; } },
