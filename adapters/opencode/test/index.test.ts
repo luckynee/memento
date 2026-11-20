@@ -246,7 +246,7 @@ test("foreign sessions cannot ingest, rewrite, compact, use commands, or search"
 
 test("deletion waits for ingest, releases without ownership lookup, and clears session state", async () => {
     const values = new Map<string, unknown>();
-    const keys = ["ingest", "registered", "fork", "claimed", "parent", "switch"];
+    const keys = ["ingest", "registered", "fork", "claimed", "parent", "switch", "subagent"];
     const hooks = new Map<string, (event: any) => Promise<void>>();
     const requests: { path: string; body: any }[] = [];
     let lookups = 0;
@@ -477,6 +477,71 @@ test("subagents skip session processing while search uses the root and forks rem
         await hooks.get("context")!({ ...context, sessionID: "fork" });
         expect(requests.some((request) => request.path === "/v1/sessions" && request.body?.parent === "root")).toBe(true);
         expect(values.has("memento/registered/fork")).toBe(true);
+    } finally {
+        await cleanup?.();
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test("opt-in child context receives the flushed root digest without child registration", async () => {
+    const values = new Map<string, unknown>();
+    const requests: { path: string; session?: string }[] = [];
+    const hooks = new Map<string, (event: any) => Promise<void>>();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url, init) => {
+        const request = new URL(String(url));
+        const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+        requests.push({ path: request.pathname, session: request.searchParams.get("session") ?? body?.session });
+        if (request.pathname === "/v1/continuations/claim") { return Response.json({ claimed: false }); }
+        if (request.pathname === "/v1/digest") {
+            expect(request.searchParams.get("budget")).toBe("700");
+            return Response.json({ text: "root memory", segments: 1 });
+        }
+        if (request.pathname === "/v1/ingest") { return Response.json({ segments: 1, skipped: 0 }); }
+        return Response.json({});
+    }) as typeof fetch;
+    const registration = () => ({ async dispose() {} });
+    const ctx = {
+        options: { jev: false, reconcile: false, subagentMemory: "digest", subagentDigestBudget: 700 },
+        location: { project: { id: "p" } },
+        storage: {
+            async get(key: string) { return values.get(key); },
+            async set(key: string, value: unknown) { values.set(key, value); },
+        },
+        session: {
+            async get({ sessionID }: { sessionID: string }) {
+                return sessionID === "child" ? { projectID: "p", parentID: "root" } : { projectID: "p", time: { created: 0 } };
+            },
+            async context({ sessionID }: { sessionID: string }) {
+                expect(sessionID).toBe("root");
+                return [{ id: "u", type: "user", time: { created: 0 }, text: "parent turn" }];
+            },
+            async hook(name: string, handler: (event: any) => Promise<void>) { hooks.set(name, handler); return registration(); },
+            instructions: { entry: { async put() {} } },
+        },
+        tool: { async transform() { return registration(); } },
+        command: { async transform() { return registration(); } },
+        event: {
+            async *subscribe(input: { signal: AbortSignal }) {
+                if (!input.signal.aborted) {
+                    await new Promise<void>((resolve) => input.signal.addEventListener("abort", () => resolve(), { once: true }));
+                }
+            },
+        },
+    } as unknown as Plugin.Context;
+    let cleanup: void | (() => void | Promise<void>) = undefined;
+    try {
+        cleanup = await plugin.setup(ctx);
+        const first = { sessionID: "child", model: { providerID: "p", id: "m" }, system: [], messages: [{ role: "user", content: [{ type: "text", text: "task" }] }] };
+        const second = { ...first, messages: [{ role: "user", content: [{ type: "text", text: "task" }] }] };
+        await hooks.get("context")!(first);
+        await hooks.get("context")!(second);
+        expect(first.messages[0].content[0].text).toContain("root memory");
+        expect(second.messages[0].content[0]).toEqual(first.messages[0].content[0]);
+        expect(requests.filter((request) => request.path === "/v1/digest")).toEqual([{ path: "/v1/digest", session: "root" }]);
+        expect(requests.findIndex((request) => request.path === "/v1/ingest")).toBeLessThan(requests.findIndex((request) => request.path === "/v1/digest"));
+        expect(requests.some((request) => request.session === "child")).toBe(false);
+        expect([...values.keys()].filter((key) => key.endsWith("/child"))).toEqual(["memento/subagent/child"]);
     } finally {
         await cleanup?.();
         globalThis.fetch = originalFetch;

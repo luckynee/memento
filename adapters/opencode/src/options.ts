@@ -11,6 +11,8 @@ export function resolveOptions(raw: Record<string, unknown>) {
         ? raw.tailUserTurns : 3;
     const digestBudget = typeof raw.digestBudget === "number" && Number.isInteger(raw.digestBudget) && raw.digestBudget > 0
         ? raw.digestBudget : 12000;
+    const subagentDigestBudget = typeof raw.subagentDigestBudget === "number" && Number.isInteger(raw.subagentDigestBudget) && raw.subagentDigestBudget > 0
+        ? raw.subagentDigestBudget : 6000;
     const tailCharBudget = typeof raw.tailCharBudget === "number" && Number.isInteger(raw.tailCharBudget) && raw.tailCharBudget > 0
         ? raw.tailCharBudget : 40000;
     const jevCooldownMs = typeof raw.jevCooldownMs === "number" && Number.isSafeInteger(raw.jevCooldownMs) && raw.jevCooldownMs >= 0
@@ -21,6 +23,8 @@ export function resolveOptions(raw: Record<string, unknown>) {
         tailUserTurns,
         tailCharBudget,
         digestBudget,
+        subagentMemory: raw.subagentMemory === "digest" ? "digest" as const : "off" as const,
+        subagentDigestBudget,
         enabled: typeof raw.enabled === "boolean" ? raw.enabled : true,
         reconcile: typeof raw.reconcile === "boolean" ? raw.reconcile : true,
         jev: typeof raw.jev === "boolean" ? raw.jev : true,

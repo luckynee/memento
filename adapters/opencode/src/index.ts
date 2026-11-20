@@ -5,6 +5,7 @@ import { createIngestor } from "./ingest";
 import { createJevGate, type DecisionsFn } from "./jev";
 import { resolveOptions } from "./options";
 import { createSessionOwnership } from "./session-ownership";
+import { createSubagentMemoryController } from "./subagent-memory";
 import { cloneMessage, type ConversationMessage, type SystemText } from "./switch";
 import { createSwitchController } from "./switch-controller";
 import { createMemorySearchTool } from "./tools";
@@ -106,6 +107,18 @@ export default Plugin.define({
             tailCharBudget: options.tailCharBudget,
             log,
         });
+        const subagentMemory = createSubagentMemoryController({
+            mode: options.subagentMemory,
+            budget: options.subagentDigestBudget,
+            harness: options.harness,
+            project,
+            lookup: ownsSession.lookup,
+            root: ownsSession.root,
+            flush: ingestor.flush,
+            client,
+            storage: ctx.storage,
+            log,
+        });
         const tool = createMemorySearchTool({ client, decide, jevModel: options.jevModel, harness: options.harness, project });
         const command = createContinueCommand({
             client,
@@ -158,6 +171,7 @@ export default Plugin.define({
         };
         const hookRegistration = await ctx.session.hook("context", async (event) => {
             if (!await ownsSession(event.sessionID)) {
+                await subagentMemory.onContext(event);
                 return;
             }
             const continuation = await ensureRegistered(event.sessionID);
@@ -178,13 +192,14 @@ export default Plugin.define({
         const controller = new AbortController();
         const releaseSession = async (sessionID: string, reason?: string, harness = options.harness) => {
             try {
+                await subagentMemory.forget(sessionID);
                 await switchController.forget(sessionID);
                 await ingestor.forget(sessionID);
                 await client.releaseSession({ harness, project, session: sessionID, ...(reason ? { reason } : {}) });
             } catch (error) {
                 log(`Failed to release session ${sessionID}`, error);
             } finally {
-                for (const key of ["ingest", "registered", "fork", "claimed", "parent", "switch"]) {
+                for (const key of ["ingest", "registered", "fork", "claimed", "parent", "switch", "subagent"]) {
                     try {
                         await ctx.storage.remove(`memento/${key}/${sessionID}`);
                     } catch (error) {

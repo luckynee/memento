@@ -25,6 +25,8 @@ Run `bun install` in this directory, then add the plugin to `opencode.jsonc`:
 | `tailUserTurns` | `3` | Recent user turns retained after a model switch |
 | `tailCharBudget` | `40000` | Target character budget for the pre-switch tail |
 | `digestBudget` | `12000` | Digest character budget |
+| `subagentMemory` | `"off"` | Set to `"digest"` to experimentally inject frozen root memory into subagent requests |
+| `subagentDigestBudget` | `6000` | Positive integer character budget for the subagent digest |
 | `enabled` | `true` | Enable the plugin |
 | `jev` | `true` | Enable Jev classification and relevance judgments |
 | `jevModel` | `opencode/jev-1.13-free` | Jev model as `provider/id` or a model object |
