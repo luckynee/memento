@@ -3158,12 +3158,17 @@ fn copy_skill(source: &Path, target: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
+struct SkillSource {
+    name: String,
+    path: Option<PathBuf>,
+    content: Option<&'static [u8]>,
+}
+
 pub(super) fn install_skills(args: &InstallSkillsArgs, home: &Path) -> Result<(), CliError> {
     let source = args
         .source
         .clone()
-        .or_else(|| env::var_os("MEMENTO_SKILLS_DIR").map(PathBuf::from))
-        .ok_or_else(|| CliError::other("supply --source DIR or set MEMENTO_SKILLS_DIR"))?;
+        .or_else(|| env::var_os("MEMENTO_SKILLS_DIR").map(PathBuf::from));
     let base = if args.user {
         home.to_path_buf()
     } else {
@@ -3190,25 +3195,44 @@ pub(super) fn install_skills(args: &InstallSkillsArgs, home: &Path) -> Result<()
             ".gemini/config/skills",
         ],
     };
-    let entries = fs::read_dir(&source).map_err(|error| {
-        CliError::other(format!(
-            "cannot read skills source {}: {error}",
-            source.display()
-        ))
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|error| {
-            CliError::other(format!("cannot read skills source entry: {error}"))
+    let mut entries = Vec::new();
+    if let Some(source) = &source {
+        let directory = fs::read_dir(source).map_err(|error| {
+            CliError::other(format!(
+                "cannot read skills source {}: {error}",
+                source.display()
+            ))
         })?;
-        if !entry
-            .file_type()
-            .map_err(|error| CliError::other(format!("cannot inspect skill: {error}")))?
-            .is_dir()
-        {
-            continue;
+        for entry in directory {
+            let entry = entry.map_err(|error| {
+                CliError::other(format!("cannot read skills source entry: {error}"))
+            })?;
+            let file_type = entry
+                .file_type()
+                .map_err(|error| CliError::other(format!("cannot inspect skill: {error}")))?;
+            if file_type.is_dir() {
+                entries.push(SkillSource {
+                    name: entry.file_name().to_string_lossy().into_owned(),
+                    path: Some(entry.path()),
+                    content: None,
+                });
+            }
         }
+    } else {
+        entries.extend(
+            crate::assets::SKILLS
+                .iter()
+                .map(|(name, content)| SkillSource {
+                    name: (*name).to_string(),
+                    path: None,
+                    content: Some(*content),
+                }),
+        );
+    }
+    for entry in entries {
+        let name = entry.name;
         for target in targets {
-            let destination = base.join(target).join(entry.file_name());
+            let destination = base.join(target).join(&name);
             match fs::symlink_metadata(&destination) {
                 Ok(_) if !skill_owned(&destination)? => {
                     eprintln!("warning: skipping foreign skill {}", destination.display());
@@ -3224,7 +3248,16 @@ pub(super) fn install_skills(args: &InstallSkillsArgs, home: &Path) -> Result<()
                 }
             }
             if !args.dry_run {
-                copy_skill(&entry.path(), &destination)?;
+                if let Some(source) = &entry.path {
+                    copy_skill(source, &destination)?;
+                } else if let Some(content) = entry.content {
+                    fs::create_dir_all(&destination).map_err(|error| {
+                        CliError::other(format!("cannot create {}: {error}", destination.display()))
+                    })?;
+                    fs::write(destination.join("SKILL.md"), content).map_err(|error| {
+                        CliError::other(format!("cannot write skill {}: {error}", name))
+                    })?;
+                }
                 let marker = destination.join(".memento-skill");
                 if fs::symlink_metadata(&marker)
                     .is_ok_and(|metadata| metadata.file_type().is_symlink())

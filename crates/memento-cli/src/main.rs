@@ -15,11 +15,20 @@ use reqwest::{Method, Url};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+mod assets;
 mod cross_harness;
+mod daemon;
+mod doctor;
+mod receipt;
 mod setup;
+mod update;
 
 #[derive(Debug, Parser)]
-#[command(name = "memento", about = "Client for the mementod memory daemon")]
+#[command(
+    name = "memento",
+    version,
+    about = "Client for the mementod memory daemon"
+)]
 struct Cli {
     #[arg(
         long,
@@ -90,6 +99,16 @@ enum Command {
     InstallHooks(cross_harness::InstallArgs),
     #[command(about = "Install memento skills for harnesses")]
     InstallSkills(cross_harness::InstallSkillsArgs),
+    #[command(about = "Manage the bundled daemon")]
+    Daemon(daemon::DaemonArgs),
+    #[command(hide = true, about = "Reapply saved setup choices")]
+    ReapplySetup,
+    #[command(about = "Update memento and refresh saved components")]
+    Update(update::UpdateArgs),
+    #[command(about = "Check installation and daemon status")]
+    Doctor(doctor::DoctorArgs),
+    #[command(hide = true, about = "Write installation receipt fields")]
+    WriteReceipt(doctor::WriteReceiptArgs),
 }
 
 #[derive(Debug, Args)]
@@ -318,7 +337,7 @@ impl CliError {
         if error.is_connect() {
             Self {
                 message: format!(
-                    "cannot connect to {url}: {error}; start the daemon with docker compose -f deploy/compose.yaml up -d"
+                    "cannot connect to {url}: {error}; start the daemon with memento daemon up"
                 ),
                 exit_code: 2,
             }
@@ -408,7 +427,12 @@ fn build_request(
         | Command::Continue(_)
         | Command::Hook(_)
         | Command::InstallHooks(_)
-        | Command::InstallSkills(_) => return Err(CliError::other("not a legacy request")),
+        | Command::InstallSkills(_)
+        | Command::Daemon(_)
+        | Command::ReapplySetup
+        | Command::Update(_)
+        | Command::Doctor(_)
+        | Command::WriteReceipt(_) => return Err(CliError::other("not a legacy request")),
     };
     let mut request = client.request(method, endpoint(&cli.url, &segments)?);
     if let Some(token) = &cli.token {
@@ -547,7 +571,12 @@ fn build_request(
         | Command::Continue(_)
         | Command::Hook(_)
         | Command::InstallHooks(_)
-        | Command::InstallSkills(_) => return Err(CliError::other("not a legacy request")),
+        | Command::InstallSkills(_)
+        | Command::Daemon(_)
+        | Command::ReapplySetup
+        | Command::Update(_)
+        | Command::Doctor(_)
+        | Command::WriteReceipt(_) => return Err(CliError::other("not a legacy request")),
     };
     request
         .build()
@@ -761,7 +790,12 @@ fn render(command: &Command, body: &str) -> Result<String, CliError> {
         | Command::Continue(_)
         | Command::Hook(_)
         | Command::InstallHooks(_)
-        | Command::InstallSkills(_) => Err(CliError::other("not a legacy response")),
+        | Command::InstallSkills(_)
+        | Command::Daemon(_)
+        | Command::ReapplySetup
+        | Command::Update(_)
+        | Command::Doctor(_)
+        | Command::WriteReceipt(_) => Err(CliError::other("not a legacy response")),
     }
 }
 
@@ -864,8 +898,23 @@ fn select_digest_session(client: &Client, cli: &mut Cli) -> Result<(), CliError>
 }
 
 fn run(mut cli: Cli) -> Result<(), CliError> {
+    if let Command::Daemon(args) = &cli.command {
+        return daemon::run(&cli, args);
+    }
+    if let Command::Update(args) = &cli.command {
+        return update::run(&cli, args);
+    }
+    if let Command::Doctor(args) = &cli.command {
+        return doctor::run(&cli, args);
+    }
+    if let Command::WriteReceipt(args) = &cli.command {
+        return doctor::write_receipt(args);
+    }
     if let Command::Setup(args) = &cli.command {
         return setup::run(&cli, args);
+    }
+    if matches!(&cli.command, Command::ReapplySetup) {
+        return setup::reapply_saved_setup(&cli);
     }
     if matches!(
         &cli.command,
@@ -877,6 +926,7 @@ fn run(mut cli: Cli) -> Result<(), CliError> {
             | Command::Hook(_)
             | Command::InstallHooks(_)
             | Command::InstallSkills(_)
+            | Command::ReapplySetup
     ) {
         return cross_harness::run(&cli);
     }

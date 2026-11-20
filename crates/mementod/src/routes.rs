@@ -299,6 +299,7 @@ async fn health(State(state): State<RouterState>) -> Json<Health> {
     Json(Health {
         ok: true,
         qdrant: state.app.store.client.health_check().await.is_ok(),
+        version: Some(env!("CARGO_PKG_VERSION").to_string()),
     })
 }
 

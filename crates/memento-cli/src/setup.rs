@@ -48,6 +48,8 @@ pub struct SetupArgs {
     opencode_plugin: Option<PathBuf>,
     #[arg(long, help = "Apply without prompting")]
     yes: bool,
+    #[arg(long, help = "Start the managed daemon if it is unavailable")]
+    start_daemon: bool,
     #[arg(long, help = "Preview without writing")]
     dry_run: bool,
 }
@@ -140,6 +142,8 @@ struct Context {
     executable: PathBuf,
     plugin: Option<PathBuf>,
     skills_source: Option<PathBuf>,
+    install_skills: bool,
+    embedded_plugin: bool,
     url: String,
 }
 
@@ -496,13 +500,25 @@ pub fn run(cli: &Cli, args: &SetupArgs) -> Result<(), CliError> {
     if let Some(token) = &cli.token {
         request = request.bearer_auth(token);
     }
-    if !request
+    let daemon_healthy = request
         .send()
-        .is_ok_and(|response| response.status().is_success())
-    {
-        eprintln!(
-            "warning: daemon health check failed; start it with docker compose -f deploy/compose.yaml up -d"
-        );
+        .is_ok_and(|response| response.status().is_success());
+    let mut managed_daemon = false;
+    if !daemon_healthy {
+        let should_start = args.start_daemon
+            || (interactive
+                && crate::daemon::docker_available()
+                && Confirm::new()
+                    .with_prompt("Daemon is unavailable. Start the managed daemon?")
+                    .default(true)
+                    .interact()
+                    .map_err(prompt_error)?);
+        if should_start {
+            crate::daemon::start(cli)?;
+            managed_daemon = true;
+        } else {
+            eprintln!("warning: daemon health check failed; start it with memento daemon up");
+        }
     }
     let scope = match args.scope {
         Some(scope) => scope,
@@ -637,34 +653,64 @@ pub fn run(cli: &Cli, args: &SetupArgs) -> Result<(), CliError> {
     } else {
         true
     };
-    let skills_source = if install_skills {
-        resolve_path(
-            &args.skills_source,
-            "MEMENTO_SKILLS_DIR",
-            &executable,
-            "skills",
-            interactive,
-            "Skills source directory (leave empty to skip)",
-        )?
-    } else {
-        None
-    };
-    if install_skills && skills_source.is_none() {
-        eprintln!("warning: skills source unavailable; skipping skills (use --skills-source DIR)");
-    }
+    let skill_override = args
+        .skills_source
+        .clone()
+        .or_else(|| env::var_os("MEMENTO_SKILLS_DIR").map(PathBuf::from));
+    let skills_source = skill_override
+        .map(|path| {
+            if !path.is_dir() {
+                return Err(CliError::other(format!(
+                    "skills source directory does not exist: {}",
+                    path.display()
+                )));
+            }
+            path.canonicalize().map_err(|error| {
+                CliError::other(format!(
+                    "cannot resolve skills source {}: {error}",
+                    path.display()
+                ))
+            })
+        })
+        .transpose()?;
+    let mut embedded_plugin = false;
     let plugin = if selected.iter().any(|entry| entry.id == "opencode") {
-        let plugin = resolve_path(
-            &args.opencode_plugin,
-            "MEMENTO_OPENCODE_PLUGIN",
-            &executable,
-            "adapters/opencode",
-            interactive,
-            "OpenCode plugin directory",
-        )?
+        let override_plugin = args
+            .opencode_plugin
+            .clone()
+            .or_else(|| env::var_os("MEMENTO_OPENCODE_PLUGIN").map(PathBuf::from));
+        let plugin = if let Some(plugin) = override_plugin {
+            resolve_path(
+                &Some(plugin),
+                "MEMENTO_OPENCODE_PLUGIN",
+                &executable,
+                "adapters/opencode",
+                false,
+                "OpenCode plugin directory",
+            )?
+        } else if crate::assets::OPENCODE_BUNDLE_AVAILABLE {
+            embedded_plugin = true;
+            Some(crate::assets::data_dir()?.join("opencode-plugin"))
+        } else {
+            resolve_path(
+                &None,
+                "MEMENTO_OPENCODE_PLUGIN",
+                &executable,
+                "adapters/opencode",
+                interactive,
+                "OpenCode plugin directory",
+            )?
+        }
         .ok_or_else(|| {
             CliError::other("OpenCode plugin directory required: use --opencode-plugin DIR")
         })?;
-        if !plugin.join("node_modules").is_dir() {
+        let embedded_default = crate::assets::OPENCODE_BUNDLE_AVAILABLE
+            && args.opencode_plugin.is_none()
+            && env::var_os("MEMENTO_OPENCODE_PLUGIN").is_none();
+        if !embedded_default
+            && plugin.join("src/index.ts").is_file()
+            && !plugin.join("node_modules").is_dir()
+        {
             eprintln!(
                 "warning: {} has no node_modules; run bun install there",
                 plugin.display()
@@ -682,6 +728,8 @@ pub fn run(cli: &Cli, args: &SetupArgs) -> Result<(), CliError> {
         executable,
         plugin,
         skills_source,
+        install_skills,
+        embedded_plugin,
         url: cli.url.clone(),
     };
     println!("Planned changes:");
@@ -695,20 +743,24 @@ pub fn run(cli: &Cli, args: &SetupArgs) -> Result<(), CliError> {
             change.path.display(),
             change.description
         );
-        if let Some(source) = &context.skills_source {
+        if context.install_skills {
             let skills = InstallSkillsArgs {
                 harness: entry.skills,
                 project: (scope == Scope::Project).then(|| context.project.clone()),
                 user: scope == Scope::User,
-                source: Some(source.clone()),
+                source: context.skills_source.clone(),
                 dry_run: true,
             };
             cross_harness::install_skills(&skills, &context.home)?;
             println!(
-                "  {}: {} - install skills from {}",
+                "  {}: {} - install {} skills",
                 entry.display,
                 skill_path(entry, &context).display(),
-                source.display()
+                if context.skills_source.is_some() {
+                    "override"
+                } else {
+                    "embedded"
+                }
             );
         }
     }
@@ -726,6 +778,9 @@ pub fn run(cli: &Cli, args: &SetupArgs) -> Result<(), CliError> {
         println!("Setup cancelled.");
         return Ok(());
     }
+    if context.embedded_plugin {
+        crate::assets::write_opencode_plugin(&crate::assets::data_dir()?)?;
+    }
     for entry in &selected {
         (entry.apply)(
             entry,
@@ -735,12 +790,12 @@ pub fn run(cli: &Cli, args: &SetupArgs) -> Result<(), CliError> {
         .map_err(|error| {
             CliError::other(format!("{} setup failed: {}", entry.display, error.message))
         })?;
-        if let Some(source) = &context.skills_source {
+        if context.install_skills {
             let skills = InstallSkillsArgs {
                 harness: entry.skills,
                 project: (scope == Scope::Project).then(|| context.project.clone()),
                 user: scope == Scope::User,
-                source: Some(source.clone()),
+                source: context.skills_source.clone(),
                 dry_run: false,
             };
             cross_harness::install_skills(&skills, &context.home).map_err(|error| {
@@ -752,8 +807,89 @@ pub fn run(cli: &Cli, args: &SetupArgs) -> Result<(), CliError> {
         }
         println!("{}: setup complete", entry.display);
     }
+    let setup_receipt = json!({
+        "harnesses": selected.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+        "scope": if scope == Scope::Project { "project" } else { "user" },
+        "project": if scope == Scope::Project {
+            Some(context.project.canonicalize().map_err(|error| CliError::other(format!("cannot canonicalize project {}: {error}", context.project.display())))?.display().to_string())
+        } else {
+            None
+        },
+        "subagent_memory": modes,
+        "skills": install_skills,
+        "managed_daemon": managed_daemon,
+        "opencode_plugin": if context.embedded_plugin {
+            None
+        } else {
+            context.plugin.as_ref().map(|path| path.display().to_string())
+        }
+    });
+    crate::receipt::merge_setup(setup_receipt)
+        .map_err(|error| CliError::other(format!("cannot update install receipt: {error}")))?;
     println!("Next: restart your harness; Codex may ask you to trust project hooks.");
     Ok(())
+}
+
+pub(super) fn reapply_saved_setup(cli: &Cli) -> Result<(), CliError> {
+    let receipt = crate::receipt::read()
+        .map_err(|error| CliError::other(format!("cannot read install receipt: {error}")))?;
+    let setup = receipt
+        .get("setup")
+        .and_then(Value::as_object)
+        .ok_or_else(|| CliError::other("install receipt has no saved setup"))?;
+    let harnesses = setup
+        .get("harnesses")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CliError::other("saved setup has no harness list"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| CliError::other("saved harness id is not a string"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let scope = match setup.get("scope").and_then(Value::as_str) {
+        Some("project") => Scope::Project,
+        Some("user") => Scope::User,
+        _ => return Err(CliError::other("saved setup has invalid scope")),
+    };
+    let subagent_memory = setup
+        .get("subagent_memory")
+        .and_then(Value::as_object)
+        .map(|modes| {
+            modes
+                .iter()
+                .filter_map(|(id, enabled)| {
+                    enabled
+                        .as_bool()
+                        .map(|enabled| format!("{id}={}", if enabled { "on" } else { "off" }))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let skills = setup.get("skills").and_then(Value::as_bool).unwrap_or(true);
+    let plugin = setup
+        .get("opencode_plugin")
+        .and_then(Value::as_str)
+        .map(PathBuf::from);
+    let args = SetupArgs {
+        harness: harnesses,
+        scope: Some(scope),
+        project: setup
+            .get("project")
+            .and_then(Value::as_str)
+            .map(PathBuf::from),
+        subagent_memory,
+        skills,
+        no_skills: !skills,
+        skills_source: None,
+        opencode_plugin: plugin,
+        yes: true,
+        start_daemon: false,
+        dry_run: false,
+    };
+    run(cli, &args)
 }
 
 #[cfg(test)]
@@ -770,6 +906,8 @@ mod tests {
             executable: root.join("bin/memento"),
             plugin: Some(root.join("adapters/opencode")),
             skills_source: None,
+            install_skills: true,
+            embedded_plugin: false,
             url: "http://127.0.0.1:7377".into(),
         }
     }
