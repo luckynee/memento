@@ -241,6 +241,8 @@ struct DigestArgs {
     session: Option<String>,
     #[arg(long, help = "Digest character budget")]
     budget: Option<usize>,
+    #[arg(long, value_parser = ["default", "subagent"], help = "Digest profile")]
+    profile: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -508,6 +510,9 @@ fn build_request(
             ];
             if let Some(budget) = args.budget {
                 query.push(("budget", budget.to_string()));
+            }
+            if let Some(profile) = &args.profile {
+                query.push(("profile", profile.clone()));
             }
             request.query(&query)
         }
@@ -1208,6 +1213,22 @@ mod tests {
             digest.url().query(),
             Some("harness=h&project=p&session=s&budget=100")
         );
+        let filtered = request(&[
+            "digest",
+            "--harness",
+            "h",
+            "--project",
+            "p",
+            "--session",
+            "s",
+            "--profile",
+            "subagent",
+        ]);
+        assert_eq!(
+            filtered.url().query(),
+            Some("harness=h&project=p&session=s&profile=subagent")
+        );
+        assert!(Cli::try_parse_from(["memento", "digest", "--profile", "unknown"]).is_err());
     }
 
     #[test]

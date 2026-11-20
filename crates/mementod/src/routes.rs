@@ -16,7 +16,7 @@ use axum::{
 };
 use chrono::{DateTime, Duration, Utc};
 use memento_core::{
-    digest::{DigestInput, render_digest},
+    digest::{DigestInput, DigestProfile, render_digest_with_profile},
     lineage::{self, Ancestor, SessionKey, SessionLink},
     protocol::{
         ClaimRequest, ClaimResponse, ContinuationRecord, ContinuationRequest, DigestResponse,
@@ -934,6 +934,7 @@ async fn claim_continuation(
         &record.project,
         &record.session,
         None,
+        DigestProfile::Default,
     )
     .await?;
     Ok(Json(ClaimResponse {
@@ -1276,6 +1277,7 @@ struct DigestQuery {
     project: String,
     session: String,
     budget: Option<usize>,
+    profile: Option<String>,
 }
 
 async fn digest(
@@ -1286,6 +1288,17 @@ async fn digest(
     required(&query.harness)?;
     required(&query.project)?;
     required(&query.session)?;
+    let profile = match query.profile.as_deref() {
+        None | Some("default") => DigestProfile::Default,
+        Some("subagent") => DigestProfile::Subagent,
+        Some(_) => {
+            return Err(ApiError {
+                status: StatusCode::BAD_REQUEST,
+                code: "invalid_profile",
+                message: "profile must be default or subagent",
+            });
+        }
+    };
     let _operation = state.operation_lock.read().await;
     read_activity(&state, &query.harness, &query.project, &query.session).await;
     Ok(Json(
@@ -1295,6 +1308,7 @@ async fn digest(
             &query.project,
             &query.session,
             query.budget,
+            profile,
         )
         .await?,
     ))
@@ -1306,6 +1320,7 @@ async fn render_session_digest(
     project: &str,
     session: &str,
     budget: Option<usize>,
+    profile: DigestProfile,
 ) -> Result<DigestResponse, ApiError> {
     let mut lineage = ancestors_with_cutoffs(state, harness, session).await?;
     let records = state
@@ -1325,7 +1340,7 @@ async fn render_session_digest(
         })
     });
     if lineage.is_empty() {
-        return Ok(render_digest(
+        return Ok(render_digest_with_profile(
             &DigestInput {
                 harness: harness.into(),
                 project: project.into(),
@@ -1333,6 +1348,7 @@ async fn render_session_digest(
                 segments: Vec::new(),
             },
             budget.unwrap_or(12000).clamp(1000, 100000),
+            profile,
         ));
     }
     let segments = state
@@ -1345,7 +1361,7 @@ async fn render_session_digest(
         })
         .await;
     let segments = store_result(state, segments).await?;
-    Ok(render_digest(
+    Ok(render_digest_with_profile(
         &DigestInput {
             harness: harness.into(),
             project: project.into(),
@@ -1356,6 +1372,7 @@ async fn render_session_digest(
             segments,
         },
         budget.unwrap_or(12000).clamp(1000, 100000),
+        profile,
     ))
 }
 

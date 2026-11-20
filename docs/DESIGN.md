@@ -161,6 +161,8 @@ Failed commands always carry a status line in stored text: the harness's own hea
 
 Identical stored data yields byte-identical output, which keeps the injected prefix cacheable.
 
+The optional `subagent` profile uses parent-memory framing, omits the newest `user_request` in the lineage, and omits `assistant_note` entries whose trimmed text has fewer than 40 characters. The default profile is unchanged. Section order, selection and budget rules remain the same.
+
 ## Daemon HTTP API (mementod, JSON)
 
 All routes under `http://127.0.0.1:7377`. Optional bearer token via `MEMENTO_TOKEN`; when set, every route except `/health` requires `Authorization: Bearer <token>`.
@@ -175,7 +177,7 @@ All routes under `http://127.0.0.1:7377`. Optional bearer token via `MEMENTO_TOK
 | `GET /v1/sessions/{harness}/{session}/lineage` | | `{ lineage: ["ses_child", "ses_parent", ...] }` |
 | `POST /v1/ingest` | neutral ingest schema | `{ segments: n, skipped: n }` |
 | `POST /v1/search` | `{ harness, project, session, query, scope?, k?, kinds? }` (empty harness and session allowed for project/global) | `{ hits: [{ id, score, kind, text, harness, session, ts, path? }] }` |
-| `GET /v1/digest` | `?harness&project&session&budget` | `{ text, segments }` |
+| `GET /v1/digest` | `?harness&project&session&budget&profile`; profile is `default` or `subagent`, unknown values return 400 `invalid_profile` | `{ text, segments }` |
 | `POST /v1/forget` | `{ harness, project?, session?, scope: "session" or "lineage" or "project", dry_run? }` | `{ deleted: n, would_delete: n, sessions: [{ harness, session }] }`; dry runs report matching segments and sessions without deleting or collecting |
 | `GET /v1/stats` | `?harness?&project?&session?` | counts by kind |
 
@@ -192,11 +194,11 @@ Errors: `{ "error": { "code": "...", "message": "..." } }` with 4xx/5xx.
 - `sessions keep --harness H --session S [--project P] [--off]` (checks the session exists and is not deleted, then sets `keep` or restores `continuation`; project defaults to the current project)
 - `sessions lineage --harness H --session S`
 - `search <query> [--harness H] [--project P] [--session S] [--scope session|lineage|project|global] [--k 8] [--kind KIND]...` (current project by default; session and lineage require harness and session)
-- `digest [--harness H --session S] [--project P] [--budget N]` (current project and its most recently active non-deleted session by default; selected session reported on stderr)
+- `digest [--harness H --session S] [--project P] [--budget N] [--profile default|subagent]` (current project and its most recently active non-deleted session by default; selected session reported on stderr)
 - `forget --harness H [--project P] (--session S | --lineage S | --whole-project) [--yes] [--dry-run]` (`--whole-project` requires `--project`; without `--yes` it asks on a TTY and refuses otherwise; dry runs never prompt and report matching segments and sessions)
 - `gc [--project DIR] [--dry-run] [--json]` releases sessions whose harness data is gone.
 - `ingest --file turns.json|-` (neutral schema, for harnesses without a plugin)
-- `install-hooks claude-code|codex|agy [--project DIR | --user] [--dry-run]`
+- `install-hooks claude-code|codex|agy [--project DIR | --user] [--dry-run] [--subagent-memory digest|filtered]` (subagent memory only for Claude Code and Codex)
 - `install-skills [--harness opencode|claude-code|codex|agy|all] [--project DIR | --user] --source DIR [--dry-run]`
 - Global: `--url`, `--token`, `--json`, `--timeout-secs`.
 
@@ -253,12 +255,12 @@ When OpenCode claims during a context hook, the claiming request also carries th
 | Harness | Track | Inject context | Import turns | Deletion signal | Subagent rule |
 | --- | --- | --- | --- | --- | --- |
 | OpenCode | Plugin session events | Plugin claim and model-switch rewrite | Plugin ingest | `session.deleted`; startup and daily reconciliation | Exclude sessions with `parentID`; searches resolve to the root non-subagent ancestor |
-| Claude Code | `SessionStart` hook | Claimed digest in `additionalContext` | `Stop` transcript import | `memento gc` | Skip inputs with nonempty `agent_id`; subagent hooks are not installed |
-| Codex | `SessionStart` hook | Claimed digest in `additionalContext` | `Stop` transcript import | `memento gc`; `SessionEnd` is not a delete signal | Skip inputs with nonempty `agent_id`; subagent hooks are not installed |
+| Claude Code | `SessionStart` hook | Claimed digest in `additionalContext` | `Stop` transcript import | `memento gc` | Optional parent memory on `SubagentStart`, default off; never register subagents |
+| Codex | `SessionStart` hook | Claimed digest in `additionalContext` | `Stop` transcript import | `memento gc`; `SessionEnd` is not a delete signal | Optional parent memory on `SubagentStart`, default off; never register subagents |
 | agy | `SessionStart` hook | Claimed digest in `injectSteps` | `Stop` transcript import | `memento gc` | Skip nonempty `agent_id`, or empty or absent `lastUserInput` when the transcript is missing or has no `USER_INPUT` |
 | Generic | `session_start` hook | Returned `context` | `turn_end` transcript or items | `session_deleted` or supported-harness gc | Skip nonempty `agent_id` or `is_subagent: true` |
 
-OpenCode excludes sessions with `parentID` from registration, ingestion, claims, switch rewriting, and compaction handling. Their `memory_search` resolves to the root non-subagent ancestor in the same project, using bounded cached lookups; continuation and handoff commands are unavailable. The experimental `subagentMemory: "digest"` option injects a frozen root digest into subagent context requests if OpenCode invokes the hook for them, which remains unverified. Forks remain independent sessions. At startup and every 24 hours, unless `reconcile: false`, the adapter checks registered OpenCode sessions and releases confirmed deleted sessions (`SessionNotFoundError`) and previously registered subagents. Claude Code and Codex emit `SubagentStart` and `SubagentStop` with `agent_id` and `agent_type`, but these hooks are not installed. agy 1.5.13 subagents fire `SessionStart` and `Stop` without subagent fields; their empty `lastUserInput` and missing or user-input-free transcript distinguish the observed cases.
+OpenCode excludes sessions with `parentID` from registration, ingestion, claims, switch rewriting, and compaction handling. Their `memory_search` resolves to the root non-subagent ancestor in the same project, using bounded cached lookups; continuation and handoff commands are unavailable. The experimental `subagentMemory: "digest"` option injects a frozen root digest into subagent context requests. Forks remain independent sessions. At startup and every 24 hours, unless `reconcile: false`, the adapter checks registered OpenCode sessions and releases confirmed deleted sessions (`SessionNotFoundError`) and previously registered subagents. Claude Code and Codex optionally install `SubagentStart` for parent memory; `SubagentStop` remains uninstalled. agy 1.5.13 subagents fire `SessionStart` and `Stop` without subagent fields; their empty `lastUserInput` and missing or user-input-free transcript distinguish the observed cases.
 
 #### Generic hook contract
 
@@ -298,6 +300,7 @@ The daemon records activity on ingest, session updates, continuation claims, sea
 
 `memento hook claude-code|codex|agy` reads the hook JSON from stdin:
 - `SessionStart`: claim a pending continuation for `project-key(cwd)`; if claimed, print the `additionalContext` JSON with the framed digest (`<memento-continuation>` wrapper, reference data, not instructions).
+- `SubagentStart` for Claude Code and Codex: `--subagent-memory off|digest|filtered`, overridden by `MEMENTO_SUBAGENT_MEMORY`, defaults to `off`. When enabled, synchronously import the parent transcript incrementally without optional Jev classification, fetch the parent lineage digest with budget 6000 (`profile=subagent` for `filtered`), and output it in `hookSpecificOutput.additionalContext` framed as `<memento-parent-memory>`. Claude Code supplies the parent transcript in `transcript_path`; Codex supplies the child rollout there, so the parent is found by `session_id` under `${CODEX_HOME:-~/.codex}/sessions/**/rollout-*-<session_id>.jsonl`. If the Codex parent rollout is absent, use stored memory. Empty digests and failures print nothing and warn on stderr. The hook has an overall 8 s deadline; subagents are not registered.
 - `Stop`: the installed synchronous hook atomically writes a timestamped per-import pending marker in `${XDG_STATE_HOME:-~/.local/state}/memento/pending/<harness>-<sanitized-session>.<pid>-<nanos>`, spawns a detached incremental importer of `transcript_path`, and returns `{}`. Each importer removes its own marker after success or failure and appends output to `${XDG_STATE_HOME:-~/.local/state}/memento/import.log` when available. `MEMENTO_HOOK_SYNC=1` imports synchronously without a marker; a spawn failure also falls back to synchronous import. Async hooks are dropped by `claude -p` and `codex exec` in headless runs (verified 2026-11-19).
 - `memento continue` waits for all source session pending markers before calling the daemon, polling every 100 ms for at most 30 s and warning on timeout; individual markers at least 60 s old are removed and ignored. The legacy unsuffixed marker is also recognized. `SessionStart` claims do not wait.
 - `SessionEnd`: fast no-op and not installed (Claude Code gives all `SessionEnd` hooks a shared 1.5 s budget, Codex 1-3 s; verified 2026-11-19).
@@ -307,7 +310,7 @@ The daemon records activity on ingest, session updates, continuation claims, sea
 - Output contract: Claude Code and Codex `SessionStart` print `hookSpecificOutput` JSON or nothing; `Stop` prints `{}` (Codex rejects plain text on `Stop`); `SessionEnd` prints nothing.
 - Codex specifics (developers.openai.com/codex/hooks, verified 2026-11-18): `~/.codex/hooks.json` (or `[hooks]` in `config.toml`), matcher groups `{ "matcher"?, "hooks": [{ "type": "command", "command", "timeout"?, "async"?, "additionalContextLimit"? }] }`; `SessionEnd` timeout is 1 s by default and at most 3 s, so imports run from `Stop`; `SessionStart` sources `startup|resume|clear|compact|fork` (on `compact` the digest is re-injected); non-managed hooks need trust via `/hooks`, or `--dangerously-bypass-hook-trust` for scripted runs; default `additionalContext` spill threshold about 2500 tokens (`additionalContextLimit` raises it).
 - agy 1.5.12 uses project `.agents/hooks.json` or global `~/.gemini/config/hooks.json`; `SessionStart` and `Stop` fire in `agy -p` and interactive sessions. Input uses camelCase fields including `conversationId`, `cwd`, `transcriptPath`, `lastUserInput`, `workspacePaths`, and `hookEventName`. A claim outputs `{"injectSteps":[{"systemMessage":{"systemMessage":"..."}}]}`. `transcriptPath` can be a `.system_generated/` directory or `logs/transcript_full.jsonl`. Observed agy 1.5.13 subagent hooks are skipped before registration, claim, import, or auto-gc using the lifecycle rule above.
-- `memento install-hooks claude-code|codex|agy [--project DIR | --user] [--dry-run]` prints or merges hook entries under an exclusive lock, preserving existing configuration and file permissions, removing memento `SessionEnd` entries and `async` from memento `Stop` entries from older installs, and writing a `.bak` copy with the original mode.
+- `memento install-hooks claude-code|codex|agy [--project DIR | --user] [--dry-run] [--subagent-memory digest|filtered]` prints or merges hook entries under an exclusive lock, preserving existing configuration and file permissions, removing memento `SessionEnd` entries and `async` from memento `Stop` entries from older installs, and writing a `.bak` copy with the original mode. Reinstalling without the subagent flag removes the memento `SubagentStart` entry.
 
 ### MCP server
 
