@@ -202,6 +202,7 @@ Errors: `{ "error": { "code": "...", "message": "..." } }` with 4xx/5xx.
 
 Location: `adapters/opencode/` (Promise plugin, `@opencode/plugin`). Verified contracts:
 
+- For OpenCode project id `global`, ownership additionally requires matching session and plugin `location.directory` values after trimming one trailing slash, and the project key is the plugin directory (live verification pending).
 - Ingestion triggers: event `session.execution.succeeded` (`data: { sessionID }`) and `session.step.ended` (`data: { sessionID, assistantMessageID, finish }`, catches progress in turns that later fail or are aborted); then `ctx.session.context({ sessionID })` (messages after the last compaction) and ingest messages newer than the last ingested message id kept in `ctx.storage`. Assistant messages are re-sent while still growing (point ids are idempotent). On first sight of a session, ingest the full active context (backfill). Ingestion is serialized per session.
 - Forks are linked to their parent and only post-fork messages are ingested; lineage also includes parent segments recorded after the fork point. A claimed continuation takes precedence over the fork parent.
 - Flush before snapshot: when a switch is detected, the adapter awaits any in-flight ingestion and runs one synchronous ingest of the current context before fetching the digest, so failed, aborted, or just-finished turns are included.

@@ -4,10 +4,11 @@ import { frameContinuation } from "../src/commands";
 import plugin, { projectKey } from "../src/index";
 
 test("uses the canonical project path when available", () => {
-    expect(projectKey({ id: "id", canonical: "/checkout" })).toBe("/checkout");
-    expect(projectKey({ id: "id", canonical: "" })).toBe("id");
-    expect(projectKey({ id: "id", canonical: null })).toBe("id");
-    expect(projectKey({ id: "id" })).toBe("id");
+    expect(projectKey({ id: "id", canonical: "/checkout" }, "/location")).toBe("/checkout");
+    expect(projectKey({ id: "id", canonical: "" }, "/location")).toBe("id");
+    expect(projectKey({ id: "id", canonical: null }, "/location")).toBe("id");
+    expect(projectKey({ id: "id" }, "/location")).toBe("id");
+    expect(projectKey({ id: "global", canonical: "/shared" }, "/location")).toBe("/location");
 });
 
 test("context claims inject once, preserve existing continuation, and coexist with switch rewrites", async () => {
@@ -610,5 +611,62 @@ test("disabled reconciliation creates no timer or startup request", async () => 
         await cleanup?.();
         globalThis.fetch = originalFetch;
         globalThis.setInterval = originalSetInterval;
+    }
+});
+
+test("global reconciliation releases only subagents from the plugin directory", async () => {
+    const releases: unknown[] = [];
+    let completed!: () => void;
+    const done = new Promise<void>((resolve) => { completed = resolve; });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url, init) => {
+        const request = new URL(String(url));
+        if (request.pathname === "/v1/sessions") {
+            expect(request.searchParams.get("project")).toBe("/project");
+            return Response.json({ sessions: ["foreign", "missing", "local"].map((session) => ({
+                harness: "opencode", project: "/project", session,
+            })) });
+        }
+        if (request.pathname === "/v1/sessions/release") {
+            releases.push(JSON.parse(String(init?.body)));
+            completed();
+            return Response.json({ released: true, removed: [] });
+        }
+        return Response.json({});
+    }) as typeof fetch;
+    const registration = () => ({ async dispose() {} });
+    const ctx = {
+        options: { jev: false },
+        location: { directory: "/project", project: { id: "global", canonical: "/shared" } },
+        storage: { async remove() {} },
+        session: {
+            async get({ sessionID }: { sessionID: string }) {
+                const location = sessionID === "missing" ? undefined
+                    : { directory: sessionID === "foreign" ? "/other" : "/project/" };
+                return { projectID: "global", parentID: "root", location };
+            },
+            async hook() { return registration(); },
+            instructions: { entry: { async put() {} } },
+        },
+        tool: { async transform() { return registration(); } },
+        command: { async transform() { return registration(); } },
+        event: {
+            async *subscribe(input: { signal: AbortSignal }) {
+                if (!input.signal.aborted) {
+                    await new Promise<void>((resolve) => input.signal.addEventListener("abort", () => resolve(), { once: true }));
+                }
+            },
+        },
+    } as unknown as Plugin.Context;
+    let cleanup: void | (() => void | Promise<void>) = undefined;
+    try {
+        cleanup = await plugin.setup(ctx);
+        await done;
+        expect(releases).toEqual([
+            { harness: "opencode", project: "/project", session: "local", reason: "subagent" },
+        ]);
+    } finally {
+        await cleanup?.();
+        globalThis.fetch = originalFetch;
     }
 });

@@ -1,11 +1,26 @@
+type SessionInfo = { projectID: string; parentID?: string; location?: { directory?: string } };
+
 export function createSessionOwnership(deps: {
-    getSession(sessionID: string): Promise<{ projectID: string; parentID?: string }>;
+    getSession(sessionID: string): Promise<SessionInfo>;
     projectID: string;
+    directory: string;
     log(message: string, error?: unknown): void;
 }) {
     type SessionOwnership = { owned: boolean; parentID?: string };
     const sessions = new Map<string, SessionOwnership>();
     const pending = new Map<string, Promise<SessionOwnership | undefined>>();
+
+    const isOwned = (session: SessionInfo): boolean => {
+        if (session.projectID !== deps.projectID) {
+            return false;
+        }
+        if (deps.projectID !== "global") {
+            return true;
+        }
+        const directory = session.location?.directory;
+        return typeof directory === "string" && directory.length > 0
+            && directory.replace(/\/$/, "") === deps.directory.replace(/\/$/, "");
+    };
 
     const lookupSession = async (sessionID: string): Promise<SessionOwnership | undefined> => {
         const cached = sessions.get(sessionID);
@@ -27,7 +42,7 @@ export function createSessionOwnership(deps: {
                 if (session.parentID !== undefined && (typeof session.parentID !== "string" || !session.parentID)) {
                     throw new Error("Session parent ID is invalid");
                 }
-                const ownership = { owned: session.projectID === deps.projectID, parentID: session.parentID };
+                const ownership = { owned: isOwned(session), parentID: session.parentID };
                 if (pending.get(sessionID) === lookup) {
                     sessions.delete(sessionID);
                     sessions.set(sessionID, ownership);
@@ -57,6 +72,7 @@ export function createSessionOwnership(deps: {
     };
 
     ownsSession.lookup = lookupSession;
+    ownsSession.isOwned = isOwned;
     ownsSession.root = async (sessionID: string): Promise<string | undefined> => {
         const visited = new Set<string>();
         let current = sessionID;

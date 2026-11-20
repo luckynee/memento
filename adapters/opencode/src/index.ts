@@ -25,7 +25,10 @@ function waitForRetry(signal: AbortSignal): Promise<void> {
     });
 }
 
-export function projectKey(project: { id: string; canonical?: unknown }): string {
+export function projectKey(project: { id: string; canonical?: unknown }, directory: string): string {
+    if (project.id === "global") {
+        return directory;
+    }
     return typeof project.canonical === "string" && project.canonical.length > 0 ? project.canonical : project.id;
 }
 
@@ -63,12 +66,13 @@ export default Plugin.define({
         if (!options.enabled) {
             return () => {};
         }
-        const project = projectKey(ctx.location.project);
+        const project = projectKey(ctx.location.project, ctx.location.directory);
         const client = new MementoClient({ url: options.url, token: options.token });
         const log = (message: string, error?: unknown) => console.warn("[memento] " + message, error ?? "");
         const ownsSession = createSessionOwnership({
             getSession: (sessionID) => ctx.session.get({ sessionID }),
             projectID: ctx.location.project.id,
+            directory: ctx.location.directory,
             log,
         });
         const decide: DecisionsFn | undefined = options.jev
@@ -203,7 +207,7 @@ export default Plugin.define({
                     let reason: string | undefined;
                     try {
                         const current = await ctx.session.get({ sessionID: session.session });
-                        if (current.projectID === ctx.location.project.id && current.parentID !== undefined) {
+                        if (ownsSession.isOwned(current) && current.parentID !== undefined) {
                             reason = "subagent";
                         }
                     } catch (error) {

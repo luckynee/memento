@@ -9,6 +9,7 @@ test("caches owned and foreign sessions and bounds the cache", async () => {
             return { projectID: sessionID === "foreign" ? "other" : "project" };
         },
         projectID: "project",
+        directory: "/project",
         log() {},
     });
     expect(await ownsSession("owned")).toBe(true);
@@ -35,6 +36,7 @@ test("fails closed without caching lookup failures", async () => {
             return { projectID: "project" };
         },
         projectID: "project",
+        directory: "/project",
         log(message, error) { errors.push([message, error]); },
     });
     expect(await ownsSession("session")).toBe(false);
@@ -53,6 +55,7 @@ test("shares concurrent lookups for a session", async () => {
             return { projectID: "project" };
         },
         projectID: "project",
+        directory: "/project",
         log() {},
     });
     expect(await Promise.all([ownsSession("session"), ownsSession("session")])).toEqual([true, true]);
@@ -69,6 +72,7 @@ test("forget clears cached and pending ownership without restoring stale results
             return calls === 1 ? firstLookup : { projectID: "other" };
         },
         projectID: "project",
+        directory: "/project",
         log() {},
     });
     const first = ownsSession("session");
@@ -93,6 +97,7 @@ test("resolves owned subagent ancestors and rejects cycles and foreign ancestors
             return { projectID: sessionID === "foreign" ? "other" : "project", parentID: parents[sessionID] };
         },
         projectID: "project",
+        directory: "/project",
         log() {},
     });
     expect(await ownsSession("child")).toBe(false);
@@ -109,7 +114,41 @@ test("bounds ancestor traversal", async () => {
             return { projectID: "project", parentID: String(Number(sessionID) + 1) };
         },
         projectID: "project",
+        directory: "/project",
         log() {},
     });
     expect(await ownsSession.root("0")).toBeUndefined();
+});
+
+test("global ownership requires the same directory with at most one trailing slash ignored", async () => {
+    const sessions: Record<string, { projectID: string; location?: { directory?: string } }> = {
+        same: { projectID: "global", location: { directory: "/project/" } },
+        other: { projectID: "global", location: { directory: "/other" } },
+        missingLocation: { projectID: "global" },
+        missingDirectory: { projectID: "global", location: {} },
+        emptyDirectory: { projectID: "global", location: { directory: "" } },
+        multipleSlashes: { projectID: "global", location: { directory: "/project//" } },
+        otherProject: { projectID: "other", location: { directory: "/project" } },
+    };
+    const ownsSession = createSessionOwnership({
+        async getSession(sessionID) { return sessions[sessionID]; },
+        projectID: "global",
+        directory: "/project",
+        log() {},
+    });
+    expect(await ownsSession("same")).toBe(true);
+    for (const sessionID of ["other", "missingLocation", "missingDirectory", "emptyDirectory", "multipleSlashes", "otherProject"]) {
+        expect(await ownsSession(sessionID)).toBe(false);
+    }
+    expect(ownsSession.isOwned({ projectID: "global", location: { directory: "/project" } })).toBe(true);
+});
+
+test("non-global ownership ignores the session directory", async () => {
+    const ownsSession = createSessionOwnership({
+        async getSession() { return { projectID: "project", location: { directory: "/other" } }; },
+        projectID: "project",
+        directory: "/project",
+        log() {},
+    });
+    expect(await ownsSession("session")).toBe(true);
 });
