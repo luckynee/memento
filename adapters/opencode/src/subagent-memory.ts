@@ -1,4 +1,5 @@
 import type { MementoClient } from "./client";
+import type { SubagentMemoryMode } from "./options";
 import { cloneMessage, neutralizeMementoTags, type ConversationMessage, type SystemText } from "./switch";
 
 export function frameParentMemory(digest: string): string {
@@ -30,11 +31,12 @@ export function injectParentMemory<M extends ConversationMessage, S extends Syst
 }
 
 export function createSubagentMemoryController(deps: {
-    mode: "off" | "digest";
+    mode: SubagentMemoryMode;
+    agents: Record<string, SubagentMemoryMode>;
     budget: number;
     harness: string;
     project: string;
-    lookup(sessionID: string): Promise<{ owned: boolean; parentID?: string } | undefined>;
+    lookup(sessionID: string): Promise<{ owned: boolean; parentID?: string; agent?: string } | undefined>;
     root(sessionID: string): Promise<string | undefined>;
     flush(sessionID: string): Promise<void>;
     client: Pick<MementoClient, "digest">;
@@ -46,7 +48,7 @@ export function createSubagentMemoryController(deps: {
 }) {
     const pending = new Map<string, Promise<string | undefined>>();
 
-    async function load(sessionID: string): Promise<string | undefined> {
+    async function load(sessionID: string, mode: "digest" | "filtered"): Promise<string | undefined> {
         const key = `memento/subagent/${sessionID}`;
         const stored = await deps.storage.get(key);
         if (typeof stored === "string") {
@@ -62,6 +64,7 @@ export function createSubagentMemoryController(deps: {
             project: deps.project,
             session: rootID,
             budget: deps.budget,
+            ...(mode === "filtered" ? { profile: "subagent" as const } : {}),
         });
         const text = digest.text.trim() ? frameParentMemory(digest.text) : "";
         await deps.storage.set(key, text);
@@ -71,7 +74,7 @@ export function createSubagentMemoryController(deps: {
     async function onContext<M extends ConversationMessage, S extends SystemText>(
         event: { sessionID: string; system: S[]; messages: M[] },
     ): Promise<void> {
-        if (deps.mode !== "digest") {
+        if (deps.mode === "off" && !Object.values(deps.agents).some((mode) => mode !== "off")) {
             return;
         }
         try {
@@ -79,12 +82,17 @@ export function createSubagentMemoryController(deps: {
             if (!ownership || !ownership.owned || ownership.parentID === undefined) {
                 return;
             }
+            const mode = ownership.agent !== undefined && Object.hasOwn(deps.agents, ownership.agent)
+                ? deps.agents[ownership.agent] : deps.mode;
+            if (mode === "off") {
+                return;
+            }
             if (event.system.some(containsParentMemory) || event.messages.some((message) => message.content.some(containsParentMemory))) {
                 return;
             }
             let loading = pending.get(event.sessionID);
             if (!loading) {
-                loading = load(event.sessionID);
+                loading = load(event.sessionID, mode);
                 pending.set(event.sessionID, loading);
             }
             let text: string | undefined;

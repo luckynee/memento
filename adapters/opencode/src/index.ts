@@ -109,6 +109,7 @@ export default Plugin.define({
         });
         const subagentMemory = createSubagentMemoryController({
             mode: options.subagentMemory,
+            agents: options.subagentMemoryAgents,
             budget: options.subagentDigestBudget,
             harness: options.harness,
             project,

@@ -147,13 +147,16 @@ export class MementoClient {
         return this.request("/v1/search", "POST", payload, signal);
     }
 
-    digest(payload: SessionIdentity & { budget: number }, signal?: AbortSignal): Promise<{ text: string; segments: number }> {
+    digest(payload: SessionIdentity & { budget: number; profile?: "default" | "subagent" }, signal?: AbortSignal): Promise<{ text: string; segments: number }> {
         const query = new URLSearchParams({
             harness: payload.harness,
             project: payload.project,
             session: payload.session,
             budget: String(payload.budget),
         });
+        if (payload.profile !== undefined) {
+            query.set("profile", payload.profile);
+        }
         return this.request(`/v1/digest?${query}`, "GET", undefined, signal);
     }
 }

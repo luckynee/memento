@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { createSubagentMemoryController, frameParentMemory, injectParentMemory } from "../src/subagent-memory";
+import type { SubagentMemoryMode } from "../src/options";
 import type { ConversationMessage, SystemText } from "../src/switch";
 
 function event(sessionID = "child") {
@@ -14,16 +15,17 @@ function event(sessionID = "child") {
     };
 }
 
-function fixture(mode: "off" | "digest" = "digest") {
+function fixture(mode: SubagentMemoryMode = "digest") {
     const values = new Map<string, unknown>();
     const calls: string[] = [];
     const logs: string[] = [];
     const deps = {
         mode,
+        agents: {} as Record<string, SubagentMemoryMode>,
         budget: 456,
         harness: "opencode",
         project: "project",
-        async lookup(sessionID: string) {
+        async lookup(sessionID: string): Promise<{ owned: boolean; parentID?: string; agent?: string }> {
             calls.push(`lookup:${sessionID}`);
             return sessionID === "root" ? { owned: true } : { owned: true, parentID: "middle" };
         },
@@ -97,6 +99,35 @@ test("shares one digest fetch for simultaneous requests", async () => {
     await Promise.all([controller.onContext(first), controller.onContext(second)]);
     expect(calls.filter((call) => call.startsWith("digest:"))).toHaveLength(1);
     expect(first.messages[1].content).toEqual(second.messages[1].content);
+});
+
+test("resolves child modes from agent overrides and defaults", async () => {
+    for (const [defaultMode, agent, override, expectedMode] of [
+        ["filtered", undefined, undefined, "filtered"],
+        ["digest", "unknown", undefined, "digest"],
+        ["off", "reviewer", "filtered", "filtered"],
+        ["filtered", "reviewer", "digest", "digest"],
+        ["digest", "reviewer", "off", "off"],
+    ] as const) {
+        const { deps, calls } = fixture(defaultMode);
+        if (override !== undefined) {
+            deps.agents.reviewer = override;
+        }
+        deps.lookup = async () => ({ owned: true, parentID: "root", agent });
+        const input = event();
+        const before = JSON.stringify(input);
+        await createSubagentMemoryController(deps).onContext(input);
+        const digest = calls.find((call) => call.startsWith("digest:"));
+        if (expectedMode === "off") {
+            expect(digest).toBeUndefined();
+            expect(JSON.stringify(input)).toBe(before);
+        } else {
+            expect(digest).toBeDefined();
+            const payload = JSON.parse(digest!.slice("digest:".length));
+            expect(payload.profile).toBe(expectedMode === "filtered" ? "subagent" : undefined);
+            expect(input.messages[1].content[0]).toEqual({ type: "text", text: frameParentMemory("recorded memory") });
+        }
+    }
 });
 
 test("skips disabled, root, foreign, and already framed requests", async () => {

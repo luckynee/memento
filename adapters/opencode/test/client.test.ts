@@ -23,6 +23,9 @@ describe("daemon client", () => {
         expect(url.pathname).toBe("/v1/digest");
         expect(url.searchParams.get("project")).toBe("a & b");
         expect(url.searchParams.get("session")).toBe("x/y");
+        expect(url.searchParams.has("profile")).toBe(false);
+        await new MementoClient({ fetch: fetcher }).digest({ harness: "h", project: "p", session: "s", budget: 4, profile: "subagent" });
+        expect(new URL(request).searchParams.get("profile")).toBe("subagent");
     });
 
     test("lists sessions with encoded harness and project", async () => {

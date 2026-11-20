@@ -1,5 +1,11 @@
 import { parseJevModel } from "./jev";
 
+export type SubagentMemoryMode = "off" | "digest" | "filtered";
+
+function isSubagentMemoryMode(value: unknown): value is SubagentMemoryMode {
+    return value === "off" || value === "digest" || value === "filtered";
+}
+
 export function resolveOptions(raw: Record<string, unknown>) {
     const url = typeof raw.url === "string" && raw.url.trim()
         ? raw.url
@@ -17,13 +23,19 @@ export function resolveOptions(raw: Record<string, unknown>) {
         ? raw.tailCharBudget : 40000;
     const jevCooldownMs = typeof raw.jevCooldownMs === "number" && Number.isSafeInteger(raw.jevCooldownMs) && raw.jevCooldownMs >= 0
         ? raw.jevCooldownMs : 600000;
+    const subagentMemoryAgents: Record<string, SubagentMemoryMode> = Object.fromEntries(
+        raw.subagentMemoryAgents && typeof raw.subagentMemoryAgents === "object" && !Array.isArray(raw.subagentMemoryAgents)
+            ? Object.entries(raw.subagentMemoryAgents).filter((entry): entry is [string, SubagentMemoryMode] => isSubagentMemoryMode(entry[1]))
+            : [],
+    );
     return {
         url,
         token,
         tailUserTurns,
         tailCharBudget,
         digestBudget,
-        subagentMemory: raw.subagentMemory === "digest" ? "digest" as const : "off" as const,
+        subagentMemory: isSubagentMemoryMode(raw.subagentMemory) ? raw.subagentMemory : "off" as const,
+        subagentMemoryAgents,
         subagentDigestBudget,
         enabled: typeof raw.enabled === "boolean" ? raw.enabled : true,
         reconcile: typeof raw.reconcile === "boolean" ? raw.reconcile : true,

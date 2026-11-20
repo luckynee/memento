@@ -1,4 +1,4 @@
-type SessionInfo = { projectID: string; parentID?: string; location?: { directory?: string } };
+type SessionInfo = { projectID: string; parentID?: string; agent?: string; location?: { directory?: string } };
 
 export function createSessionOwnership(deps: {
     getSession(sessionID: string): Promise<SessionInfo>;
@@ -6,7 +6,7 @@ export function createSessionOwnership(deps: {
     directory: string;
     log(message: string, error?: unknown): void;
 }) {
-    type SessionOwnership = { owned: boolean; parentID?: string };
+    type SessionOwnership = { owned: boolean; parentID?: string; agent?: string };
     const sessions = new Map<string, SessionOwnership>();
     const pending = new Map<string, Promise<SessionOwnership | undefined>>();
 
@@ -42,7 +42,11 @@ export function createSessionOwnership(deps: {
                 if (session.parentID !== undefined && (typeof session.parentID !== "string" || !session.parentID)) {
                     throw new Error("Session parent ID is invalid");
                 }
-                const ownership = { owned: isOwned(session), parentID: session.parentID };
+                const ownership = {
+                    owned: isOwned(session),
+                    parentID: session.parentID,
+                    ...(typeof session.agent === "string" ? { agent: session.agent } : {}),
+                };
                 if (pending.get(sessionID) === lookup) {
                     sessions.delete(sessionID);
                     sessions.set(sessionID, ownership);

@@ -495,6 +495,7 @@ test("opt-in child context receives the flushed root digest without child regist
         if (request.pathname === "/v1/continuations/claim") { return Response.json({ claimed: false }); }
         if (request.pathname === "/v1/digest") {
             expect(request.searchParams.get("budget")).toBe("700");
+            expect(request.searchParams.get("profile")).toBe("subagent");
             return Response.json({ text: "root memory", segments: 1 });
         }
         if (request.pathname === "/v1/ingest") { return Response.json({ segments: 1, skipped: 0 }); }
@@ -502,7 +503,7 @@ test("opt-in child context receives the flushed root digest without child regist
     }) as typeof fetch;
     const registration = () => ({ async dispose() {} });
     const ctx = {
-        options: { jev: false, reconcile: false, subagentMemory: "digest", subagentDigestBudget: 700 },
+        options: { jev: false, reconcile: false, subagentMemory: "off", subagentMemoryAgents: { reviewer: "filtered" }, subagentDigestBudget: 700 },
         location: { project: { id: "p" } },
         storage: {
             async get(key: string) { return values.get(key); },
@@ -510,7 +511,7 @@ test("opt-in child context receives the flushed root digest without child regist
         },
         session: {
             async get({ sessionID }: { sessionID: string }) {
-                return sessionID === "child" ? { projectID: "p", parentID: "root" } : { projectID: "p", time: { created: 0 } };
+                return sessionID === "child" ? { projectID: "p", parentID: "root", agent: "reviewer" } : { projectID: "p", time: { created: 0 } };
             },
             async context({ sessionID }: { sessionID: string }) {
                 expect(sessionID).toBe("root");

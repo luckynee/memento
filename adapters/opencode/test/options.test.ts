@@ -6,8 +6,15 @@ test("validates adapter options and model references", () => {
     const defaults = resolveOptions({ tailUserTurns: 0, tailCharBudget: -1, digestBudget: 1.5, enabled: "no", harness: "", jevCooldownMs: -1 });
     expect(defaults).toMatchObject({ tailUserTurns: 3, tailCharBudget: 40000, digestBudget: 12000, enabled: true, reconcile: true, jev: true, jevCooldownMs: 600000, harness: "opencode" });
     expect(resolveOptions({ enabled: false, reconcile: false, harness: "custom", tailCharBudget: 99, jevCooldownMs: 0 })).toMatchObject({ enabled: false, reconcile: false, harness: "custom", tailCharBudget: 99, jevCooldownMs: 0 });
-    expect(resolveOptions({})).toMatchObject({ subagentMemory: "off", subagentDigestBudget: 6000 });
+    expect(resolveOptions({})).toMatchObject({ subagentMemory: "off", subagentMemoryAgents: {}, subagentDigestBudget: 6000 });
     expect(resolveOptions({ subagentMemory: "digest", subagentDigestBudget: 42 })).toMatchObject({ subagentMemory: "digest", subagentDigestBudget: 42 });
+    expect(resolveOptions({
+        subagentMemory: "filtered",
+        subagentMemoryAgents: { coder: "digest", reviewer: "filtered", private: "off", bad: "on", invalid: null },
+    })).toMatchObject({ subagentMemory: "filtered", subagentMemoryAgents: { coder: "digest", reviewer: "filtered", private: "off" } });
+    for (const value of [null, "digest", [], true]) {
+        expect(resolveOptions({ subagentMemoryAgents: value }).subagentMemoryAgents).toEqual({});
+    }
     for (const value of ["on", true, null]) {
         expect(resolveOptions({ subagentMemory: value }).subagentMemory).toBe("off");
     }
