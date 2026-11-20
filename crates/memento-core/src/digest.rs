@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use chrono::{DateTime, Utc};
 
+use crate::absence::is_absence_statement;
 use crate::protocol::{DigestResponse, Kind};
 use crate::segment::{Segment, SegmentPolicy, command_exit_header, strip_scaffolding};
 
@@ -88,6 +89,13 @@ fn entries(segments: &[Segment]) -> Vec<Entry> {
         );
         let text = text.trim_start_matches('\n').to_string();
         if text.trim().is_empty() {
+            continue;
+        }
+        if matches!(
+            first.kind,
+            Kind::AssistantNote | Kind::Decision | Kind::Constraint
+        ) && is_absence_statement(&text)
+        {
             continue;
         }
         result.push(Entry {
@@ -645,6 +653,46 @@ mod tests {
             assert!(!digest.text.contains(forbidden), "{forbidden}");
         }
         assert_eq!(digest.segments, 6);
+    }
+
+    #[test]
+    fn absence_only_notes_decisions_and_constraints_are_skipped() {
+        let digest = render_digest(
+            &input(vec![
+                segment(
+                    Kind::AssistantNote,
+                    "note",
+                    0,
+                    "Deploy window: not recorded.",
+                ),
+                segment(Kind::Decision, "decision", 1, "No record of a decision."),
+                segment(
+                    Kind::Constraint,
+                    "constraint",
+                    2,
+                    "No information about a constraint.",
+                ),
+                segment(
+                    Kind::AssistantNote,
+                    "mixed",
+                    3,
+                    "Window: not recorded. Owner: Dana.",
+                ),
+                segment(
+                    Kind::UserRequest,
+                    "request",
+                    4,
+                    "The window is not recorded.",
+                ),
+            ]),
+            4000,
+        );
+        assert!(!digest.text.contains("Deploy window: not recorded."));
+        assert!(!digest.text.contains("No record of a decision."));
+        assert!(!digest.text.contains("No information about a constraint."));
+        assert!(digest.text.contains("Window: not recorded. Owner: Dana."));
+        assert!(digest.text.contains("The window is not recorded."));
+        assert_eq!(digest.segments, 2);
     }
 
     #[test]

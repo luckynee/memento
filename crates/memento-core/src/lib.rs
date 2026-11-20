@@ -1,3 +1,4 @@
+pub mod absence;
 pub mod chunk;
 pub mod digest;
 pub mod ids;

@@ -1,7 +1,11 @@
 use chrono::Duration;
 
+use crate::absence::is_absence_statement;
 use crate::protocol::{Kind, SearchHit};
 use crate::segment::Segment;
+
+const QUESTION_RRF_FACTOR: f32 = 0.6;
+const ABSENCE_RRF_FACTOR: f32 = 0.4;
 
 #[derive(Debug, Clone)]
 pub struct Candidate {
@@ -57,6 +61,18 @@ pub fn rerank(
                 candidate.fused_score / max_fused
             } else {
                 0.0
+            };
+            let normalized = if candidate.segment.kind == Kind::UserRequest
+                && is_question(&candidate.segment.text)
+            {
+                normalized * QUESTION_RRF_FACTOR
+            } else {
+                normalized
+            };
+            let normalized = if is_absence_statement(&candidate.segment.text) {
+                normalized * ABSENCE_RRF_FACTOR
+            } else {
+                normalized
             };
             let age = newest.signed_duration_since(candidate.segment.ts);
             let age_secs =
@@ -114,6 +130,19 @@ pub fn rerank(
             path: segment.path,
         })
         .collect()
+}
+
+fn is_question(text: &str) -> bool {
+    let text = text.trim();
+    text.ends_with('?')
+        || text.split_whitespace().next().is_some_and(|word| {
+            [
+                "who", "what", "which", "when", "where", "why", "how", "is", "are", "does", "do",
+                "did", "can", "could", "should",
+            ]
+            .iter()
+            .any(|question_word| word.eq_ignore_ascii_case(question_word))
+        })
 }
 
 fn is_identifier(token: &str) -> bool {
@@ -223,6 +252,54 @@ mod tests {
         assert_eq!(hits[0].text, "new");
         assert!((hits[0].score - 0.15).abs() < 0.00001);
         assert!((hits[1].score - 0.075).abs() < 0.00001);
+    }
+
+    #[test]
+    fn answering_notes_rank_above_questions_with_higher_fused_scores() {
+        for kind in [Kind::AssistantNote, Kind::Decision] {
+            let question = candidate("Who is the QA sign-off owner?", 0, 1.0);
+            let mut answer = candidate("QA sign-off owner is Dana Reyes.", 0, 0.8);
+            answer.segment.kind = kind;
+            let hits = rerank(
+                "QA sign-off owner",
+                vec![question, answer],
+                &RerankConfig::default(),
+                2,
+            );
+            assert_eq!(hits[0].kind, kind);
+        }
+    }
+
+    #[test]
+    fn non_question_user_requests_are_not_penalized() {
+        let hits = rerank(
+            "QA owner",
+            vec![candidate("Record the QA owner.", 0, 1.0)],
+            &RerankConfig::default(),
+            1,
+        );
+        assert!((hits[0].score - 1.15).abs() < 0.00001);
+        assert!(is_question("  WHO owns this  "));
+        assert!(is_question("Tell me the owner?  "));
+        assert!(!is_question("Record the owner."));
+    }
+
+    #[test]
+    fn absence_only_hits_rank_below_facts() {
+        let mut absence = candidate("absence", 0, 1.0);
+        absence.segment.kind = Kind::AssistantNote;
+        absence.segment.text = "Deploy window: not recorded.".into();
+        let mut fact = candidate("fact", 0, 0.7);
+        fact.segment.kind = Kind::AssistantNote;
+        fact.segment.text = "Deploy window: Friday.".into();
+        let hits = rerank(
+            "deploy window",
+            vec![absence, fact],
+            &RerankConfig::default(),
+            2,
+        );
+        assert_eq!(hits[0].text, "Deploy window: Friday.");
+        assert!((hits[1].score - 0.55).abs() < 0.00001);
     }
 
     #[test]
