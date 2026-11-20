@@ -27,7 +27,7 @@ Run `bun install` in this directory, then add the plugin to `opencode.jsonc`:
 | `digestBudget` | `12000` | Digest character budget |
 | `subagentMemory` | `"off"` | Default subagent mode: `"off"`, `"digest"`, or `"filtered"`; enabled modes inject frozen root memory, and `"filtered"` omits the parent's newest user request and acknowledgement notes shorter than 40 characters |
 | `subagentMemoryAgents` | `{}` | Map agent IDs to `"off"`, `"digest"`, or `"filtered"` to override the default mode; invalid entries are ignored |
-| `subagentDigestBudget` | `6000` | Positive integer character budget for the subagent digest |
+| `subagentDigestBudget` | `12000` | Positive integer character budget for the subagent digest |
 | `enabled` | `true` | Enable the plugin |
 | `jev` | `true` | Enable Jev classification and relevance judgments |
 | `jevModel` | `opencode/jev-1.13-free` | Jev model as `provider/id` or a model object |

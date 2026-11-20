@@ -2360,7 +2360,7 @@ fn subagent_hook(
         ("harness", harness.name()),
         ("project", project.as_str()),
         ("session", input.session_id.as_str()),
-        ("budget", "6000"),
+        ("budget", "12000"),
     ];
     if mode == SubagentMemory::Filtered {
         query.push(("profile", "subagent"));
@@ -3950,7 +3950,7 @@ mod tests {
         );
         let request = server.join().unwrap();
         assert!(request.contains("session=parent"));
-        assert!(request.contains("budget=6000"));
+        assert!(request.contains("budget=12000"));
         assert!(request.contains("profile=subagent"));
     }
 
