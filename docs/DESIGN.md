@@ -209,6 +209,8 @@ The release binary embeds the OpenCode plugin bundle, harness skills, and daemon
 - `install-skills [--harness opencode|claude-code|codex|agy|all] [--project DIR | --user] [--source DIR] [--dry-run]` (embedded skills by default)
 - Global: `--url`, `--token`, `--json`, `--timeout-secs`.
 
+For `stats`, `sessions list`, `sessions link`, `sessions keep`, `search`, `digest`, and `forget`, `--project` accepts a directory or identifier: an existing directory resolves to its canonical project key, any other value is used verbatim (legacy identifiers, deleted directories). `gc`, `import`, and `continue` require an existing directory and fail otherwise.
+
 ## OpenCode adapter
 
 Location: `adapters/opencode/` (Promise plugin, `@opencode/plugin`). Verified contracts:

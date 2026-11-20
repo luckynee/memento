@@ -213,6 +213,37 @@ pub(super) fn project_key(dir: Option<&Path>) -> Result<String, CliError> {
         .map_err(|_| CliError::other("project path is not UTF-8"))
 }
 
+pub(super) fn project_argument_key(project: &Path) -> Result<String, CliError> {
+    if project.is_dir() {
+        project_key(Some(project))
+    } else {
+        project
+            .to_str()
+            .map(str::to_owned)
+            .ok_or_else(|| CliError::other("project identifier is not UTF-8"))
+    }
+}
+
+#[cfg(test)]
+mod project_argument_tests {
+    use super::*;
+
+    #[test]
+    fn nonexistent_project_arguments_stay_verbatim() {
+        let missing = Path::new("memento-missing-project-identifier");
+        assert!(!missing.exists());
+        assert_eq!(
+            project_argument_key(missing).unwrap(),
+            "memento-missing-project-identifier"
+        );
+    }
+
+    #[test]
+    fn directory_commands_still_reject_missing_directories() {
+        assert!(project_key(Some(Path::new("memento-missing-project-identifier"))).is_err());
+    }
+}
+
 fn http<T: Serialize>(
     client: &Client,
     cli: &Cli,

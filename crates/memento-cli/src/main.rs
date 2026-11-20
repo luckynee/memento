@@ -115,7 +115,10 @@ enum Command {
 struct StatsArgs {
     #[arg(long, help = "Harness identifier")]
     harness: Option<String>,
-    #[arg(long, help = "Filter by project (default: current project)")]
+    #[arg(
+        long,
+        help = "Project directory or identifier (default: current project)"
+    )]
     project: Option<String>,
     #[arg(long, help = "Filter by session")]
     session: Option<String>,
@@ -127,14 +130,14 @@ enum SessionsCommand {
     List {
         #[arg(long, help = "Harness identifier")]
         harness: String,
-        #[arg(long, help = "Filter by project")]
+        #[arg(long, help = "Filter by project directory or identifier")]
         project: Option<String>,
     },
     #[command(about = "Link a child session to a parent")]
     Link {
         #[arg(long, help = "Harness identifier")]
         harness: String,
-        #[arg(long, help = "Project identifier")]
+        #[arg(long, help = "Project directory or identifier")]
         project: String,
         #[arg(long, help = "Child session identifier")]
         child: String,
@@ -155,7 +158,10 @@ enum SessionsCommand {
         harness: String,
         #[arg(long, help = "Session identifier")]
         session: String,
-        #[arg(long, help = "Project identifier (default: current project)")]
+        #[arg(
+            long,
+            help = "Project directory or identifier (default: current project)"
+        )]
         project: Option<String>,
         #[arg(long, help = "Restore continuation retention")]
         off: bool,
@@ -237,7 +243,10 @@ struct SearchArgs {
     query: String,
     #[arg(long, help = "Harness identifier")]
     harness: Option<String>,
-    #[arg(long, help = "Project identifier (default: current project)")]
+    #[arg(
+        long,
+        help = "Project directory or identifier (default: current project)"
+    )]
     project: Option<String>,
     #[arg(long, help = "Session identifier")]
     session: Option<String>,
@@ -257,7 +266,10 @@ struct SearchArgs {
 struct DigestArgs {
     #[arg(long, requires = "session", help = "Harness identifier")]
     harness: Option<String>,
-    #[arg(long, help = "Project identifier (default: current project)")]
+    #[arg(
+        long,
+        help = "Project directory or identifier (default: current project)"
+    )]
     project: Option<String>,
     #[arg(long, requires = "harness", help = "Session identifier")]
     session: Option<String>,
@@ -272,7 +284,7 @@ struct DigestArgs {
 struct ForgetArgs {
     #[arg(long, help = "Harness identifier")]
     harness: String,
-    #[arg(long, help = "Project identifier")]
+    #[arg(long, help = "Project directory or identifier")]
     project: Option<String>,
     #[arg(long, help = "Forget one session")]
     session: Option<String>,
@@ -367,7 +379,7 @@ fn endpoint(base: &str, segments: &[&str]) -> Result<Url, CliError> {
 
 fn project_or_current(project: &Option<String>) -> Result<String, CliError> {
     match project {
-        Some(project) => Ok(project.clone()),
+        Some(project) => cross_harness::project_argument_key(std::path::Path::new(project)),
         None => cross_harness::project_key(None),
     }
 }
@@ -459,8 +471,12 @@ fn build_request(
             command: SessionsCommand::List { harness, project },
         } => {
             let mut query = vec![("harness", harness.as_str())];
-            if let Some(project) = project {
-                query.push(("project", project));
+            let project = project
+                .as_deref()
+                .map(|project| cross_harness::project_argument_key(std::path::Path::new(project)))
+                .transpose()?;
+            if let Some(project) = &project {
+                query.push(("project", project.as_str()));
             }
             request.query(&query)
         }
@@ -477,6 +493,7 @@ fn build_request(
                     retention,
                 },
         } => {
+            let project = cross_harness::project_argument_key(std::path::Path::new(project))?;
             let mut body =
                 json!({"harness": harness, "project": project, "session": child, "parent": parent});
             if let Some(parent_harness) = parent_harness {
@@ -554,7 +571,13 @@ fn build_request(
             };
             request.json(&ForgetRequest {
                 harness: args.harness.clone(),
-                project: args.project.clone(),
+                project: args
+                    .project
+                    .as_deref()
+                    .map(|project| {
+                        cross_harness::project_argument_key(std::path::Path::new(project))
+                    })
+                    .transpose()?,
                 session,
                 scope,
                 dry_run: args.dry_run,
@@ -1332,6 +1355,79 @@ mod tests {
             stats.url().query_pairs().collect::<Vec<_>>(),
             vec![("project".into(), project.into())]
         );
+    }
+
+    #[test]
+    fn project_arguments_resolve_directories_and_preserve_identifiers() {
+        let expected = cross_harness::project_key(Some(std::path::Path::new("."))).unwrap();
+        for (project, expected) in [
+            (".", expected.as_str()),
+            (
+                "memento-missing-project-identifier",
+                "memento-missing-project-identifier",
+            ),
+        ] {
+            let cases = [
+                vec!["stats", "--project", project],
+                vec!["sessions", "list", "--harness", "h", "--project", project],
+                vec![
+                    "sessions",
+                    "link",
+                    "--harness",
+                    "h",
+                    "--project",
+                    project,
+                    "--child",
+                    "c",
+                    "--parent",
+                    "p",
+                ],
+                vec![
+                    "sessions",
+                    "keep",
+                    "--harness",
+                    "h",
+                    "--session",
+                    "s",
+                    "--project",
+                    project,
+                ],
+                vec!["search", "query", "--project", project],
+                vec![
+                    "digest",
+                    "--harness",
+                    "h",
+                    "--session",
+                    "s",
+                    "--project",
+                    project,
+                ],
+                vec![
+                    "forget",
+                    "--harness",
+                    "h",
+                    "--session",
+                    "s",
+                    "--project",
+                    project,
+                ],
+            ];
+            for args in cases {
+                let request = request(&args);
+                let actual = if request.method() == Method::GET {
+                    request
+                        .url()
+                        .query_pairs()
+                        .find(|(key, _)| key == "project")
+                        .unwrap()
+                        .1
+                        .into_owned()
+                } else {
+                    body(&request)["project"].as_str().unwrap().to_string()
+                };
+                assert_eq!(actual, expected, "{args:?}");
+            }
+        }
     }
 
     #[test]
