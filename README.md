@@ -15,8 +15,12 @@ docker compose -f deploy/compose.yaml -p memento up -d --build
 cargo install --path crates/memento-cli
 cd adapters/opencode && bun install
 cd ../..
-memento setup
 ```
+
+Then connect your harnesses in one of two ways. Both produce the same configuration.
+
+- Guided: run `memento setup`.
+- Manual: run `memento install-hooks <harness>` and `memento install-skills` yourself and add the OpenCode plugin entry to `opencode.jsonc` (see [Other harnesses](#other-harnesses) and [adapters/opencode/README.md](adapters/opencode/README.md)). Your own harness or tooling can instead use the generic hook, `memento import`/`memento ingest`, MCP, or the daemon HTTP API ([docs/DESIGN.md](docs/DESIGN.md)).
 
 The wizard detects installed harnesses, chooses project or user scope, configures subagent memory, and optionally installs skills. It previews changes before confirmation. To configure without prompts:
 
@@ -41,7 +45,7 @@ The project key is the main checkout path (`memento project-key`), identical acr
 
 | Harness | Writes memory | Reads memory | Setup |
 | --- | --- | --- | --- |
-| OpenCode | plugin (step/turn events) | digest after model switch, `memory_search`, continuation claim | `memento setup` |
+| OpenCode | plugin (step/turn events) | digest after model switch, `memory_search`, continuation claim | `memento setup`, or add the plugin entry to `opencode.jsonc` ([snippet](adapters/opencode/README.md)) |
 | Claude Code | `Stop` hook starts a detached transcript import | `SessionStart` hook injects a claimed continuation | `memento install-hooks claude-code --project DIR` (or `--user`) |
 | Codex | `Stop` hook starts a detached rollout import | `SessionStart` hook (also re-injects after compaction) | `memento install-hooks codex --project DIR` (or `--user`); trust the project (`codex --trust` or `/hooks`) |
 | agy | `Stop` hook imports the transcript | `SessionStart` hook injects a claimed continuation | `memento install-hooks agy --project DIR` (or `--user`) |
@@ -55,7 +59,7 @@ OpenCode and Codex provide parent memory to subagents by default; Claude Code is
 
 Preview deleted-session cleanup with `memento gc --project DIR --dry-run`, then run `memento gc --project DIR` when appropriate. Hooks also start gc at most daily per project; `MEMENTO_AUTO_GC=0` disables this. The daemon sweeps stale sessions by default. Deleted sessions can remain available to dependent continuations until collected.
 
-Explicit forgetting is destructive and has no dry-run flag. Inspect sessions and lineage first, then confirm the scope before `memento forget --harness H --project PROJECT --session S`, `--lineage S` (S and its descendants), or `--whole-project` (all harnesses). The CLI asks for confirmation unless `--yes` is supplied.
+Explicit forgetting is destructive. Preview it with `--dry-run` (reports the segment count and affected sessions without deleting), then confirm the scope before `memento forget --harness H --project PROJECT --session S`, `--lineage S` (S and its descendants), or `--whole-project` (all harnesses). The CLI asks for confirmation unless `--yes` is supplied.
 
 ### Skills
 
