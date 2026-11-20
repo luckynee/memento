@@ -85,6 +85,7 @@ async fn run_test(store: &Store) -> anyhow::Result<()> {
         session: "s1".into(),
         parent: Some("parent".into()),
         parent_harness: None,
+        parent_cutoff: Some("2026-11-18T10:00:00Z".parse().unwrap()),
         retention: Retention::Keep,
         title: Some("title".into()),
         created: Some("2026-11-18T10:00:00Z".parse().unwrap()),

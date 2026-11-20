@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub const MAX_LINEAGE_DEPTH: usize = 64;
@@ -22,6 +23,12 @@ impl fmt::Display for SessionKey {
 pub struct SessionLink {
     pub key: SessionKey,
     pub parent: Option<SessionKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Ancestor {
+    pub key: SessionKey,
+    pub cutoff: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +66,37 @@ pub fn ancestors(
         }
         current = parent_of(&session);
         result.push(session);
+    }
+    Ok(result)
+}
+
+pub fn ancestors_with_cutoffs(
+    start: &SessionKey,
+    parent_of: impl Fn(&SessionKey) -> Option<(SessionKey, Option<DateTime<Utc>>)>,
+) -> Result<Vec<Ancestor>, LineageError> {
+    let mut result = Vec::new();
+    let mut seen = HashSet::new();
+    let mut current = Some((start.clone(), None::<DateTime<Utc>>));
+    while let Some((session, cutoff)) = current {
+        if !seen.insert(session.clone()) {
+            return Err(LineageError::Cycle { session });
+        }
+        if result.len() == MAX_LINEAGE_DEPTH {
+            return Err(LineageError::TooDeep {
+                limit: MAX_LINEAGE_DEPTH,
+            });
+        }
+        current = parent_of(&session).map(|(parent, parent_cutoff)| {
+            let effective_cutoff = match (cutoff, parent_cutoff) {
+                (Some(left), Some(right)) => Some(left.min(right)),
+                (left, right) => left.or(right),
+            };
+            (parent, effective_cutoff)
+        });
+        result.push(Ancestor {
+            key: session,
+            cutoff,
+        });
     }
     Ok(result)
 }
@@ -135,6 +173,31 @@ mod tests {
             ancestors(&start, |_| Some(start.clone())),
             Err(LineageError::Cycle { session: start })
         );
+    }
+
+    #[test]
+    fn fork_cutoffs_propagate_across_forks_and_continuations() {
+        let early = "2026-11-18T10:00:00Z".parse().unwrap();
+        let late = "2026-11-18T12:00:00Z".parse().unwrap();
+        let parent = |session: &SessionKey| match session.session.as_str() {
+            "fork" => Some((key("h", "root"), Some(early))),
+            "nested" => Some((key("h", "fork"), Some(late))),
+            "continuation" => Some((key("h", "nested"), None)),
+            "plain" => Some((key("h", "root"), None)),
+            _ => None,
+        };
+        let single = ancestors_with_cutoffs(&key("h", "fork"), parent).unwrap();
+        assert_eq!(single[0].cutoff, None);
+        assert_eq!(single[1].cutoff, Some(early));
+        let nested = ancestors_with_cutoffs(&key("h", "nested"), parent).unwrap();
+        assert_eq!(nested[1].cutoff, Some(late));
+        assert_eq!(nested[2].cutoff, Some(early));
+        let continuation = ancestors_with_cutoffs(&key("h", "continuation"), parent).unwrap();
+        assert_eq!(continuation[1].cutoff, None);
+        assert_eq!(continuation[2].cutoff, Some(late));
+        assert_eq!(continuation[3].cutoff, Some(early));
+        let plain = ancestors_with_cutoffs(&key("h", "plain"), parent).unwrap();
+        assert_eq!(plain[1].cutoff, None);
     }
 
     #[test]

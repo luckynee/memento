@@ -2528,6 +2528,7 @@ fn install(args: &InstallArgs, home: &Path, executable: &Path) -> Result<Option<
 struct GenericParent {
     harness: String,
     session: String,
+    cutoff: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Deserialize)]
@@ -2575,6 +2576,9 @@ fn generic_hook(
             if let Some(parent) = &input.parent {
                 registration["parent"] = json!(parent.session);
                 registration["parent_harness"] = json!(parent.harness);
+                if let Some(cutoff) = parent.cutoff {
+                    registration["parent_cutoff"] = json!(cutoff);
+                }
             }
             http(
                 &client,
@@ -3196,7 +3200,7 @@ mod tests {
             "event":"session_start",
             "session_id":"child",
             "cwd":temp.path(),
-            "parent":{"harness":"opencode","session":"parent"}
+            "parent":{"harness":"opencode","session":"parent","cutoff":"2026-11-18T10:00:00Z"}
         }))
         .unwrap();
         let output = generic_hook(&cli, "custom", &input, false).unwrap();
@@ -3242,6 +3246,7 @@ mod tests {
         let requests = server.join().unwrap();
         assert_eq!(requests[0]["parent_harness"], "opencode");
         assert_eq!(requests[0]["parent"], "parent");
+        assert_eq!(requests[0]["parent_cutoff"], "2026-11-18T10:00:00Z");
         assert_eq!(requests[1]["harness"], "custom");
         assert_eq!(requests[2]["items"][0]["text"], "hello");
         assert_eq!(requests[3]["reason"], "deleted");

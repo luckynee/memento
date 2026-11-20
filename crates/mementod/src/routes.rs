@@ -17,7 +17,7 @@ use axum::{
 use chrono::{DateTime, Duration, Utc};
 use memento_core::{
     digest::{DigestInput, render_digest},
-    lineage::{self, SessionKey, SessionLink},
+    lineage::{self, Ancestor, SessionKey, SessionLink},
     protocol::{
         ClaimRequest, ClaimResponse, ContinuationRecord, ContinuationRequest, DigestResponse,
         ErrorBody, ErrorDetail, ForgetRequest, ForgetResponse, ForgetScope, Health, IngestRequest,
@@ -309,6 +309,7 @@ struct SessionUpdate {
     session: String,
     parent: Option<String>,
     parent_harness: Option<String>,
+    parent_cutoff: Option<DateTime<Utc>>,
     retention: Option<Retention>,
     title: Option<String>,
     #[serde(default)]
@@ -698,6 +699,7 @@ async fn merge_session(
         session: update.session.clone(),
         parent: None,
         parent_harness: None,
+        parent_cutoff: None,
         retention: Retention::default(),
         title: None,
         created: Some(Utc::now()),
@@ -709,13 +711,25 @@ async fn merge_session(
     record.project = update.project;
     if let Some(parent) = update.parent {
         record.parent = Some(parent);
+        record.parent_cutoff = update.parent_cutoff;
         record.parent_harness = Some(
             update
                 .parent_harness
                 .unwrap_or_else(|| record.harness.clone()),
         );
     } else if let Some(parent_harness) = update.parent_harness {
+        if record.parent_harness.as_deref().unwrap_or(&record.harness) != parent_harness {
+            record.parent_cutoff = None;
+        }
         record.parent_harness = Some(parent_harness);
+        if update.parent_cutoff.is_some() {
+            record.parent_cutoff = update.parent_cutoff;
+        }
+    } else if update.parent_cutoff.is_some() {
+        record.parent_cutoff = update.parent_cutoff;
+    }
+    if record.parent.is_none() {
+        record.parent_cutoff = None;
     }
     if let Some(parent) = &record.parent {
         let child = SessionKey {
@@ -906,6 +920,7 @@ async fn claim_continuation(
             session: request.session,
             parent: Some(pending.parent_session.clone()),
             parent_harness: Some(pending.parent_harness.clone()),
+            parent_cutoff: None,
             retention: None,
             title: None,
             require_parent: false,
@@ -985,17 +1000,48 @@ async fn ancestors(
     harness: &str,
     session: &str,
 ) -> Result<Vec<SessionKey>, ApiError> {
-    let links = state.app.store.session_links().await;
-    let links = store_result(state, links)
+    Ok(ancestors_with_cutoffs(state, harness, session)
         .await?
         .into_iter()
+        .map(|ancestor| ancestor.key)
+        .collect())
+}
+
+async fn ancestors_with_cutoffs(
+    state: &RouterState,
+    harness: &str,
+    session: &str,
+) -> Result<Vec<Ancestor>, ApiError> {
+    let records = state
+        .app
+        .store
+        .list_sessions_filtered(ScopeFilter::default())
+        .await;
+    let links = store_result(state, records)
+        .await?
+        .into_iter()
+        .filter_map(|record| {
+            let key = session_key(&record);
+            record.parent.map(|session| {
+                (
+                    key,
+                    (
+                        SessionKey {
+                            harness: record.parent_harness.unwrap_or(record.harness),
+                            session,
+                        },
+                        record.parent_cutoff,
+                    ),
+                )
+            })
+        })
         .collect::<BTreeMap<_, _>>();
-    lineage::ancestors(
+    lineage::ancestors_with_cutoffs(
         &SessionKey {
             harness: harness.into(),
             session: session.into(),
         },
-        |session| links.get(session).cloned().flatten(),
+        |session| links.get(session).cloned(),
     )
     .map_err(ApiError::internal)
 }
@@ -1075,6 +1121,7 @@ async fn ingest(
                 session: request.session.clone(),
                 parent: None,
                 parent_harness: None,
+                parent_cutoff: None,
                 retention: Retention::default(),
                 title: None,
                 created: Some(Utc::now()),
@@ -1091,7 +1138,7 @@ async fn ingest(
         let result = state.app.store.upsert_session(record).await;
         store_result(&state, result).await?;
     }
-    let lineage = ancestors(&state, &request.harness, &request.session).await?;
+    let lineage = ancestors_with_cutoffs(&state, &request.harness, &request.session).await?;
     drop(_guard);
     let outcome = segment_items(&request, &state.app.policy);
     let source_roles = request
@@ -1151,12 +1198,17 @@ async fn search(
     if request.kinds.as_ref().is_some_and(Vec::is_empty) {
         return Ok(Json(SearchResponse { hits: Vec::new() }));
     }
-    let mut sessions = match request.scope {
-        Scope::Session => Some(vec![SessionKey {
-            harness: request.harness.clone(),
-            session: request.session.clone(),
+    let mut lineage = match request.scope {
+        Scope::Session => Some(vec![Ancestor {
+            key: SessionKey {
+                harness: request.harness.clone(),
+                session: request.session.clone(),
+            },
+            cutoff: None,
         }]),
-        Scope::Lineage => Some(ancestors(&state, &request.harness, &request.session).await?),
+        Scope::Lineage => {
+            Some(ancestors_with_cutoffs(&state, &request.harness, &request.session).await?)
+        }
         Scope::Project | Scope::Global => None,
     };
     let records = state
@@ -1180,8 +1232,8 @@ async fn search(
             session: record.session.clone(),
         })
         .collect::<std::collections::HashSet<_>>();
-    if let Some(keys) = &mut sessions {
-        keys.retain(|key| !hidden.contains(key));
+    if let Some(keys) = &mut lineage {
+        keys.retain(|ancestor| !hidden.contains(&ancestor.key));
         if keys.is_empty() {
             return Ok(Json(SearchResponse { hits: Vec::new() }));
         }
@@ -1190,7 +1242,8 @@ async fn search(
         harness: None,
         project: (request.scope != Scope::Global).then_some(request.project),
         session: None,
-        sessions,
+        sessions: None,
+        lineage,
         kinds: request.kinds,
     };
     let candidates = state
@@ -1254,7 +1307,7 @@ async fn render_session_digest(
     session: &str,
     budget: Option<usize>,
 ) -> Result<DigestResponse, ApiError> {
-    let mut lineage = ancestors(state, harness, session).await?;
+    let mut lineage = ancestors_with_cutoffs(state, harness, session).await?;
     let records = state
         .app
         .store
@@ -1264,10 +1317,10 @@ async fn render_session_digest(
         })
         .await;
     let records = store_result(state, records).await?;
-    lineage.retain(|key| {
+    lineage.retain(|ancestor| {
         !records.iter().any(|record| {
-            record.harness == key.harness
-                && record.session == key.session
+            record.harness == ancestor.key.harness
+                && record.session == ancestor.key.session
                 && record.collected_at.is_some()
         })
     });
@@ -1286,7 +1339,7 @@ async fn render_session_digest(
         .app
         .store
         .scroll_segments(&ScopeFilter {
-            sessions: Some(lineage.clone()),
+            lineage: Some(lineage.clone()),
             project: Some(project.to_owned()),
             ..Default::default()
         })
@@ -1296,7 +1349,10 @@ async fn render_session_digest(
         &DigestInput {
             harness: harness.into(),
             project: project.into(),
-            lineage: lineage.iter().map(ToString::to_string).collect(),
+            lineage: lineage
+                .iter()
+                .map(|ancestor| ancestor.key.to_string())
+                .collect(),
             segments,
         },
         budget.unwrap_or(12000).clamp(1000, 100000),
@@ -1506,6 +1562,7 @@ mod tests {
             session: session.into(),
             parent: parent.map(|(_, session)| session.into()),
             parent_harness: parent.map(|(harness, _)| harness.into()),
+            parent_cutoff: None,
             retention: Retention::Continuation,
             title: None,
             created: Some(Utc::now()),

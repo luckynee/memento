@@ -46,7 +46,7 @@ OpenCode plugin (TypeScript, adapters/opencode)      memento (Rust workspace)
 - `harness`: adapter id, for example `opencode`.
 - `project`: canonical project key (OpenCode `ctx.location.project.id`).
 - `session`: harness session id.
-- Lineage: a session may declare a `parent` session (continuation). Lineage of S is S plus all ancestors.
+- Lineage: a session may declare a `parent` session (continuation or fork). Lineage of S is S plus all ancestors; a fork can limit visible ancestor segments using `parent_cutoff`.
 - Search scopes: `session`, `lineage`, `project`, `global`. The CLI defaults to `project`, or `lineage` when a session is supplied.
 - Retention mode per session: `continuation` (default) or `keep`. Explicit forgetting uses `memento forget --session|--lineage|--whole-project`.
 
@@ -126,24 +126,25 @@ Collection `memento_segments`:
 
 Collection `memento_sessions` (registry): payload-only points if the Rust client supports a collection without vectors, otherwise a 1-dim dummy dense vector. Point id: UUIDv5 over `harness/session`.
 
-- payload: `harness`, `project`, `session`, `parent` and `parent_harness` (optional), `retention`, `created`, `title`, activity and deletion timestamps, and `deleted_reason` (optional).
+- payload: `harness`, `project`, `session`, `parent`, `parent_harness` and `parent_cutoff` (optional RFC 3339), `retention`, `created`, `title`, activity and deletion timestamps, and `deleted_reason` (optional).
 - keyword indexes: `harness`, `project`, `session`, `parent`.
 - Linking rejects cycles and self-parenting (409).
 
 Lineage terms:
 
 - ancestors(S): S, its parent, the parent's parent, up to the root (cycle-safe, max depth 64).
+- Each ancestor's effective cutoff is the earliest `parent_cutoff` on the path from S to that ancestor, or absent if no link has one. S itself has no cutoff.
 - descendants(S): S and every session whose ancestor chain contains S.
 - Search scope `lineage` uses ancestors(S). `forget` scope `lineage` uses descendants(S), so forgetting a continuation never deletes the parent history that siblings still use.
 
 Search:
 
-1. Qdrant query: prefetch dense (limit 50) and bm25 (limit 50), both under the scope filter and optional `kinds` filter, fused with RRF at the top level with an explicit `limit` of 50. No formula query: RRF scores are sums of `1/(k + rank)` and Qdrant's docs warn that an unweighted decay term dominates them.
+1. Qdrant query: prefetch dense (limit 50) and bm25 (limit 50), both under the scope filter and optional `kinds` filter, fused with RRF at the top level with an explicit `limit` of 50. For lineage scope, each ancestor's `(harness, session)` clause also requires `ts <=` its effective cutoff when present. No formula query: RRF scores are sums of `1/(k + rank)` and Qdrant's docs warn that an unweighted decay term dominates them.
 2. Rerank in Rust (pure, unit-tested): `normalized = rrf_score / max_rrf_score`, `final = normalized * question_factor * absence_factor + recency_weight * exp(-ln2 * age / half_life) + exact_match_bonus` where `question_factor` is 0.6 for a `user_request` whose trimmed text ends in `?` or begins with a question word, and 1 otherwise; `absence_factor` is 0.4 when every non-empty sentence or line states absence, and 1 otherwise. Age is measured against the newest `ts` in the candidate set (not wall clock, so results are reproducible), defaults `recency_weight = 0.15`, `half_life = 24h`. The default exact-match bonus of 0.5 applies only when the query has identifier-like whitespace-separated tokens and every such token occurs as a case-sensitive substring of the candidate text or first path. Surrounding punctuation is trimmed; identifiers contain `_`, `.`, `/`, `::`, or `-` between alphanumerics, mixed letters and digits, or a lowercase-to-uppercase transition. Ties break on `(ts desc, source_id, chunk_index)`. Return top `k` (default 8, max 50).
 
 ## Digest
 
-`GET /v1/digest` builds a deterministic working-state document for a session lineage (ancestors) within a char budget (default 12000). Segments are loaded fully by scroll and sorted by `(ts, source_id, chunk_index)` before rendering; chunks of one source are re-joined (overlap removed) and rendered as one entry, never split mid-entry. Absence-only assistant notes, decisions and constraints are omitted; mixed entries remain. Each section has its own share of the budget and unused share flows to the next section:
+`GET /v1/digest` builds a deterministic working-state document for a session lineage (ancestors) within a char budget (default 12000). Segments are loaded fully by scroll using the same ancestor cutoff filters as lineage search and sorted by `(ts, source_id, chunk_index)` before rendering; chunks of one source are re-joined (overlap removed) and rendered as one entry, never split mid-entry. Absence-only assistant notes, decisions and constraints are omitted; mixed entries remain. Each section has its own share of the budget and unused share flows to the next section:
 
 | Section | Share | Selection | Rendered order |
 | --- | --- | --- | --- |
@@ -167,7 +168,7 @@ All routes under `http://127.0.0.1:7377`. Optional bearer token via `MEMENTO_TOK
 | Method and path | Body or query | Response |
 | --- | --- | --- |
 | `GET /health` | | `{ "ok": true, "qdrant": true }` |
-| `PUT /v1/sessions` | `{ harness, project, session, parent?, parent_harness?, require_parent?, retention?, title? }`; merge semantics: absent fields keep stored values, `created` is set once | session record |
+| `PUT /v1/sessions` | `{ harness, project, session, parent?, parent_harness?, parent_cutoff?, require_parent?, retention?, title? }`; `parent_cutoff` is an RFC 3339 timestamp; absent fields keep stored values, except an explicit parent link without a cutoff clears it; `created` is set once | session record |
 | `GET /v1/sessions` | `?harness?&project?&include_deleted?` | `{ sessions: [...] }` |
 | `POST /v1/sessions/release` | `{ harness, project, session, reason? }` | `{ released, removed: [{ harness, session }] }` |
 | `POST /v1/maintenance/sweep` | `{ project?, dry_run? }` | stale and removed session keys |
@@ -187,7 +188,7 @@ Errors: `{ "error": { "code": "...", "message": "..." } }` with 4xx/5xx.
 - `health`
 - `stats [--harness H] [--project P] [--session S]` (`{ total, by_kind }`; current project by default, all harnesses when omitted)
 - `sessions list --harness H [--project P]`
-- `sessions link --harness H --project P --child S --parent P2 [--parent-harness H2] [--title T] [--retention continuation|keep]`
+- `sessions link --harness H --project P --child S --parent P2 [--parent-harness H2] [--parent-cutoff RFC3339] [--title T] [--retention continuation|keep]`
 - `sessions keep --harness H --session S [--project P] [--off]` (checks the session exists and is not deleted, then sets `keep` or restores `continuation`; project defaults to the current project)
 - `sessions lineage --harness H --session S`
 - `search <query> [--harness H] [--project P] [--session S] [--scope session|lineage|project|global] [--k 8] [--kind KIND]...` (current project by default; session and lineage require harness and session)
@@ -205,7 +206,7 @@ Location: `adapters/opencode/` (Promise plugin, `@opencode/plugin`). Verified co
 
 - For OpenCode project id `global`, ownership additionally requires matching session and plugin `location.directory` values after trimming one trailing slash, and the project key is the plugin directory (live verification pending).
 - Ingestion triggers: event `session.execution.succeeded` (`data: { sessionID }`) and `session.step.ended` (`data: { sessionID, assistantMessageID, finish }`, catches progress in turns that later fail or are aborted); then `ctx.session.context({ sessionID })` (messages after the last compaction) and ingest messages newer than the last ingested message id kept in `ctx.storage`. Assistant messages are re-sent while still growing (point ids are idempotent). On first sight of a session, ingest the full active context (backfill). Ingestion is serialized per session.
-- Forks are linked to their parent and only post-fork messages are ingested; lineage also includes parent segments recorded after the fork point. A claimed continuation takes precedence over the fork parent.
+- Forks are linked to their parent and only post-fork messages are ingested; lineage excludes ancestor segments after the effective fork cutoff. The adapter must send `parent_cutoff` when linking forks; adapter wiring is pending, so existing fork links remain unbounded until then. A claimed continuation takes precedence over the fork parent and clears the cutoff.
 - Flush before snapshot: when a switch is detected, the adapter awaits any in-flight ingestion and runs one synchronous ingest of the current context before fetching the digest, so failed, aborted, or just-finished turns are included.
 - Transcript shapes: user `{ id, type: "user", time: { created }, text }`; assistant `{ id, type: "assistant", model, content: (text | reasoning | tool)[] }`; tool part `{ type: "tool", id, name, state }` with `state.input`, `state.content`, `state.error`.
 - Jev at ingest: for each assistant text item, one `choice` question with choices `decision`, `constraint`, `task`, `note`; result becomes `kind_hint` (`note` maps to null). Failures fall back to null.
@@ -243,7 +244,7 @@ Harness ids: `opencode`, `claude-code`, `codex`, `agy`.
 
 ### Pending continuations
 
-`PUT /v1/continuations { project, parent_harness, parent_session, target_harness? }` stores one pending continuation per `(project, target_harness)` slot; an absent target is a separate any-harness slot. A put replaces only its slot. `POST /v1/continuations/claim { project, harness, session }` first returns an existing unexpired claim by that caller, then tries the caller's targeted slot followed by the any-harness slot. Expired slots are deleted; a slot claimed by another caller is skipped. A successful claim records `claimed_by` and `claimed_at`, links the session (`parent_harness`, `parent`), and returns `{ claimed: bool, parent_harness?, parent?, digest? }` with the lineage digest. Claims are idempotent per caller for 24 h; unclaimed slots expire 24 h after creation, and claimed slots expire 24 h after claiming. Legacy project-only-ID records remain claimable until expiry or replacement. Project-scope forget removes all continuation slots for the project. Links, continuations and claims are rejected with 409 `cross_project` when parent and child projects differ, and with 409 `too_deep` when the lineage would exceed 64. CLI: `memento continue --from <harness>/<session> [--project DIR] [--to HARNESS]`. Every adapter claims on its first event for a new session.
+`PUT /v1/continuations { project, parent_harness, parent_session, target_harness? }` stores one pending continuation per `(project, target_harness)` slot; an absent target is a separate any-harness slot. A put replaces only its slot. `POST /v1/continuations/claim { project, harness, session }` first returns an existing unexpired claim by that caller, then tries the caller's targeted slot followed by the any-harness slot. Expired slots are deleted; a slot claimed by another caller is skipped. A successful claim records `claimed_by` and `claimed_at`, links the session (`parent_harness`, `parent`), clears any stale `parent_cutoff`, and returns `{ claimed: bool, parent_harness?, parent?, digest? }` with the lineage digest. Claims are idempotent per caller for 24 h; unclaimed slots expire 24 h after creation, and claimed slots expire 24 h after claiming. Legacy project-only-ID records remain claimable until expiry or replacement. Project-scope forget removes all continuation slots for the project. Links, continuations and claims are rejected with 409 `cross_project` when parent and child projects differ, and with 409 `too_deep` when the lineage would exceed 64. CLI: `memento continue --from <harness>/<session> [--project DIR] [--to HARNESS]`. Every adapter claims on its first event for a new session.
 
 When OpenCode claims during a context hook, the claiming request also carries the framed continuation in its first user message, or in system text if no user message exists.
 
@@ -271,13 +272,13 @@ Invoke `memento hook generic --harness NAME` with JSON on stdin:
   "transcript_path": "/optional/transcript.jsonl",
   "transcript_format": "claude-code|codex|agy",
   "items": [],
-  "parent": { "harness": "opencode", "session": "parent-id" },
+  "parent": { "harness": "opencode", "session": "parent-id", "cutoff": "2026-11-18T10:00:00Z" },
   "agent_id": "optional-subagent-id",
   "is_subagent": false
 }
 ```
 
-Only `event`, `session_id`, and `cwd` are required; `items` contains neutral `IngestItem` objects. `session_start` registers the session, optionally links its parent, claims a continuation, and prints `{"context":"<framed digest>"}` or `{"context":null}`. `turn_end` imports a transcript when `transcript_path` is present, requiring `transcript_format` and taking precedence over `items`; otherwise it ingests the items. `session_deleted` releases with reason `deleted`; `session_end` is a no-op. Unknown events print `{}` and warn on stderr. A nonempty `agent_id` or true `is_subagent` prints `{}` and does nothing.
+Only `event`, `session_id`, and `cwd` are required; `items` contains neutral `IngestItem` objects, and `parent.cutoff` is optional RFC 3339. `session_start` registers the session, optionally links its parent, claims a continuation, and prints `{"context":"<framed digest>"}` or `{"context":null}`. `turn_end` imports a transcript when `transcript_path` is present, requiring `transcript_format` and taking precedence over `items`; otherwise it ingests the items. `session_deleted` releases with reason `deleted`; `session_end` is a no-op. Unknown events print `{}` and warn on stderr. A nonempty `agent_id` or true `is_subagent` prints `{}` and does nothing.
 
 #### Retention lifecycle
 

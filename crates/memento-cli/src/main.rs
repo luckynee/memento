@@ -120,6 +120,8 @@ enum SessionsCommand {
         parent: String,
         #[arg(long, help = "Parent harness identifier")]
         parent_harness: Option<String>,
+        #[arg(long, help = "Fork cutoff timestamp (RFC 3339)")]
+        parent_cutoff: Option<chrono::DateTime<chrono::Utc>>,
         #[arg(long, help = "Child session title")]
         title: Option<String>,
         #[arg(long, value_enum, help = "Child session retention mode")]
@@ -440,6 +442,7 @@ fn build_request(
                     child,
                     parent,
                     parent_harness,
+                    parent_cutoff,
                     title,
                     retention,
                 },
@@ -448,6 +451,9 @@ fn build_request(
                 json!({"harness": harness, "project": project, "session": child, "parent": parent});
             if let Some(parent_harness) = parent_harness {
                 body["parent_harness"] = json!(parent_harness);
+            }
+            if let Some(parent_cutoff) = parent_cutoff {
+                body["parent_cutoff"] = json!(parent_cutoff);
             }
             if let Some(title) = title {
                 body["title"] = json!(title);
@@ -1124,6 +1130,8 @@ mod tests {
             "s",
             "--parent-harness",
             "other",
+            "--parent-cutoff",
+            "2026-11-18T10:00:00Z",
             "--title",
             "title",
             "--retention",
@@ -1133,7 +1141,7 @@ mod tests {
         assert_eq!(link.url().path(), "/v1/sessions");
         assert_eq!(
             body(&link),
-            json!({"harness":"h","project":"p","session":"c","parent":"s","parent_harness":"other","title":"title","retention":"keep"})
+            json!({"harness":"h","project":"p","session":"c","parent":"s","parent_harness":"other","parent_cutoff":"2026-11-18T10:00:00Z","title":"title","retention":"keep"})
         );
 
         let lineage = request(&[

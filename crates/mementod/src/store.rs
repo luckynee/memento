@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, ensure};
 use memento_core::{
-    lineage::SessionKey,
+    lineage::{Ancestor, SessionKey},
     protocol::{ContinuationRecord, Kind, Role, SessionRecord},
     segment::Segment,
 };
@@ -13,9 +13,9 @@ use qdrant_client::{
     Payload, Qdrant,
     qdrant::{
         Condition, CountPointsBuilder, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder,
-        DeletePointsBuilder, Distance, Document, DocumentBuilder, FieldType, Filter, Fusion,
-        KeywordIndexParamsBuilder, Modifier, PointId, PointStruct, PrefetchQueryBuilder, Query,
-        QueryPointsBuilder, Range, ScrollPointsBuilder, SparseVectorParamsBuilder,
+        DatetimeRange, DeletePointsBuilder, Distance, Document, DocumentBuilder, FieldType, Filter,
+        Fusion, KeywordIndexParamsBuilder, Modifier, PointId, PointStruct, PrefetchQueryBuilder,
+        Query, QueryPointsBuilder, Range, ScrollPointsBuilder, SparseVectorParamsBuilder,
         SparseVectorsConfigBuilder, UpsertPointsBuilder, Vector, VectorParamsBuilder,
         VectorsConfigBuilder, point_id::PointIdOptions,
     },
@@ -34,6 +34,7 @@ pub struct ScopeFilter {
     pub project: Option<String>,
     pub session: Option<String>,
     pub sessions: Option<Vec<SessionKey>>,
+    pub lineage: Option<Vec<Ancestor>>,
     pub kinds: Option<Vec<Kind>>,
 }
 
@@ -59,6 +60,32 @@ impl ScopeFilter {
                     Condition::matches("harness", session.harness.clone()),
                     Condition::matches("session", session.session.clone()),
                 ]))
+            });
+            conditions.push(Condition::from(Filter::should(pairs)));
+        }
+        if let Some(lineage) = &self.lineage {
+            ensure!(
+                !lineage.is_empty(),
+                "empty lineage filter would match nothing"
+            );
+            let pairs = lineage.iter().map(|ancestor| {
+                let mut conditions = vec![
+                    Condition::matches("harness", ancestor.key.harness.clone()),
+                    Condition::matches("session", ancestor.key.session.clone()),
+                ];
+                if let Some(cutoff) = ancestor.cutoff {
+                    conditions.push(Condition::datetime_range(
+                        "ts",
+                        DatetimeRange {
+                            lte: Some(qdrant_client::qdrant::Timestamp {
+                                seconds: cutoff.timestamp(),
+                                nanos: cutoff.timestamp_subsec_nanos() as i32,
+                            }),
+                            ..Default::default()
+                        },
+                    ));
+                }
+                Condition::from(Filter::must(conditions))
             });
             conditions.push(Condition::from(Filter::should(pairs)));
         }
@@ -245,12 +272,12 @@ impl Store {
         &self,
         segments: &[Segment],
         source_roles: &HashMap<String, Role>,
-        lineage: &[SessionKey],
+        lineage: &[Ancestor],
         cosine_threshold: f32,
         jaccard_threshold: f32,
     ) -> Result<(usize, usize)> {
         let lineage_filter = ScopeFilter {
-            sessions: Some(lineage.to_vec()),
+            lineage: Some(lineage.to_vec()),
             ..Default::default()
         }
         .to_filter()
@@ -893,6 +920,7 @@ mod tests {
                 },
             ]),
             kinds: Some(vec![Kind::Task]),
+            lineage: None,
         }
         .to_filter()
         .unwrap();

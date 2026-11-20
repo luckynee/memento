@@ -215,8 +215,175 @@ async fn run_workflow(address: &str, store: &Store) {
     cross_harness_workflow(address, store).await;
     regression_workflow(address, store).await;
     continuation_slots_workflow(address, store).await;
+    fork_cutoff_workflow(address).await;
     release_workflow(address).await;
     stale_workflow(address, store).await;
+}
+
+async fn fork_cutoff_workflow(address: &str) {
+    let call = |method: &'static str, path: &'static str, body: Value| async move {
+        request(address, method, path, Some("test-token"), &body.to_string()).await
+    };
+    let parent = json!({
+        "harness":"fork-test","project":"fork-project","session":"parent","items":[
+            {"source_id":"before","ts":"2026-11-18T10:00:00Z","role":"user","text":"forkmarker before cutoff"},
+            {"source_id":"equal","ts":"2026-11-18T10:01:00Z","role":"user","text":"forkmarker equal cutoff"},
+            {"source_id":"after","ts":"2026-11-18T10:02:00Z","role":"user","text":"forkmarker after cutoff"}
+        ]
+    });
+    assert_eq!(call("POST", "/v1/ingest", parent).await.0, 200);
+    let link = json!({
+        "harness":"fork-test","project":"fork-project","session":"child",
+        "parent":"parent","parent_cutoff":"2026-11-18T10:01:00Z"
+    });
+    let linked = call("PUT", "/v1/sessions", link.clone()).await;
+    assert_eq!(linked.0, 200);
+    assert_eq!(linked.1["parent_cutoff"], "2026-11-18T10:01:00Z");
+    let merged = call(
+        "PUT",
+        "/v1/sessions",
+        json!({
+            "harness":"fork-test","project":"fork-project","session":"child","title":"fork"
+        }),
+    )
+    .await;
+    assert_eq!(merged.1["parent_cutoff"], "2026-11-18T10:01:00Z");
+    let search = |session: &str, scope: &str| {
+        json!({
+            "harness":"fork-test","project":"fork-project","session":session,
+            "query":"forkmarker","scope":scope,"k":50
+        })
+    };
+    let fork_hits = call("POST", "/v1/search", search("child", "lineage"))
+        .await
+        .1;
+    let texts = fork_hits["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| hit["text"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(texts.contains(&"forkmarker before cutoff"));
+    assert!(texts.contains(&"forkmarker equal cutoff"));
+    assert!(!texts.contains(&"forkmarker after cutoff"));
+    let parent_hits = call("POST", "/v1/search", search("parent", "session"))
+        .await
+        .1;
+    assert!(
+        parent_hits["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|hit| hit["text"] == "forkmarker after cutoff")
+    );
+    let digest = call(
+        "GET",
+        "/v1/digest?harness=fork-test&project=fork-project&session=child",
+        json!(null),
+    )
+    .await
+    .1;
+    let text = digest["text"].as_str().unwrap();
+    assert!(text.contains("forkmarker before cutoff"));
+    assert!(text.contains("forkmarker equal cutoff"));
+    assert!(!text.contains("forkmarker after cutoff"));
+    for scope in ["project", "global"] {
+        let hits = call("POST", "/v1/search", search("child", scope)).await.1;
+        assert!(
+            hits["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hit| hit["text"] == "forkmarker after cutoff")
+        );
+    }
+    let nested = call(
+        "PUT",
+        "/v1/sessions",
+        json!({
+            "harness":"fork-test","project":"fork-project","session":"nested","parent":"child",
+            "parent_cutoff":"2026-11-18T10:00:30Z"
+        }),
+    )
+    .await;
+    assert_eq!(nested.0, 200);
+    let nested_hits = call("POST", "/v1/search", search("nested", "lineage"))
+        .await
+        .1;
+    assert!(
+        nested_hits["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|hit| hit["text"] == "forkmarker before cutoff")
+    );
+    assert!(
+        !nested_hits["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|hit| hit["text"] == "forkmarker equal cutoff")
+    );
+    let child_ingest = call("POST", "/v1/ingest", json!({
+        "harness":"fork-test","project":"fork-project","session":"child","items":[
+            {"source_id":"own","ts":"2026-11-18T10:03:00Z","role":"user","text":"forkmarker after cutoff"}
+        ]
+    })).await;
+    assert_eq!(child_ingest.1["segments"], 1);
+    assert_eq!(child_ingest.1["duplicates"], 0);
+    let relinked = call(
+        "PUT",
+        "/v1/sessions",
+        json!({
+            "harness":"fork-test","project":"fork-project","session":"child","parent":"parent"
+        }),
+    )
+    .await;
+    assert!(relinked.1["parent_cutoff"].is_null());
+    assert_eq!(call("PUT", "/v1/sessions", link).await.0, 200);
+    assert_eq!(
+        call(
+            "PUT",
+            "/v1/continuations",
+            json!({
+                "project":"fork-project","parent_harness":"fork-test","parent_session":"parent"
+            })
+        )
+        .await
+        .0,
+        200
+    );
+    let claim = call(
+        "POST",
+        "/v1/continuations/claim",
+        json!({
+            "project":"fork-project","harness":"fork-test","session":"child"
+        }),
+    )
+    .await;
+    assert_eq!(claim.1["claimed"], true);
+    assert!(
+        claim.1["digest"]
+            .as_str()
+            .unwrap()
+            .contains("forkmarker after cutoff")
+    );
+    let record = call(
+        "GET",
+        "/v1/sessions?harness=fork-test&project=fork-project",
+        json!(null),
+    )
+    .await
+    .1;
+    assert!(
+        record["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["session"] == "child")
+            .unwrap()["parent_cutoff"]
+            .is_null()
+    );
 }
 
 async fn stale_workflow(address: &str, store: &Store) {

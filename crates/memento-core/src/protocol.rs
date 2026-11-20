@@ -71,6 +71,8 @@ pub struct SessionRecord {
     pub parent: Option<String>,
     pub parent_harness: Option<String>,
     #[serde(default)]
+    pub parent_cutoff: Option<DateTime<Utc>>,
+    #[serde(default)]
     pub retention: Retention,
     pub title: Option<String>,
     pub created: Option<DateTime<Utc>>,
