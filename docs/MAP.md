@@ -40,7 +40,7 @@
 
 - `memento/ingest/<sessionID>`: ingest cursor
 - `memento/registered/<sessionID>`: session registered with the daemon
-- `memento/switch/<sessionID>`: `{ origin, lastModel, snapshots }`
+- `memento/switch/<sessionID>`: `{ origin, lastModel, snapshots: { "<provider>/<id>": { cutMessageID, digest, compacted?, lastMessageID?, lastRequestAt? } } }`
 - `memento/subagent/<childID>`: frozen framed parent digest for a child session (`subagentMemory: "digest"`)
 
 ## Cross-harness pieces

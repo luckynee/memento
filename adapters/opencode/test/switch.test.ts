@@ -177,16 +177,18 @@ describe("switch controller", () => {
         const errors: unknown[] = [];
         let context: unknown[] = [];
         let calls = 0;
+        let currentTime = 1000;
         const controller = createSwitchController({
             client: { async digest() { order.push("digest"); calls++; if (failFirst && calls === 1) { throw new Error("offline"); } return { text: `digest-${calls}`, segments: 1 }; } },
             storage: { async get(key) { return values.get(key); }, async set(key, value) { values.set(key, value); } },
             async flush() { order.push("flush"); await Promise.resolve(); order.push("flushed"); },
             async loadContext() { return context; },
             harness: "opencode", project: "p", digestBudget: 100, tailUserTurns: 3, tailCharBudget: 40000,
+            now: () => currentTime,
             log(_message, error) { errors.push(error); },
         });
         const event = (model: ModelRef) => ({ sessionID: "s", model, system: system(), messages: history() });
-        return { controller, values, errors, order, event, calls: () => calls, setContext(messages: unknown[]) { context = messages; } };
+        return { controller, values, errors, order, event, calls: () => calls, setContext(messages: unknown[]) { context = messages; }, setTime(value: number) { currentTime = value; } };
     }
 
     test("detects a fork's first switch from the most recent assistant model", async () => {
@@ -202,7 +204,7 @@ describe("switch controller", () => {
         expect(fake.values.get("memento/switch/s")).toEqual({
             origin: a,
             lastModel: b,
-            snapshots: { "p/b": { cutMessageID: "u4", digest: "digest-1" } },
+            snapshots: { "p/b": { cutMessageID: "u4", digest: "digest-1", lastMessageID: "a4", lastRequestAt: 1000 } },
         });
         expect(fake.order).toEqual(["flush", "flushed", "digest"]);
         expect(event.messages[0].content[0]).toEqual({ type: "text", text: buildDigestText("digest-1") });
@@ -257,6 +259,92 @@ describe("switch controller", () => {
         expect(JSON.stringify({ system: second.system, messages: second.messages })).toBe(JSON.stringify({ system: first.system, messages: first.messages }));
         expect(fake.calls()).toBe(2);
         expect(fake.order).toEqual(["flush", "flushed", "digest", "flush", "flushed", "digest"]);
+    });
+
+    test("refreshes the returning model after uncached messages exceed the budget", async () => {
+        const fake = setup();
+        await fake.controller.onContext(fake.event(a));
+        await fake.controller.onContext(fake.event(b));
+        const expanded = [...history()];
+        for (let index = 0; index < 8; index++) {
+            expanded.push(message(`growth-u${index}`, "user", "u".repeat(3000)));
+            expanded.push(message(`growth-a${index}`, "assistant", "a".repeat(3000)));
+        }
+        await fake.controller.onContext({ ...fake.event(a), messages: expanded });
+        const returning = { ...fake.event(b), messages: expanded };
+        await fake.controller.onContext(returning);
+        expect(fake.calls()).toBe(3);
+        expect(fake.order).toEqual(["flush", "flushed", "digest", "flush", "flushed", "digest", "flush", "flushed", "digest"]);
+        expect(returning.messages[0].content[0]).toEqual({ type: "text", text: buildDigestText("digest-3") });
+        expect(returning.messages.length).toBeLessThan(expanded.length);
+    });
+
+    test("refreshes a compaction-created snapshot when returning to its model", async () => {
+        const fake = setup();
+        await fake.controller.onContext(fake.event(a));
+        await fake.controller.onCompaction({ sessionID: "s", model: b });
+        const compacted = { ...fake.event(b), messages: [message("summary", "assistant", "summary")] };
+        await fake.controller.onContext(compacted);
+        const expanded = [...compacted.messages, message("next", "user", "next"), message("answer", "assistant", "answer")];
+        await fake.controller.onContext({ ...fake.event(a), messages: expanded });
+        const returning = { ...fake.event(b), messages: expanded };
+        await fake.controller.onContext(returning);
+        expect(fake.calls()).toBe(3);
+        expect(returning.messages[0].content[0]).toEqual({ type: "text", text: buildDigestText("digest-3") });
+    });
+
+    test("reuses a snapshot byte-identically within the budget and cache lifetime", async () => {
+        const fake = setup();
+        await fake.controller.onContext(fake.event(a));
+        const first = fake.event(b);
+        await fake.controller.onContext(first);
+        fake.setTime(301000);
+        const expanded = [...history(), message("next", "user", "x".repeat(40000))];
+        await fake.controller.onContext({ ...fake.event(a), messages: expanded });
+        const returning = { ...fake.event(b), messages: expanded };
+        await fake.controller.onContext(returning);
+        const expected = { ...first, messages: [...first.messages, expanded[expanded.length - 1]] };
+        expect(JSON.stringify(returning)).toBe(JSON.stringify(expected));
+        expect(fake.calls()).toBe(2);
+    });
+
+    test("refreshes a snapshot older than five minutes only on transition", async () => {
+        const fake = setup();
+        await fake.controller.onContext(fake.event(a));
+        await fake.controller.onContext(fake.event(b));
+        fake.setTime(301001);
+        await fake.controller.onContext(fake.event(a));
+        const returning = fake.event(b);
+        await fake.controller.onContext(returning);
+        expect(fake.calls()).toBe(3);
+        expect(returning.messages[0].content[0]).toEqual({ type: "text", text: buildDigestText("digest-3") });
+        fake.setTime(601002);
+        await fake.controller.onContext(fake.event(b));
+        expect(fake.calls()).toBe(3);
+    });
+
+    test("refreshes a legacy snapshot without request tracking on transition", async () => {
+        const fake = setup();
+        fake.values.set("memento/switch/s", {
+            origin: a,
+            lastModel: a,
+            snapshots: { "p/b": { cutMessageID: "u4", digest: "old" } },
+        });
+        const returning = fake.event(b);
+        await fake.controller.onContext(returning);
+        expect(fake.calls()).toBe(1);
+        expect(returning.messages[0].content[0]).toEqual({ type: "text", text: buildDigestText("digest-1") });
+    });
+
+    test("refreshes when the last seen message is missing on transition", async () => {
+        const fake = setup();
+        await fake.controller.onContext(fake.event(a));
+        await fake.controller.onContext(fake.event(b));
+        await fake.controller.onContext(fake.event(a));
+        const returning = { ...fake.event(b), messages: [message("new", "user", "new")] };
+        await fake.controller.onContext(returning);
+        expect(fake.calls()).toBe(3);
+        expect(returning.messages[0].content[0]).toEqual({ type: "text", text: buildDigestText("digest-3") });
     });
 
     test("A to B to A creates and reuses A snapshot", async () => {

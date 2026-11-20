@@ -1,5 +1,7 @@
 import type { MementoClient } from "./client";
-import { buildDigestText, cloneMessage, rewriteForSwitch, sameModel, type ConversationMessage, type ModelRef, type SwitchState, type SystemText } from "./switch";
+import { buildDigestText, cloneMessage, partSize, rewriteForSwitch, sameModel, type ConversationMessage, type ModelRef, type SwitchSnapshot, type SwitchState, type SystemText } from "./switch";
+
+const SNAPSHOT_CACHE_TTL_MS = 300000;
 
 type Storage = {
     get(key: string): Promise<unknown>;
@@ -16,6 +18,7 @@ export function createSwitchController(deps: {
     digestBudget: number;
     tailUserTurns: number;
     tailCharBudget: number;
+    now?(): number;
     log(message: string, error?: unknown): void;
 }) {
     const states = new Map<string, SwitchState>();
@@ -85,6 +88,23 @@ export function createSwitchController(deps: {
         return undefined;
     }
 
+    function snapshotIsStale(snapshot: SwitchSnapshot, messages: ConversationMessage[], now: number): boolean {
+        if (snapshot.compacted || typeof snapshot.lastMessageID !== "string" || typeof snapshot.lastRequestAt !== "number" || !Number.isFinite(snapshot.lastRequestAt)) {
+            return true;
+        }
+        if (now - snapshot.lastRequestAt > SNAPSHOT_CACHE_TTL_MS) {
+            return true;
+        }
+        const lastMessageIndex = messages.findIndex((message) => message.id === snapshot.lastMessageID);
+        if (lastMessageIndex < 0) {
+            return true;
+        }
+        const addedSize = messages.slice(lastMessageIndex + 1).reduce(
+            (sum, message) => sum + message.content.reduce<number>((total, part) => total + partSize(part), 0), 0,
+        );
+        return addedSize > deps.tailCharBudget;
+    }
+
     function onCompaction(event: { sessionID: string; model: ModelRef; result?: { summary: string; metadata?: Record<string, unknown> } }): Promise<void> {
         return serialize(event.sessionID, async () => {
             const state = await load(event.sessionID);
@@ -133,7 +153,9 @@ export function createSwitchController(deps: {
             }
             const modelKey = `${event.model.providerID}/${event.model.id}`;
             let snapshot = state.snapshots[modelKey];
-            if (!snapshot) {
+            const now = (deps.now ?? Date.now)();
+            const switched = !sameModel(event.model, state.lastModel!);
+            if (!snapshot || (switched && snapshotIsStale(snapshot, event.messages, now))) {
                 try {
                     await deps.flush(event.sessionID);
                 } catch (error) {
@@ -153,9 +175,19 @@ export function createSwitchController(deps: {
                     }
                 }
                 snapshot = { cutMessageID, digest: digest.text };
-                state = { ...state, snapshots: { ...state.snapshots, [modelKey]: snapshot } };
             }
-            state = { ...state, lastModel: { providerID: event.model.providerID, id: event.model.id } };
+            let lastMessageID: string | undefined;
+            for (const message of event.messages) {
+                if (typeof message.id === "string") {
+                    lastMessageID = message.id;
+                }
+            }
+            snapshot = { ...snapshot, lastMessageID, lastRequestAt: now };
+            state = {
+                ...state,
+                lastModel: { providerID: event.model.providerID, id: event.model.id },
+                snapshots: { ...state.snapshots, [modelKey]: snapshot },
+            };
             await persist(event.sessionID, state);
             if (snapshot.compacted) {
                 return;

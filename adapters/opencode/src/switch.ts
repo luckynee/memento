@@ -1,5 +1,5 @@
 export type ModelRef = { providerID: string; id: string };
-export type SwitchSnapshot = { cutMessageID: string | null; digest: string; compacted?: boolean };
+export type SwitchSnapshot = { cutMessageID: string | null; digest: string; compacted?: boolean; lastMessageID?: string; lastRequestAt?: number };
 export type SwitchState = { origin?: ModelRef; lastModel?: ModelRef; snapshots: Record<string, SwitchSnapshot> };
 export type ConversationMessage = { role: string; content: ReadonlyArray<unknown>; id?: string };
 export type SystemText = { type: "text"; text: string };
@@ -39,7 +39,7 @@ function jsonSize(value: unknown): number {
     return (JSON.stringify(value) ?? "").length;
 }
 
-function partSize(value: unknown): number {
+export function partSize(value: unknown): number {
     const part = record(value);
     if (!part) {
         return 0;
