@@ -1,0 +1,169 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Validate release tag
+        id: version
+        shell: bash
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "memento-core") | .version')"
+          test -n "$version"
+          test "$GITHUB_REF_NAME" = "v$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  binaries:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-14
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: oven-sh/setup-bun@v2
+      - name: Build plugin bundle
+        working-directory: adapters/opencode
+        run: |
+          bun install --frozen-lockfile
+          bun build src/index.ts --target=bun --outfile=dist/index.js
+          test -s dist/index.js
+      - name: Install musl build tools
+        if: contains(matrix.target, 'linux-musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools cmake perl
+      - name: Build release binaries
+        run: cargo build --locked --release -p memento-cli -p memento-mcp --target "${{ matrix.target }}"
+      - name: Package assets
+        shell: bash
+        run: |
+          asset="memento-${{ matrix.target }}.tar.gz"
+          staging="$(mktemp -d)"
+          cp "target/${{ matrix.target }}/release/memento" "$staging/memento"
+          cp "target/${{ matrix.target }}/release/memento-mcp" "$staging/memento-mcp"
+          tar -C "$staging" -czf "$asset" memento memento-mcp
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$asset" > "$asset.sha256"
+          else
+            shasum -a 256 "$asset" > "$asset.sha256"
+          fi
+          rm -rf "$staging"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.target }}
+          path: |
+            memento-${{ matrix.target }}.tar.gz
+            memento-${{ matrix.target }}.tar.gz.sha256
+
+  docker:
+    needs: version
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          labels: org.opencontainers.image.version=${{ needs.version.outputs.version }}
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/mementod,push-by-digest=true,name-canonical=true,push=true
+      - name: Export digest
+        run: |
+          mkdir -p "/tmp/digests/${{ matrix.arch }}"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${{ matrix.arch }}/${digest#sha256:}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-digests-${{ matrix.arch }}
+          path: /tmp/digests/${{ matrix.arch }}/*
+          if-no-files-found: error
+          retention-days: 1
+
+  docker-manifest:
+    needs: [version, docker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: docker-digests-*
+          path: /tmp/digests
+          merge-multiple: true
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Publish multi-platform tags
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/mementod"
+          docker buildx imagetools create \
+            --tag "$image:${{ needs.version.outputs.version }}" \
+            --tag "$image:latest" \
+            $(printf "$image@sha256:%s " $(find /tmp/digests -type f -printf '%f\n'))
+
+  github-release:
+    needs: [version, binaries, docker-manifest]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          path: release-assets
+          merge-multiple: true
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$GITHUB_REF_NAME" release-assets/* install.sh --generate-notes
