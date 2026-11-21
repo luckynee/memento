@@ -324,7 +324,9 @@ The daemon records activity on ingest, session updates, continuation claims, sea
 
 ### MCP server
 
-`memento-mcp --harness NAME` (crate `memento-mcp`, `rmcp` 3.x) optionally serves stdio MCP tools for agy and other MCP-capable harnesses: `memory_search { query, scope?, project?, session? }`, `memory_digest { project?, harness?, session? }`, `memory_continue { from_harness, from_session }` (claims nothing, returns the parent digest), and `memory_note { kind: decision|constraint|task|note, text, session? }` which stores an explicit note (default session `<harness>-notes`, project from the server's cwd).
+`memento-mcp --harness NAME` (crate `memento-mcp`, `rmcp` 3.x) optionally serves stdio MCP tools for agy and other MCP-capable harnesses: `memory_search { query, scope?, project?, session? }`, `memory_digest { project?, harness?, session? }`, `memory_continue { from_harness, from_session, project? }` (claims nothing, returns the parent digest), and `memory_note { kind: decision|constraint|task|note, text, session?, project? }` which stores an explicit note (default session `<harness>-notes`).
+
+Each call resolves its project directory from the tool's `project` argument, then `--project` or `MEMENTO_PROJECT_DIR`, then the first usable `file://` client root when roots are advertised, then the lexicographically first workspace key in Codex request metadata, and finally the server's current directory at call time. The directory is converted to the canonical project key.
 
 ### Hardening (2026-11-19)
 
