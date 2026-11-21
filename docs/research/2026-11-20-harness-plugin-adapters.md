@@ -206,5 +206,5 @@ Decisions:
 1. `memento-mcp` resolves the project per call (commit `33bcd83d`): tool `project` argument, `--project`/`MEMENTO_PROJECT_DIR`, client roots, Codex workspace metadata, cwd.
 2. Integration lives in the adapters, installed with each harness's plugin manager; `memento setup`/`install-hooks` are not extended for plugins. No per-user config file is needed: Claude Code exposes subagent memory through `userConfig`, agy has no subagent hook, and Codex hooks stay outside the plugin.
 3. Codex adapter ships MCP and skills only; `memento install-hooks codex` stays required until Codex runs plugin hooks.
-4. Claude Code Mods are not adopted: `turn.step` exposes `turnId`, `index`, `model`, `effort`, `messageCount` only and accepts only `model`/`effort` changes; `session.compact` can only skip.
+4. Claude Code Mods cannot do the OpenCode switch rewrite (`turn.step` exposes `turnId`, `index`, `model`, `effort`, `messageCount` only and accepts only `model`/`effort` changes; `session.compact` can only skip), but they can register native tools. The Claude Code adapter therefore uses a Mod (`hooks/register.ts`) instead of MCP, backed by `memento search --framed`, `digest --framed/--continuation`, and `note`. Codex and agy have no in-process runtime, so they keep MCP.
 5. Live end-to-end recall passed for all three plugins (see `docs/MAP.md`).

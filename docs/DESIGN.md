@@ -331,15 +331,15 @@ Each call resolves its project directory from the tool's `project` argument, the
 
 ### Native plugin adapters
 
-Each harness has a self-contained plugin under `adapters/<harness>/`, installed through that harness's own plugin manager instead of `memento setup` or `install-hooks`. Plugins hold only declarative wiring; runtime logic stays in `memento hook <harness>` and `memento-mcp --harness <harness>`, which must be on `PATH`. Root `skills/` is canonical; `scripts/sync-adapter-skills.sh` copies it into each adapter, and `--check` (run in CI) fails on skill drift or a manifest version that differs from the workspace version.
+Each harness has a self-contained plugin under `adapters/<harness>/`, installed through that harness's own plugin manager instead of `memento setup` or `install-hooks`. Claude Code uses a Mod to register tools backed by the `memento` CLI; the other plugins wire `memento-mcp --harness <harness>`. Lifecycle logic stays in `memento hook <harness>`; the required binaries must be on `PATH`. Root `skills/` is canonical; `scripts/sync-adapter-skills.sh` copies it into each adapter, and `--check` (run in CI) fails on skill drift or a manifest version that differs from the workspace version.
 
 | Harness | Path | Hooks | MCP | Install |
 | --- | --- | --- | --- | --- |
-| Claude Code | `adapters/claude-code` | `hooks/hooks.json`, exec form: `SessionStart`, `Stop`, and `SubagentStart` with `--subagent-memory ${user_config.subagent_memory}` (`userConfig` default `off`) | `.mcp.json`, `--project ${CLAUDE_PROJECT_DIR}` | `claude --plugin-dir`, or marketplace `.claude-plugin/marketplace.json` |
+| Claude Code | `adapters/claude-code` | `hooks/hooks.json`, exec form: `SessionStart`, `Stop`, and `SubagentStart` with `--subagent-memory ${user_config.subagent_memory}` (`userConfig` default `off`) | none; `hooks/register.ts` registers native Mod tools using `memento` | `claude --plugin-dir`, or marketplace `.claude-plugin/marketplace.json` |
 | Codex | `adapters/codex` | none: Codex 0.170 does not run plugin hooks, so `memento install-hooks codex` remains required | portable `mcp.json`; project from request workspace metadata | marketplace `.agents/plugins/marketplace.json` |
 | agy | `adapters/agy` | root `hooks.json`: `SessionStart`, `Stop` | `mcp_config.json`; project from client roots | `agy plugin install <dir>` or `.agents/plugins/memento/` |
 
-A plugin plus hooks previously written by `install-hooks` for the same harness run twice; remove the old hooks when switching. Claude Code Mods were evaluated and not adopted: in 2.1.329 `turn.step` exposes only `turnId`, `index`, `model`, `effort`, and `messageCount` and accepts only `model`/`effort` changes, and `session.compact` can only skip, so a Mod cannot reproduce the OpenCode switch rewrite or compaction replacement.
+A plugin plus hooks previously written by `install-hooks` for the same harness run twice; remove the old hooks when switching. Claude Code's built-in Mod guard or organization policy can refuse Mods. In 2.1.329 `turn.step` exposes only `turnId`, `index`, `model`, `effort`, and `messageCount` and accepts only `model`/`effort` changes, and `session.compact` can only skip, so a Mod cannot reproduce the OpenCode switch rewrite or compaction replacement.
 
 ### Hardening (2026-11-19)
 

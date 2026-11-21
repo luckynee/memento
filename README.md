@@ -64,7 +64,7 @@ The project key is the main checkout path (`memento project-key`), identical acr
 | agy | `Stop` hook imports the transcript | `SessionStart` hook injects a claimed continuation | `memento install-hooks agy --project DIR` (or `--user`) |
 | Generic | `turn_end` imports a supported transcript or neutral items | `session_start` returns claimed context for the harness to inject | Wire JSON lifecycle events to `memento hook generic --harness NAME`; see [contract](docs/DESIGN.md#generic-hook-contract) |
 
-Native plugins are an alternative to `install-hooks` that also wire `memento-mcp` (`memory_search`, `memory_note`, ...): [Claude Code](adapters/claude-code/README.md) (hooks + MCP), [agy](adapters/agy/README.md) (hooks + MCP), and [Codex](adapters/codex/README.md) (MCP only; Codex 0.170 does not run plugin hooks, so keep `memento install-hooks codex`). Use either a plugin or `install-hooks` per harness, not both.
+Native plugins are an alternative to `install-hooks` that also provide memory tools (`memory_search`, `memory_note`, ...): [Claude Code](adapters/claude-code/README.md) (hooks + native Mod tools, no MCP), [agy](adapters/agy/README.md) (hooks + MCP), and [Codex](adapters/codex/README.md) (MCP only; Codex 0.170 does not run plugin hooks, so keep `memento install-hooks codex`). Use either a plugin or `install-hooks` per harness, not both.
 
 Any harness can use the CLI directly: `memento import claude-code|codex|agy --transcript PATH` (incremental cursor), `memento search`, `memento digest`. MCP is optional for agy and other MCP-capable harnesses; for agy, configure `agy mcp add memento -- /path/to/memento-mcp --harness agy`.
 
