@@ -1,0 +1,16 @@
+{
+    "memento": {
+        "SessionStart": [
+            {
+                "command": "memento hook agy",
+                "timeout": 30
+            }
+        ],
+        "Stop": [
+            {
+                "command": "memento hook agy",
+                "timeout": 30
+            }
+        ]
+    }
+}
