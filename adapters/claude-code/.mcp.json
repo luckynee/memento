@@ -1,8 +1,0 @@
-{
-    "mcpServers": {
-        "memento": {
-            "command": "memento-mcp",
-            "args": ["--harness", "claude-code", "--project", "${CLAUDE_PROJECT_DIR}"]
-        }
-    }
-}
