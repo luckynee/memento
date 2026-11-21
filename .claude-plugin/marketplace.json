@@ -1,0 +1,14 @@
+{
+    "name": "memento-pool",
+    "description": "Memento memory integration plugins.",
+    "owner": {
+        "name": "memento-pool"
+    },
+    "plugins": [
+        {
+            "name": "memento",
+            "source": "./adapters/claude-code",
+            "description": "Cross-session and cross-harness memory for Claude Code."
+        }
+    ]
+}

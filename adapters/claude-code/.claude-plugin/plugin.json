@@ -1,0 +1,17 @@
+{
+    "name": "memento",
+    "version": "0.1.0",
+    "description": "Cross-session and cross-harness memory for Claude Code.",
+    "author": {
+        "name": "memento-pool"
+    },
+    "userConfig": {
+        "subagent_memory": {
+            "type": "string",
+            "title": "Subagent memory",
+            "description": "Choose whether to provide parent session memory to subagents.",
+            "options": ["off", "digest", "filtered"],
+            "default": "off"
+        }
+    }
+}

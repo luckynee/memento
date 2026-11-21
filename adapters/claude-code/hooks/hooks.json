@@ -1,0 +1,38 @@
+{
+    "hooks": {
+        "SessionStart": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "memento",
+                        "args": ["hook", "claude-code"]
+                    }
+                ]
+            }
+        ],
+        "Stop": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "memento",
+                        "args": ["hook", "claude-code"]
+                    }
+                ]
+            }
+        ],
+        "SubagentStart": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "memento",
+                        "args": ["hook", "claude-code", "--subagent-memory", "${user_config.subagent_memory}"],
+                        "timeout": 10
+                    }
+                ]
+            }
+        ]
+    }
+}
