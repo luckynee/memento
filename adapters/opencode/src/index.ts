@@ -103,6 +103,7 @@ export default Plugin.define({
             harness: options.harness,
             project,
             digestBudget: options.digestBudget,
+            compactionMode: options.compaction,
             tailUserTurns: options.tailUserTurns,
             tailCharBudget: options.tailCharBudget,
             log,

@@ -1,5 +1,5 @@
 import type { MementoClient } from "./client";
-import { buildDigestText, cloneMessage, partSize, rewriteForSwitch, sameModel, type ConversationMessage, type ModelRef, type SwitchSnapshot, type SwitchState, type SystemText } from "./switch";
+import { buildDigestText, cloneMessage, partSize, renderRecentTail, rewriteForSwitch, sameModel, type ConversationMessage, type ModelRef, type SwitchSnapshot, type SwitchState, type SystemText } from "./switch";
 
 const SNAPSHOT_CACHE_TTL_MS = 300000;
 
@@ -16,6 +16,7 @@ export function createSwitchController(deps: {
     harness: string;
     project: string;
     digestBudget: number;
+    compactionMode?: "native" | "memento";
     tailUserTurns: number;
     tailCharBudget: number;
     now?(): number;
@@ -105,11 +106,12 @@ export function createSwitchController(deps: {
         return addedSize > deps.tailCharBudget;
     }
 
-    function onCompaction(event: { sessionID: string; model: ModelRef; result?: { summary: string; metadata?: Record<string, unknown> } }): Promise<void> {
+    function onCompaction(event: { sessionID: string; model: ModelRef; messages?: ReadonlyArray<ConversationMessage>; result?: { summary: string; metadata?: Record<string, unknown> } }): Promise<void> {
         return serialize(event.sessionID, async () => {
             const state = await load(event.sessionID);
             const previous = state.lastModel ?? historyModel(await deps.loadContext(event.sessionID)) ?? state.origin;
-            if (!previous || sameModel(event.model, previous)) {
+            const sameModelCompaction = !previous || sameModel(event.model, previous);
+            if (sameModelCompaction && deps.compactionMode !== "memento") {
                 return;
             }
             await deps.flush(event.sessionID);
@@ -121,13 +123,26 @@ export function createSwitchController(deps: {
             });
             const model = { providerID: event.model.providerID, id: event.model.id };
             const modelKey = `${model.providerID}/${model.id}`;
+            const messages = event.messages ?? [];
+            let lastUserIndex = messages.length;
+            for (let index = messages.length - 1; index >= 0; index--) {
+                if (messages[index].role === "user") {
+                    lastUserIndex = index;
+                    break;
+                }
+            }
+            const tail = sameModelCompaction ? renderRecentTail(messages.slice(0, lastUserIndex), {
+                tailUserTurns: deps.tailUserTurns,
+                tailCharBudget: deps.tailCharBudget,
+            }) : "";
+            const summary = buildDigestText(digest.text) + (tail ? "\n\n" + tail : "");
             await persist(event.sessionID, {
                 ...state,
-                origin: state.origin ?? previous,
+                origin: state.origin ?? previous ?? model,
                 lastModel: model,
                 snapshots: { ...state.snapshots, [modelKey]: { cutMessageID: null, digest: digest.text, compacted: true } },
             });
-            event.result = { summary: buildDigestText(digest.text), metadata: { source: "memento" } };
+            event.result = { summary, metadata: sameModelCompaction ? { source: "memento", mode: "same-model" } : { source: "memento" } };
         });
     }
 

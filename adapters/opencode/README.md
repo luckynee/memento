@@ -34,6 +34,7 @@ Alternatively, add the checkout plugin to `opencode.jsonc` manually:
 | `tailUserTurns` | `3` | Recent user turns retained after a model switch |
 | `tailCharBudget` | `40000` | Target character budget for the pre-switch tail |
 | `digestBudget` | `12000` | Digest character budget |
+| `compaction` | `"native"` | `"memento"` replaces same-model compaction with the memento digest plus a verbatim recent tail at zero model cost; OpenCode's observed `keepID` retains the latest user turn verbatim, so the tail covers earlier turns; falls back to native on errors |
 | `subagentMemory` | `"digest"` | Default subagent mode: `"off"`, `"digest"`, or `"filtered"`; enabled modes inject frozen root memory, and `"filtered"` omits the parent's newest user request and acknowledgement notes shorter than 40 characters |
 | `subagentMemoryAgents` | `{}` | Map agent IDs to `"off"`, `"digest"`, or `"filtered"` to override the default mode; invalid entries are ignored |
 | `subagentDigestBudget` | `12000` | Positive integer character budget for the subagent digest |

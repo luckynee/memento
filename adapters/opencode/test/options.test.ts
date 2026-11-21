@@ -7,6 +7,12 @@ test("validates adapter options and model references", () => {
     expect(defaults).toMatchObject({ tailUserTurns: 3, tailCharBudget: 40000, digestBudget: 12000, enabled: true, reconcile: true, jev: true, jevCooldownMs: 600000, harness: "opencode" });
     expect(resolveOptions({ enabled: false, reconcile: false, harness: "custom", tailCharBudget: 99, jevCooldownMs: 0 })).toMatchObject({ enabled: false, reconcile: false, harness: "custom", tailCharBudget: 99, jevCooldownMs: 0 });
     expect(resolveOptions({})).toMatchObject({ subagentMemory: "digest", subagentMemoryAgents: {}, subagentDigestBudget: 12000 });
+    expect(resolveOptions({}).compaction).toBe("native");
+    expect(resolveOptions({ compaction: "native" }).compaction).toBe("native");
+    expect(resolveOptions({ compaction: "memento" }).compaction).toBe("memento");
+    for (const value of ["other", true, null]) {
+        expect(resolveOptions({ compaction: value }).compaction).toBe("native");
+    }
     expect(resolveOptions({ subagentMemory: "digest", subagentDigestBudget: 42 })).toMatchObject({ subagentMemory: "digest", subagentDigestBudget: 42 });
     expect(resolveOptions({
         subagentMemory: "filtered",

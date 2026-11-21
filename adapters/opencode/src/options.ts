@@ -34,6 +34,7 @@ export function resolveOptions(raw: Record<string, unknown>) {
         tailUserTurns,
         tailCharBudget,
         digestBudget,
+        compaction: raw.compaction === "memento" ? "memento" as const : "native" as const,
         subagentMemory: isSubagentMemoryMode(raw.subagentMemory) ? raw.subagentMemory : "digest" as const,
         subagentMemoryAgents,
         subagentDigestBudget,
