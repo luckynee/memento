@@ -5,6 +5,7 @@ Session-continuation memory for coding-agent harnesses. When you switch models m
 - `mementod`: Rust daemon (axum) storing segments in Qdrant with hybrid search (fastembed BGE-small dense + Qdrant server-side BM25, RRF, recency rerank).
 - `memento`: Rust CLI for the daemon.
 - `adapters/opencode`: OpenCode V2 plugin (ingest, model-switch rewrite, `memory_search`, `/memento-continue`).
+- `adapters/claude-code`, `adapters/codex`, `adapters/agy`: native plugins bundling lifecycle hooks (Claude Code, agy), the `memento-mcp` server, and skills; see each adapter's README.
 
 Design and verified contracts: [docs/DESIGN.md](docs/DESIGN.md). Code map: [docs/MAP.md](docs/MAP.md).
 
@@ -62,6 +63,8 @@ The project key is the main checkout path (`memento project-key`), identical acr
 | Codex | `Stop` hook starts a detached rollout import | `SessionStart` hook (also re-injects after compaction) | `memento install-hooks codex --project DIR` (or `--user`); trust the project (`codex --trust` or `/hooks`) |
 | agy | `Stop` hook imports the transcript | `SessionStart` hook injects a claimed continuation | `memento install-hooks agy --project DIR` (or `--user`) |
 | Generic | `turn_end` imports a supported transcript or neutral items | `session_start` returns claimed context for the harness to inject | Wire JSON lifecycle events to `memento hook generic --harness NAME`; see [contract](docs/DESIGN.md#generic-hook-contract) |
+
+Native plugins are an alternative to `install-hooks` that also wire `memento-mcp` (`memory_search`, `memory_note`, ...): [Claude Code](adapters/claude-code/README.md) (hooks + MCP), [agy](adapters/agy/README.md) (hooks + MCP), and [Codex](adapters/codex/README.md) (MCP only; Codex 0.170 does not run plugin hooks, so keep `memento install-hooks codex`). Use either a plugin or `install-hooks` per harness, not both.
 
 Any harness can use the CLI directly: `memento import claude-code|codex|agy --transcript PATH` (incremental cursor), `memento search`, `memento digest`. MCP is optional for agy and other MCP-capable harnesses; for agy, configure `agy mcp add memento -- /path/to/memento-mcp --harness agy`.
 

@@ -328,6 +328,18 @@ The daemon records activity on ingest, session updates, continuation claims, sea
 
 Each call resolves its project directory from the tool's `project` argument, then `--project` or `MEMENTO_PROJECT_DIR`, then the first usable `file://` client root when roots are advertised, then the lexicographically first workspace key in Codex request metadata, and finally the server's current directory at call time. The directory is converted to the canonical project key.
 
+### Native plugin adapters
+
+Each harness has a self-contained plugin under `adapters/<harness>/`, installed through that harness's own plugin manager instead of `memento setup` or `install-hooks`. Plugins hold only declarative wiring; runtime logic stays in `memento hook <harness>` and `memento-mcp --harness <harness>`, which must be on `PATH`. Root `skills/` is canonical; `scripts/sync-adapter-skills.sh` copies it into each adapter, and `--check` (run in CI) fails on skill drift or a manifest version that differs from the workspace version.
+
+| Harness | Path | Hooks | MCP | Install |
+| --- | --- | --- | --- | --- |
+| Claude Code | `adapters/claude-code` | `hooks/hooks.json`, exec form: `SessionStart`, `Stop`, and `SubagentStart` with `--subagent-memory ${user_config.subagent_memory}` (`userConfig` default `off`) | `.mcp.json`, `--project ${CLAUDE_PROJECT_DIR}` | `claude --plugin-dir`, or marketplace `.claude-plugin/marketplace.json` |
+| Codex | `adapters/codex` | none: Codex 0.170 does not run plugin hooks, so `memento install-hooks codex` remains required | portable `mcp.json`; project from request workspace metadata | marketplace `.agents/plugins/marketplace.json` |
+| agy | `adapters/agy` | root `hooks.json`: `SessionStart`, `Stop` | `mcp_config.json`; project from client roots | `agy plugin install <dir>` or `.agents/plugins/memento/` |
+
+A plugin plus hooks previously written by `install-hooks` for the same harness run twice; remove the old hooks when switching. Claude Code Mods were evaluated and not adopted: in 2.1.329 `turn.step` exposes only `turnId`, `index`, `model`, `effort`, and `messageCount` and accepts only `model`/`effort` changes, and `session.compact` can only skip, so a Mod cannot reproduce the OpenCode switch rewrite or compaction replacement.
+
 ### Hardening (2026-11-19)
 
 - Ingest: `IngestResponse.duplicates` counts prose segments skipped as near-duplicates of an existing segment in the same project and the same lineage (the session and its ancestors; an unlinked session repeating a fact is stored) (dense cosine >= 0.95 and 3-gram word-shingle Jaccard >= 0.8; `MEMENTO_DUPLICATE_COSINE_THRESHOLD`, `MEMENTO_DUPLICATE_JACCARD_THRESHOLD`). This curbs memory echo when a model restates the digest.
