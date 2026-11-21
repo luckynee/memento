@@ -199,8 +199,9 @@ The release binary embeds the OpenCode plugin bundle, harness skills, and daemon
 - `sessions link --harness H --project P --child S --parent P2 [--parent-harness H2] [--parent-cutoff RFC3339] [--title T] [--retention continuation|keep]`
 - `sessions keep --harness H --session S [--project P] [--off]` (checks the session exists and is not deleted, then sets `keep` or restores `continuation`; project defaults to the current project)
 - `sessions lineage --harness H --session S`
-- `search <query> [--harness H] [--project P] [--session S] [--scope session|lineage|project|global] [--k 8] [--kind KIND]...` (current project by default; session and lineage require harness and session)
-- `digest [--harness H --session S] [--project P] [--budget N] [--profile default|subagent]` (current project by default; checks up to 10 most recently active non-deleted sessions and selects the first with a non-`user_request` segment, falling back to the most recently active if none qualifies or a stats request fails; selected session reported on stderr)
+- `search <query> [--harness H] [--project P] [--session S] [--scope session|lineage|project|global] [--k 8] [--kind KIND]... [--framed]` (current project by default; session and lineage require harness and session; `--framed` emits neutralized reference data and conflicts with `--json`)
+- `digest [--harness H --session S] [--project P] [--budget N] [--profile default|subagent] [--framed | --continuation]` (current project by default; checks up to 10 most recently active non-deleted sessions and selects the first with a non-`user_request` segment, falling back to the most recently active if none qualifies or a stats request fails; selected session reported on stderr; framing flags conflict with `--json`, and `--continuation` requires `--harness` and `--session`)
+- `note --kind decision|constraint|task|note --harness H [--session S] [--project P] <TEXT>` (stores an assistant-authored note; session defaults to `<harness>-notes`, project defaults to the current project, and `--json` prints the raw ingest response)
 - `forget --harness H [--project P] (--session S | --lineage S | --whole-project) [--yes] [--dry-run]` (`--whole-project` requires `--project`; without `--yes` it asks on a TTY and refuses otherwise; dry runs never prompt and report matching segments and sessions)
 - `gc [--project DIR] [--dry-run] [--json]` releases sessions whose harness data is gone.
 - `ingest --file turns.json|-` (neutral schema, for harnesses without a plugin)
@@ -209,7 +210,7 @@ The release binary embeds the OpenCode plugin bundle, harness skills, and daemon
 - `install-skills [--harness opencode|claude-code|codex|agy|all] [--project DIR | --user] [--source DIR] [--dry-run]` (embedded skills by default)
 - Global: `--url`, `--token`, `--json`, `--timeout-secs`.
 
-For `stats`, `sessions list`, `sessions link`, `sessions keep`, `search`, `digest`, and `forget`, `--project` accepts a directory or identifier: an existing directory resolves to its canonical project key, any other value is used verbatim (legacy identifiers, deleted directories). `gc`, `import`, and `continue` require an existing directory and fail otherwise.
+For `stats`, `sessions list`, `sessions link`, `sessions keep`, `search`, `digest`, `note`, and `forget`, `--project` accepts a directory or identifier: an existing directory resolves to its canonical project key, any other value is used verbatim (legacy identifiers, deleted directories). `gc`, `import`, and `continue` require an existing directory and fail otherwise.
 
 ## OpenCode adapter
 

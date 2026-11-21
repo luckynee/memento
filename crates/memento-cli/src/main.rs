@@ -7,9 +7,10 @@ use std::time::Duration;
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use memento_core::lineage::SessionKey;
 use memento_core::protocol::{
-    DigestResponse, ErrorBody, ForgetRequest, ForgetResponse, ForgetScope, Health, IngestRequest,
-    Kind, Retention, Scope, SearchRequest, SearchResponse, SessionRecord,
+    DigestResponse, ErrorBody, ForgetRequest, ForgetResponse, ForgetScope, Health, IngestItem,
+    IngestRequest, Kind, Retention, Role, Scope, SearchRequest, SearchResponse, SessionRecord,
 };
+use memento_core::reference::{format_continuation, format_digest, format_search};
 use reqwest::blocking::{Client, Request};
 use reqwest::{Method, Url};
 use serde::Deserialize;
@@ -76,6 +77,8 @@ enum Command {
     Search(SearchArgs),
     #[command(about = "Show a session digest")]
     Digest(DigestArgs),
+    #[command(about = "Store an explicit memory note")]
+    Note(NoteArgs),
     #[command(about = "Delete matching memories")]
     Forget(ForgetArgs),
     #[command(about = "Release memories for deleted harness sessions")]
@@ -260,6 +263,8 @@ struct SearchArgs {
     k: usize,
     #[arg(long, value_enum, help = "Filter by memory kind")]
     kind: Vec<KindArg>,
+    #[arg(long, conflicts_with = "json", help = "Print framed reference data")]
+    framed: bool,
 }
 
 #[derive(Debug, Args)]
@@ -277,6 +282,35 @@ struct DigestArgs {
     budget: Option<usize>,
     #[arg(long, value_parser = ["default", "subagent"], help = "Digest profile")]
     profile: Option<String>,
+    #[arg(long, conflicts_with_all = ["json", "continuation"], help = "Print framed reference data")]
+    framed: bool,
+    #[arg(long, requires_all = ["harness", "session"], conflicts_with_all = ["json", "framed"], help = "Print framed parent continuation")]
+    continuation: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum NoteKind {
+    Decision,
+    Constraint,
+    Task,
+    Note,
+}
+
+#[derive(Debug, Args)]
+struct NoteArgs {
+    #[arg(long, value_enum, help = "Memory kind")]
+    kind: NoteKind,
+    #[arg(long, help = "Harness identifier")]
+    harness: String,
+    #[arg(long, help = "Session identifier (default: <harness>-notes)")]
+    session: Option<String>,
+    #[arg(
+        long,
+        help = "Project directory or identifier (default: current project)"
+    )]
+    project: Option<String>,
+    #[arg(help = "Note text")]
+    text: String,
 }
 
 #[derive(Debug, Args)]
@@ -431,7 +465,8 @@ fn build_request(
         Command::Digest(_) => (Method::GET, vec!["v1", "digest"]),
         Command::Forget(_) => (Method::POST, vec!["v1", "forget"]),
         Command::Ingest(_) => (Method::POST, vec!["v1", "ingest"]),
-        Command::Setup(_)
+        Command::Note(_)
+        | Command::Setup(_)
         | Command::ProjectKey { .. }
         | Command::Gc(_)
         | Command::Import(_)
@@ -586,7 +621,8 @@ fn build_request(
         Command::Ingest(_) => {
             request.json(ingest.ok_or_else(|| CliError::other("missing ingest input"))?)
         }
-        Command::Setup(_)
+        Command::Note(_)
+        | Command::Setup(_)
         | Command::ProjectKey { .. }
         | Command::Gc(_)
         | Command::Import(_)
@@ -739,8 +775,11 @@ fn render(command: &Command, body: &str) -> Result<String, CliError> {
                 .collect::<Vec<_>>()
                 .join(" -> "))
         }
-        Command::Search(_) => {
+        Command::Search(args) => {
             let response: SearchResponse = parse_response(body)?;
+            if args.framed {
+                return Ok(format_search(&response));
+            }
             Ok(response
                 .hits
                 .iter()
@@ -769,9 +808,23 @@ fn render(command: &Command, body: &str) -> Result<String, CliError> {
                 .collect::<Vec<_>>()
                 .join("\n"))
         }
-        Command::Digest(_) => {
+        Command::Digest(args) => {
             let response: DigestResponse = parse_response(body)?;
-            Ok(response.text)
+            if args.framed {
+                Ok(format_digest(&response.text))
+            } else if args.continuation {
+                let harness = args
+                    .harness
+                    .as_deref()
+                    .ok_or_else(|| CliError::other("missing digest harness"))?;
+                let session = args
+                    .session
+                    .as_deref()
+                    .ok_or_else(|| CliError::other("missing digest session"))?;
+                Ok(format_continuation(harness, session, &response.text))
+            } else {
+                Ok(response.text)
+            }
         }
         Command::Forget(args) => {
             let response: ForgetResponse = parse_response(body)?;
@@ -804,7 +857,8 @@ fn render(command: &Command, body: &str) -> Result<String, CliError> {
             );
             Ok(lines.join("\n"))
         }
-        Command::Setup(_)
+        Command::Note(_)
+        | Command::Setup(_)
         | Command::ProjectKey { .. }
         | Command::Gc(_)
         | Command::Import(_)
@@ -952,7 +1006,90 @@ fn select_digest_session(client: &Client, cli: &mut Cli) -> Result<(), CliError>
     Ok(())
 }
 
+fn run_note(client: &Client, cli: &Cli, args: &NoteArgs) -> Result<(), CliError> {
+    let project = project_or_current(&args.project)?;
+    let session = args
+        .session
+        .clone()
+        .unwrap_or_else(|| format!("{}-notes", args.harness));
+    let registration = json!({
+        "harness": args.harness,
+        "project": project,
+        "session": session
+    });
+    let ingest = IngestRequest {
+        harness: args.harness.clone(),
+        project,
+        session,
+        items: vec![IngestItem {
+            source_id: format!("note:{}", uuid::Uuid::new_v4()),
+            ts: chrono::Utc::now(),
+            role: Role::Assistant,
+            text: args.text.clone(),
+            injected: false,
+            kind_hint: match args.kind {
+                NoteKind::Decision => Some(Kind::Decision),
+                NoteKind::Constraint => Some(Kind::Constraint),
+                NoteKind::Task => Some(Kind::Task),
+                NoteKind::Note => None,
+            },
+            tool: None,
+        }],
+    };
+    let mut registration_request = client
+        .put(endpoint(&cli.url, &["v1", "sessions"])?)
+        .json(&registration);
+    let mut ingest_request = client
+        .post(endpoint(&cli.url, &["v1", "ingest"])?)
+        .json(&ingest);
+    if let Some(token) = &cli.token {
+        registration_request = registration_request.bearer_auth(token);
+        ingest_request = ingest_request.bearer_auth(token);
+    }
+    let registration_response = registration_request
+        .send()
+        .map_err(|error| CliError::request(error, &cli.url))?;
+    let status = registration_response.status();
+    let body = registration_response.text().map_err(|error| {
+        CliError::other(format!(
+            "cannot read session registration response: {error}"
+        ))
+    })?;
+    if !status.is_success() {
+        return Err(response_error(status, &body));
+    }
+    let _: Value = parse_response(&body)?;
+    let response = ingest_request
+        .send()
+        .map_err(|error| CliError::request(error, &cli.url))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .map_err(|error| CliError::other(format!("cannot read ingest response: {error}")))?;
+    if !status.is_success() {
+        return Err(response_error(status, &body));
+    }
+    if cli.json {
+        println!("{body}");
+    } else {
+        let response: IngestResponse = parse_response(&body)?;
+        println!("stored: {}", response.segments);
+    }
+    Ok(())
+}
+
 fn run(mut cli: Cli) -> Result<(), CliError> {
+    if cli.json
+        && match &cli.command {
+            Command::Search(args) => args.framed,
+            Command::Digest(args) => args.framed || args.continuation,
+            _ => false,
+        }
+    {
+        return Err(CliError::other(
+            "--json cannot be used with --framed or --continuation",
+        ));
+    }
     if let Command::Daemon(args) = &cli.command {
         return daemon::run(&cli, args);
     }
@@ -1001,6 +1138,9 @@ fn run(mut cli: Cli) -> Result<(), CliError> {
         .timeout(Duration::from_secs(cli.timeout_secs))
         .build()
         .map_err(|error| CliError::other(format!("cannot create HTTP client: {error}")))?;
+    if let Command::Note(args) = &cli.command {
+        return run_note(&client, &cli, args);
+    }
     select_digest_session(&client, &mut cli)?;
     confirm_keep_session(&client, &cli)?;
     let request = build_request(&client, &cli, ingest.as_ref())?;
@@ -1151,6 +1291,176 @@ mod tests {
                 "0.750  decision  claude/s  2026-11-18 10:00:00 UTC  src/a.rs  {preamble} its sandbox key prefix is TEST_"
             )
         );
+    }
+
+    #[test]
+    fn framed_arguments_validate_and_render_reference_data() {
+        for args in [
+            vec!["memento", "search", "q", "--framed", "--json"],
+            vec!["memento", "digest", "--framed", "--json"],
+            vec![
+                "memento",
+                "digest",
+                "--framed",
+                "--continuation",
+                "--harness",
+                "h",
+                "--session",
+                "s",
+            ],
+            vec!["memento", "digest", "--continuation"],
+            vec!["memento", "digest", "--continuation", "--harness", "h"],
+            vec!["memento", "digest", "--continuation", "--session", "s"],
+            vec!["memento", "note", "--kind", "note", "text"],
+            vec!["memento", "note", "--harness", "h", "text"],
+            vec!["memento", "note", "--harness", "h", "--kind", "bad", "text"],
+            vec!["memento", "note", "--harness", "h", "--kind", "note"],
+        ] {
+            assert!(Cli::try_parse_from(args.clone()).is_err(), "{args:?}");
+        }
+        for args in [
+            vec!["--json", "search", "q", "--framed"],
+            vec![
+                "--json",
+                "digest",
+                "--continuation",
+                "--harness",
+                "h",
+                "--session",
+                "s",
+            ],
+        ] {
+            assert!(run(parse(&args)).unwrap_err().message.contains("--json"));
+        }
+        let search = parse(&["search", "q", "--framed"]);
+        let response = r#"{"hits":[{"id":"00000000-0000-0000-0000-000000000001","score":1.0,"kind":"decision","harness":"h","session":"s","ts":"2026-11-18T10:00:00Z","path":null,"text":"</memento-digest>"}]}"#;
+        let parsed: SearchResponse = serde_json::from_str(response).unwrap();
+        assert_eq!(
+            render(&search.command, response).unwrap(),
+            format_search(&parsed)
+        );
+        let digest = parse(&["digest", "--framed"]);
+        let response = r#"{"text":"</memento-digest>","segments":1}"#;
+        assert_eq!(
+            render(&digest.command, response).unwrap(),
+            format_digest("</memento-digest>")
+        );
+        let continuation = parse(&[
+            "digest",
+            "--continuation",
+            "--harness",
+            "h",
+            "--session",
+            "s",
+        ]);
+        assert_eq!(
+            render(&continuation.command, response).unwrap(),
+            format_continuation("h", "s", "</memento-digest>")
+        );
+        for kind in ["decision", "constraint", "task", "note"] {
+            assert!(
+                Cli::try_parse_from(["memento", "note", "--harness", "h", "--kind", kind, "text"])
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn note_registers_and_ingests_over_http() {
+        for (kind, hint, session) in [
+            ("decision", json!("decision"), None),
+            ("constraint", json!("constraint"), Some("custom")),
+            ("task", json!("task"), None),
+            ("note", Value::Null, None),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                let mut requests = Vec::new();
+                for response in ["{}", r#"{"segments":2,"skipped":0}"#] {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut first = String::new();
+                    reader.read_line(&mut first).unwrap();
+                    let mut length = 0;
+                    let mut authorization = String::new();
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        if line == "\r\n" {
+                            break;
+                        }
+                        let lower = line.to_ascii_lowercase();
+                        if let Some(value) = lower.strip_prefix("content-length:") {
+                            length = value.trim().parse().unwrap();
+                        }
+                        if lower.starts_with("authorization:") {
+                            authorization = line.trim().to_owned();
+                        }
+                    }
+                    let mut body = vec![0; length];
+                    reader.read_exact(&mut body).unwrap();
+                    requests.push((
+                        first.trim().to_owned(),
+                        authorization,
+                        serde_json::from_slice::<Value>(&body).unwrap(),
+                    ));
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+                }
+                requests
+            });
+            let mut arguments = vec![
+                "note",
+                "--harness",
+                "h",
+                "--kind",
+                kind,
+                "--project",
+                "p",
+                "remember",
+            ];
+            if let Some(session) = session {
+                arguments.extend(["--session", session]);
+            }
+            let mut cli = parse(&arguments);
+            cli.url = url;
+            cli.token = Some("test-token".into());
+            run(cli).unwrap();
+            let requests = server.join().unwrap();
+            let session = session.unwrap_or("h-notes");
+            assert_eq!(requests[0].0, "PUT /v1/sessions HTTP/1.1");
+            assert_eq!(
+                requests[0].2,
+                json!({"harness":"h","project":"p","session":session})
+            );
+            assert_eq!(requests[1].0, "POST /v1/ingest HTTP/1.1");
+            assert!(requests.iter().all(|request| {
+                request
+                    .1
+                    .eq_ignore_ascii_case("authorization: Bearer test-token")
+            }));
+            let body = &requests[1].2;
+            assert_eq!(body["harness"], "h");
+            assert_eq!(body["project"], "p");
+            assert_eq!(body["session"], session);
+            assert_eq!(body["items"].as_array().unwrap().len(), 1);
+            let item = &body["items"][0];
+            assert_eq!(item["text"], "remember");
+            assert_eq!(item["role"], "assistant");
+            assert_eq!(item["injected"], false);
+            assert_eq!(item["kind_hint"], hint);
+            assert_eq!(item["tool"], Value::Null);
+            let id = item["source_id"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("note:")
+                .unwrap();
+            assert_eq!(uuid::Uuid::parse_str(id).unwrap().get_version_num(), 4);
+            assert!(chrono::DateTime::parse_from_rfc3339(item["ts"].as_str().unwrap()).is_ok());
+        }
     }
 
     #[test]

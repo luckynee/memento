@@ -4,5 +4,6 @@ pub mod digest;
 pub mod ids;
 pub mod lineage;
 pub mod protocol;
+pub mod reference;
 pub mod rerank;
 pub mod segment;
