@@ -4,6 +4,7 @@ import { createContinueCommand, createHandoffCommand } from "./commands";
 import { createIngestor } from "./ingest";
 import { createJevGate, type DecisionsFn } from "./jev";
 import { resolveOptions } from "./options";
+import { createResumeController } from "./resume";
 import { createSessionOwnership, normalizeDirectory } from "./session-ownership";
 import { createSubagentMemoryController } from "./subagent-memory";
 import { cloneMessage, type ConversationMessage, type SystemText } from "./switch";
@@ -108,6 +109,14 @@ export default Plugin.define({
             tailCharBudget: options.tailCharBudget,
             log,
         });
+        const resumeController = createResumeController({
+            options: options.resume,
+            storage: ctx.storage,
+            loadContext: (sessionID) => ctx.session.context({ sessionID }),
+            compact: (input) => ctx.session.compact(input),
+            now: Date.now,
+            log,
+        });
         const subagentMemory = createSubagentMemoryController({
             mode: options.subagentMemory,
             agents: options.subagentMemoryAgents,
@@ -176,6 +185,7 @@ export default Plugin.define({
                 await subagentMemory.onContext(event);
                 return;
             }
+            await resumeController.onContext(event.sessionID);
             const continuation = await ensureRegistered(event.sessionID);
             if (continuation) {
                 injectContinuation(event, continuation);
@@ -191,17 +201,27 @@ export default Plugin.define({
             }
             await switchController.onCompaction(event);
         });
+        const promptRegistration = await ctx.session.hook("prompt", async (event) => {
+            try {
+                if (options.resume && await ownsSession(event.sessionID)) {
+                    await resumeController.onPrompt(event.sessionID);
+                }
+            } catch (error) {
+                log(`Failed to process resume prompt for session ${event.sessionID}`, error);
+            }
+        });
         const controller = new AbortController();
         const releaseSession = async (sessionID: string, reason?: string, harness = options.harness) => {
             try {
                 await subagentMemory.forget(sessionID);
                 await switchController.forget(sessionID);
+                await resumeController.forget(sessionID);
                 await ingestor.forget(sessionID);
                 await client.releaseSession({ harness, project, session: sessionID, ...(reason ? { reason } : {}) });
             } catch (error) {
                 log(`Failed to release session ${sessionID}`, error);
             } finally {
-                for (const key of ["ingest", "registered", "fork", "claimed", "parent", "switch", "subagent"]) {
+                for (const key of ["ingest", "registered", "fork", "claimed", "parent", "switch", "subagent", "resume"]) {
                     try {
                         await ctx.storage.remove(`memento/${key}/${sessionID}`);
                     } catch (error) {
@@ -290,7 +310,7 @@ export default Plugin.define({
             if (reconcileTimer !== undefined) {
                 clearInterval(reconcileTimer);
             }
-            const disposals = Promise.allSettled([hookRegistration.dispose(), compactionRegistration.dispose(), toolRegistration.dispose(), commandRegistration.dispose()]);
+            const disposals = Promise.allSettled([hookRegistration.dispose(), compactionRegistration.dispose(), promptRegistration.dispose(), toolRegistration.dispose(), commandRegistration.dispose()]);
             await eventLoop;
             await reconciliation;
             await ingestor.idle();

@@ -93,6 +93,7 @@ test("context claims inject once, preserve existing continuation, and coexist wi
         const user = { id: "u", role: "user", content: [{ type: "text", text: "hello" }] };
         const first = { sessionID: "first", model: { providerID: "p", id: "new" }, system: [] as { type: string; text: string }[], messages: [user] };
         await hooks.get("context")!(first);
+        expect(values.get("memento/resume/first")).toEqual({ lastRequestAt: expect.any(Number) });
         expect(instructions.get("first")).toBe(continuation);
         expect(first.messages[0]).not.toBe(user);
         expect(user.content).toEqual([{ type: "text", text: "hello" }]);
@@ -196,9 +197,9 @@ test("step ended dispatches ingestion and cleanup stops the subscription", async
         });
         expect(subscriptionTypes).toContain("session.step.ended");
         expect(ingests).toHaveLength(1);
-        expect(hooks).toEqual(["context", "compaction"]);
+        expect(hooks).toEqual(["context", "compaction", "prompt"]);
         if (cleanup) { await cleanup(); }
-        expect(disposedHooks).toEqual(["context", "compaction"]);
+        expect(disposedHooks).toEqual(["context", "compaction", "prompt"]);
     } finally {
         globalThis.fetch = originalFetch;
     }
@@ -217,7 +218,7 @@ test("foreign sessions cannot ingest, rewrite, compact, use commands, or search"
     }) as typeof fetch;
     const registration = () => ({ async dispose() {} });
     const ctx = {
-        options: { jev: false, reconcile: false },
+        options: { jev: false, reconcile: false, resume: true },
         location: { project: { id: "p" } },
         storage: {
             async get() { throw new Error("foreign session accessed storage"); },
@@ -252,6 +253,7 @@ test("foreign sessions cannot ingest, rewrite, compact, use commands, or search"
         const compaction = { ...context };
         await hooks.get("context")!(context);
         await hooks.get("compaction")!(compaction);
+        await hooks.get("prompt")!({ sessionID: "foreign" });
         expect(context).toEqual({ sessionID: "foreign", system: [], messages: [], model: { providerID: "p", id: "m" } });
         expect(compaction).toEqual(context);
         for (const name of ["memento-continue", "memento-handoff"]) {
@@ -272,7 +274,7 @@ test("foreign sessions cannot ingest, rewrite, compact, use commands, or search"
 
 test("deletion waits for ingest, releases without ownership lookup, and clears session state", async () => {
     const values = new Map<string, unknown>();
-    const keys = ["ingest", "registered", "fork", "claimed", "parent", "switch", "subagent"];
+    const keys = ["ingest", "registered", "fork", "claimed", "parent", "switch", "subagent", "resume"];
     const hooks = new Map<string, (event: any) => Promise<void>>();
     const requests: { path: string; body: any }[] = [];
     let lookups = 0;
@@ -433,6 +435,52 @@ test("disabled plugin registers nothing", async () => {
     if (cleanup) { await cleanup(); }
 });
 
+test("resume prompt hook compacts owned primary sessions after idle time", async () => {
+    const values = new Map<string, unknown>([["memento/resume/s", { lastRequestAt: Date.now() - 120000 }]]);
+    const hooks = new Map<string, (event: any) => Promise<void>>();
+    const calls: unknown[] = [];
+    const warnings: unknown[][] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warnings.push(args); };
+    const registration = () => ({ async dispose() {} });
+    const ctx = {
+        options: { jev: false, reconcile: false, resume: { idleMinutes: 1, minContextTokens: 1 } },
+        location: { project: { id: "p" } },
+        storage: {
+            async get(key: string) { return values.get(key); },
+            async set(key: string, value: unknown) { values.set(key, value); },
+        },
+        session: {
+            async get() { return { projectID: "p" }; },
+            async context() { return [{ type: "user", text: "1234" }]; },
+            async compact(input: unknown) { calls.push(input); },
+            async hook(name: string, handler: (event: any) => Promise<void>) { hooks.set(name, handler); return registration(); },
+            instructions: { entry: { async put() {} } },
+        },
+        tool: { async transform() { return registration(); } },
+        command: { async transform() { return registration(); } },
+        event: {
+            async *subscribe(input: { signal: AbortSignal }) {
+                if (!input.signal.aborted) {
+                    await new Promise<void>((resolve) => input.signal.addEventListener("abort", () => resolve(), { once: true }));
+                }
+            },
+        },
+    } as unknown as Plugin.Context;
+    let cleanup: void | (() => void | Promise<void>) = undefined;
+    try {
+        cleanup = await plugin.setup(ctx);
+        await hooks.get("prompt")!({ sessionID: "s" });
+        await hooks.get("prompt")!({ sessionID: "s" });
+        expect(calls).toEqual([{ sessionID: "s", delivery: "steer" }]);
+        expect(values.get("memento/resume/s")).toEqual({ lastRequestAt: expect.any(Number) });
+        expect(warnings.some((args) => String(args[0]).includes("resume compaction for s"))).toBe(true);
+    } finally {
+        await cleanup?.();
+        console.warn = originalWarn;
+    }
+});
+
 test("subagents skip session processing while search uses the root and forks remain enabled", async () => {
     const values = new Map<string, unknown>();
     const requests: { path: string; body: any }[] = [];
@@ -451,7 +499,7 @@ test("subagents skip session processing while search uses the root and forks rem
     }) as typeof fetch;
     const registration = () => ({ async dispose() {} });
     const ctx = {
-        options: { jev: false, reconcile: false, subagentMemory: "off" },
+        options: { jev: false, reconcile: false, subagentMemory: "off", resume: true },
         location: { project: { id: "p" } },
         storage: {
             async get(key: string) { return values.get(key); },
@@ -491,6 +539,7 @@ test("subagents skip session processing while search uses the root and forks rem
         const compaction = { ...context };
         await hooks.get("context")!(context);
         await hooks.get("compaction")!(compaction);
+        await hooks.get("prompt")!({ sessionID: "child" });
         expect(context).toEqual({ sessionID: "child", system: [], messages: [], model: { providerID: "p", id: "m" } });
         expect(compaction).toEqual(context);
         expect(values.size).toBe(0);

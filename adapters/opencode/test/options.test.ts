@@ -31,3 +31,18 @@ test("validates adapter options and model references", () => {
     expect(parseJevModel({ providerID: "p", id: "m", variant: "v" })).toEqual({ providerID: "p", id: "m", variant: "v" });
     expect(parseJevModel("bad")).toEqual({ providerID: "opencode", id: "jev-1.13-free" });
 });
+
+test("resume options are opt-in and validate positive finite thresholds", () => {
+    expect(resolveOptions({}).resume).toBeUndefined();
+    for (const resume of [false, null, [], "true", 1]) {
+        expect(resolveOptions({ resume }).resume).toBeUndefined();
+    }
+    expect(resolveOptions({ resume: true }).resume).toEqual({ idleMinutes: 60, minContextTokens: 100000 });
+    expect(resolveOptions({ resume: {} }).resume).toEqual({ idleMinutes: 60, minContextTokens: 100000 });
+    expect(resolveOptions({ resume: { idleMinutes: 0.5, minContextTokens: 42.5 } }).resume)
+        .toEqual({ idleMinutes: 0.5, minContextTokens: 42.5 });
+    for (const value of [0, -1, Infinity, NaN, "5", null]) {
+        expect(resolveOptions({ resume: { idleMinutes: value, minContextTokens: value } }).resume)
+            .toEqual({ idleMinutes: 60, minContextTokens: 100000 });
+    }
+});

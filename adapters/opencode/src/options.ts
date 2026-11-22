@@ -7,6 +7,14 @@ function isSubagentMemoryMode(value: unknown): value is SubagentMemoryMode {
 }
 
 export function resolveOptions(raw: Record<string, unknown>) {
+    const resumeInput = raw.resume === true ? {} : raw.resume && typeof raw.resume === "object" && !Array.isArray(raw.resume)
+        ? raw.resume as Record<string, unknown> : undefined;
+    const positiveNumber = (value: unknown, fallback: number) =>
+        typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
+    const resume = resumeInput ? {
+        idleMinutes: positiveNumber(resumeInput.idleMinutes, 60),
+        minContextTokens: positiveNumber(resumeInput.minContextTokens, 100000),
+    } : undefined;
     const url = typeof raw.url === "string" && raw.url.trim()
         ? raw.url
         : typeof process.env.MEMENTO_URL === "string" && process.env.MEMENTO_URL.trim()
@@ -35,6 +43,7 @@ export function resolveOptions(raw: Record<string, unknown>) {
         tailCharBudget,
         digestBudget,
         compaction: raw.compaction === "memento" ? "memento" as const : "native" as const,
+        resume,
         subagentMemory: isSubagentMemoryMode(raw.subagentMemory) ? raw.subagentMemory : "digest" as const,
         subagentMemoryAgents,
         subagentDigestBudget,
