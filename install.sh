@@ -18,7 +18,7 @@ Darwin:arm64 | Darwin:aarch64) target=aarch64-apple-darwin ;;
 esac
 
 mkdir -p "$install_dir"
-install_dir=$(CDPATH= cd -- "$install_dir" && pwd -P)
+install_dir=$(CDPATH='' cd -- "$install_dir" && pwd -P)
 temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/memento-install.XXXXXX")
 trap 'rm -rf "$temp_dir"' 0
 trap 'exit 1' HUP INT TERM
@@ -84,7 +84,7 @@ esac
 case ":${PATH:-}:" in
 *":$install_dir:"*) ;;
 *)
-	printf 'Add this line to your shell profile:\nexport PATH="%s:$PATH"\n' "$install_dir"
+	printf "Add this line to your shell profile:\nexport PATH=\"%s:\$PATH\"\n" "$install_dir"
 	;;
 esac
 
