@@ -1,31 +1,86 @@
 # memento-pool
 
-Session-continuation memory for coding-agent harnesses. When you switch models mid-session, the new model gets a small frozen digest of the session, a bounded verbatim tail, and a `memory_search` tool over a filtered, segmented copy of the session, instead of the full transcript.
+Long coding sessions can replay a huge transcript when you switch models, while starting a new session can leave useful context behind. Provider prompt caches are per model, so switching can also mean an expensive uncached prefill.
 
-- `mementod`: Rust daemon (axum) storing segments in Qdrant with hybrid search (fastembed BGE-small dense + Qdrant server-side BM25, RRF, recency rerank).
-- `memento`: Rust CLI for the daemon.
-- `adapters/opencode`: OpenCode V2 plugin (ingest, model-switch rewrite, `memory_search`, `/memento-continue`).
-- `adapters/claude-code`, `adapters/codex`, `adapters/agy`: native plugins bundling lifecycle hooks (Claude Code, agy), the `memento-mcp` server, and skills; see each adapter's README.
+memento-pool gives coding agents a compact working-state digest, a bounded recent verbatim tail, and `memory_search` over a filtered copy of the session. It works across OpenCode, Claude Code, Codex, and agy.
 
-Design and verified contracts: [docs/DESIGN.md](docs/DESIGN.md). Code map: [docs/MAP.md](docs/MAP.md).
+## How it works
 
-## Quick start
+1. A harness adapter ingests session activity and filters it into searchable segments.
+2. `mementod` stores segments in Qdrant. Hybrid search combines fastembed BGE-small dense vectors and Qdrant BM25 using RRF, then reranks for recency.
+3. The adapter supplies a digest and recent context when continuing work; the agent can search memory for details it needs.
+
+The main components are:
+
+- `mementod`: the Rust daemon and Qdrant-backed memory service.
+- `memento`: the Rust CLI for setup, maintenance, and memory operations.
+- `memento-mcp`: an optional MCP server exposing memory tools.
+- Adapters: the OpenCode V2 plugin and native Claude Code, Codex, and agy integrations.
+
+## Requirements
+
+- Docker with Compose for the managed daemon.
+- A published GitHub release for the installer.
+- A supported CLI target: x86_64 or aarch64 Linux (musl), or x86_64 or aarch64 macOS.
+
+## Install
 
 ```sh
 curl -fsSL https://github.com/luckynee/memento/releases/latest/download/install.sh | sh
 ```
 
-The installer downloads `memento` and `memento-mcp`, verifies the SHA-256 checksum, and runs `memento setup` when a terminal is available. Setup guides harness configuration and can start the managed daemon. Docker with Compose is required for the daemon. The installer requires a published GitHub release.
+The installer downloads `memento` and `memento-mcp`, verifies their archive's SHA-256 checksum, and runs `memento setup` when a terminal is available.
 
-Override install settings with `MEMENTO_VERSION` (for example `0.2.0` or `v0.2.0`), `MEMENTO_INSTALL_DIR` (default `~/.local/bin`), or `MEMENTO_NO_SETUP=1`.
+Set `MEMENTO_VERSION` to select a release (for example `0.2.0` or `v0.2.0`), `MEMENTO_INSTALL_DIR` to change the binary directory (default `~/.local/bin`), or `MEMENTO_NO_SETUP=1` to skip setup.
 
-### Install and update
+## Setup
 
-Run `memento setup` to configure detected harnesses, install embedded skills and the embedded OpenCode plugin, and optionally start the managed daemon. The wizard previews changes before confirmation. `memento setup --start-daemon` starts the managed daemon without prompting; for non-interactive setup, also specify `--yes --harness ... --scope ...`.
+Run `memento setup` to detect harnesses, install embedded skills and the OpenCode plugin, and optionally start the managed daemon. The wizard defaults to **This project**; choose **User-wide** to configure your user instead. It previews changes and asks for confirmation.
 
-Run `memento remove` to preview and remove saved harness integrations. It preserves memory data and binaries; `memento remove --purge` additionally destroys the managed daemon's Qdrant data and embedded plugin after confirmation.
+For non-interactive setup, specify `--yes`, `--harness`, and `--scope`; add `--start-daemon` to request starting the managed daemon:
 
-Alternatively, configure harnesses manually with `memento install-hooks <harness>` and `memento install-skills`, then add the installed OpenCode plugin at `${XDG_DATA_HOME:-~/.local/share}/memento/opencode-plugin/` to `opencode.jsonc` (see [Other harnesses](#other-harnesses) and [adapters/opencode/README.md](adapters/opencode/README.md)). Your own tooling can use the generic hook, `memento import`/`memento ingest`, MCP, or the daemon HTTP API ([docs/DESIGN.md](docs/DESIGN.md)).
+```sh
+memento setup --yes --harness opencode --scope project --start-daemon
+```
+
+For OpenCode, setup also accepts:
+
+- `--resume on|off`: enable or disable resume compaction. By default, it triggers after more than 60 minutes idle when context is at least approximately 100,000 tokens, keeping the first post-idle request smaller.
+- `--compaction memento|native`: choose memento's digest-based same-model compaction to avoid a model summarisation request, or use native compaction.
+
+`memento doctor` reports the installed per-harness settings.
+
+## Everyday use
+
+- Keep working: configured adapters ingest session activity automatically.
+- Switch models in an OpenCode session: the adapter supplies a per-model snapshot instead of replaying the full transcript.
+- Continue an old session in OpenCode with `/memento-continue <harness>/<session>`; a bare session ID means OpenCode.
+- Hand off to the next session with `/memento-handoff [harness]` in OpenCode, or `memento continue --from <harness>/<session> [--to <harness>]` in a shell. The next session in the project claims it on its first event or `SessionStart` hook.
+- Inspect memory from the project directory with `memento search "topic"`, `memento stats`, `memento digest`, or `memento sessions lineage --harness <h> --session <ses>`.
+
+The project key is the main checkout path, shared across harnesses and linked worktrees. Run `memento project-key` to see it.
+
+## Harness support
+
+| Harness | Writes memory | Reads memory | Setup |
+| --- | --- | --- | --- |
+| OpenCode | Plugin step/turn events | Switch digest, `memory_search`, continuation claim | `memento setup`, or add the plugin entry to `opencode.jsonc` ([snippet](adapters/opencode/README.md)) |
+| Claude Code | `Stop` hook starts detached transcript import | `SessionStart` injects a claimed continuation | `memento install-hooks claude-code --project DIR` (or `--user`) |
+| Codex | `Stop` hook starts detached rollout import | `SessionStart` injects a claim and re-injects after compaction | `memento install-hooks codex --project DIR` (or `--user`); trust the project with `codex --trust` or `/hooks` |
+| agy | `Stop` hook imports the transcript | `SessionStart` injects a claimed continuation | `memento install-hooks agy --project DIR` (or `--user`) |
+| Generic | `turn_end` imports a supported transcript or neutral items | `session_start` returns claimed context for injection | Wire JSON events to `memento hook generic --harness NAME`; see the [contract](docs/DESIGN.md#generic-hook-contract) |
+
+Native plugins provide memory tools such as `memory_search` and `memory_note`: [Claude Code](adapters/claude-code/README.md) uses hooks and native Mod tools without MCP; [agy](adapters/agy/README.md) uses hooks and MCP; [Codex](adapters/codex/README.md) uses MCP. Use either the native plugin hooks or `install-hooks` for a harness, not both. Codex 0.170 does not run plugin hooks, so its plugin still needs `memento install-hooks codex`.
+
+OpenCode and Codex give subagents parent memory by default. Claude Code is opt-in with `memento install-hooks claude-code --subagent-memory digest`; disable Codex's default with `--subagent-memory off` or set OpenCode's `subagentMemory` to `"off"`. Both OpenCode and Codex also support `"filtered"`; agy does not support subagent memory.
+
+For manual setup, use `memento install-hooks <harness>` and `memento install-skills`, then register the OpenCode plugin at `${XDG_DATA_HOME:-~/.local/share}/memento/opencode-plugin/` in `opencode.jsonc`. Other tooling can use `memento import claude-code|codex|agy --transcript PATH` (incremental cursor), `memento ingest`, `memento search`, `memento digest`, the generic hook, MCP, or the [daemon HTTP API](docs/DESIGN.md#daemon-http-api-mementod-json). MCP is optional for agy and other MCP-capable harnesses:
+
+```sh
+agy mcp add memento -- /path/to/memento-mcp --harness agy
+```
+
+## Maintenance
 
 ```sh
 memento update
@@ -33,9 +88,52 @@ memento doctor
 memento daemon up|down|status|logs [-f]|pull
 ```
 
-`memento update --check` checks for an available update, `--version <x.y.z>` selects a release, and `--refresh` reapplies saved setup without replacing binaries. Updates replace binaries only for installer-managed installs; Cargo installs should use `cargo install --path crates/memento-cli` or the installer. A managed daemon is pulled and restarted during refresh. `memento doctor --offline` skips the latest-release check.
+- `memento update --check` checks for an update; `--version <x.y.z>` selects a release; `--refresh` reapplies saved setup without replacing binaries. Refresh also pulls and restarts a managed daemon.
+- Binary replacement is for installer-managed installs. For Cargo installs, use `cargo install --path crates/memento-cli` or the installer.
+- `memento doctor --offline` skips the latest-release check.
+- `memento daemon` manages the daemon through Docker Compose; `logs -f` follows its logs.
 
-### From source
+## Removing memento
+
+`memento remove` previews removal and lets you choose harness integrations from a checklist, or select them with `--harness`. Use `--dry-run` to preview without changes. Normal removal keeps memory data, binaries, and shared assets that other integrations may need.
+
+`memento remove --purge` additionally destroys the managed daemon's Qdrant data, Compose project and files, and embedded plugin. It requires a saved managed daemon and typing `purge` in a terminal; non-interactive purge requires `--yes`.
+
+## Cleaning up memory
+
+Preview deleted-session cleanup with `memento gc --project DIR --dry-run`, then run `memento gc --project DIR`. Hooks also start gc at most daily per project; `MEMENTO_AUTO_GC=0` disables that automatic gc. The daemon separately sweeps stale sessions by default. Deleted sessions can remain available to dependent continuations until collected.
+
+Explicit forgetting is destructive. Use `--dry-run` to see the segment count and affected sessions first. The CLI asks for confirmation unless `--yes` is supplied:
+
+- `memento forget --harness H --project PROJECT --session S`: forget one session.
+- Replace `--session S` with `--lineage S` to forget S and its descendants.
+- Replace it with `--whole-project` to forget all harnesses in the project.
+
+## Skills
+
+Preview and install the embedded skills with:
+
+```sh
+memento install-skills --harness all --project DIR --dry-run
+memento install-skills --harness all --project DIR
+```
+
+Use `--user` instead of `--project DIR` for user-wide installation, or `--source DIR` to override the embedded skills. The installer skips foreign skills.
+
+| Harness | Project location | User location |
+| --- | --- | --- |
+| OpenCode | `.opencode/skills` | `~/.config/opencode/skills` |
+| Claude Code | `.claude/skills` | `~/.claude/skills` |
+| Codex | `.agents/skills` | `~/.agents/skills` |
+| agy | `.agents/skills` | `~/.gemini/config/skills` |
+
+## Jev
+
+The OpenCode adapter uses the free `opencode/jev-1.13-free` through `ctx.experimental.generate.decisions` to classify assistant notes and filter search hits. The paid `opencode/jev-1.13` uses OpenCode Models credits and returns HTTP 402 without balance. On failure, the adapter falls back to unclassified notes and score ordering, and pauses Jev for `jevCooldownMs`. Set `jev: false` to disable it.
+
+## Development
+
+Build from a checkout:
 
 ```sh
 docker compose -f deploy/compose.yaml -p memento up -d --build
@@ -43,57 +141,9 @@ cargo install --path crates/memento-cli
 cd adapters/opencode && bun install
 ```
 
-Run `memento setup` from the checkout. Development checkouts can pass `--opencode-plugin /path/to/memento-pool/adapters/opencode` and `--skills-source /path/to/memento-pool/skills`; the equivalent environment overrides are `MEMENTO_OPENCODE_PLUGIN` and `MEMENTO_SKILLS_DIR`. JSONC files containing comments or trailing commas are left unchanged; setup prints the plugin snippet for manual insertion.
+Run `memento setup` from the checkout. Override embedded development assets with `--opencode-plugin /path/to/memento-pool/adapters/opencode` and `--skills-source /path/to/memento-pool/skills`, or with `MEMENTO_OPENCODE_PLUGIN` and `MEMENTO_SKILLS_DIR`. Setup preserves supported JSONC comments and trailing commas; if it cannot safely parse a config, it leaves the file unchanged and prints a plugin snippet for manual insertion.
 
-## Daily use
-
-- Keep working; every finished step is ingested.
-- Switch models in the same session; the adapter serves the new model from a per-model snapshot.
-- New session continuing an old one: `/memento-continue <harness>/<session>` (bare id = opencode).
-- Hand off to the next session in this project, any harness: `/memento-handoff [harness]` in OpenCode, or `memento continue --from <harness>/<session> [--to <harness>]` from a shell. The next session started in the project claims it on its first event or `SessionStart` hook.
-- Inspect from the project directory: `memento search "topic"`, `memento stats`, `memento digest`, `memento sessions lineage --harness <h> --session <ses>`.
-- Done: see [Cleanup](#cleanup) before forgetting or collecting memory.
-
-The project key is the main checkout path (`memento project-key`), identical across harnesses.
-
-## Other harnesses
-
-| Harness | Writes memory | Reads memory | Setup |
-| --- | --- | --- | --- |
-| OpenCode | plugin (step/turn events) | digest after model switch, `memory_search`, continuation claim | `memento setup`, or add the plugin entry to `opencode.jsonc` ([snippet](adapters/opencode/README.md)) |
-| Claude Code | `Stop` hook starts a detached transcript import | `SessionStart` hook injects a claimed continuation | `memento install-hooks claude-code --project DIR` (or `--user`) |
-| Codex | `Stop` hook starts a detached rollout import | `SessionStart` hook (also re-injects after compaction) | `memento install-hooks codex --project DIR` (or `--user`); trust the project (`codex --trust` or `/hooks`) |
-| agy | `Stop` hook imports the transcript | `SessionStart` hook injects a claimed continuation | `memento install-hooks agy --project DIR` (or `--user`) |
-| Generic | `turn_end` imports a supported transcript or neutral items | `session_start` returns claimed context for the harness to inject | Wire JSON lifecycle events to `memento hook generic --harness NAME`; see [contract](docs/DESIGN.md#generic-hook-contract) |
-
-Native plugins are an alternative to `install-hooks` that also provide memory tools (`memory_search`, `memory_note`, ...): [Claude Code](adapters/claude-code/README.md) (hooks + native Mod tools, no MCP), [agy](adapters/agy/README.md) (hooks + MCP), and [Codex](adapters/codex/README.md) (MCP only; Codex 0.170 does not run plugin hooks, so keep `memento install-hooks codex`). Use either a plugin or `install-hooks` per harness, not both.
-
-Any harness can use the CLI directly: `memento import claude-code|codex|agy --transcript PATH` (incremental cursor), `memento search`, `memento digest`. MCP is optional for agy and other MCP-capable harnesses; for agy, configure `agy mcp add memento -- /path/to/memento-mcp --harness agy`.
-
-OpenCode and Codex provide parent memory to subagents by default; Claude Code is opt-in with `memento install-hooks claude-code --subagent-memory digest`. Use `--subagent-memory off` when installing Codex hooks to disable it, or set the OpenCode `subagentMemory` option to `"off"`. Both also support `"filtered"`; agy does not support subagent memory.
-
-### Cleanup
-
-Preview deleted-session cleanup with `memento gc --project DIR --dry-run`, then run `memento gc --project DIR` when appropriate. Hooks also start gc at most daily per project; `MEMENTO_AUTO_GC=0` disables this. The daemon sweeps stale sessions by default. Deleted sessions can remain available to dependent continuations until collected.
-
-Explicit forgetting is destructive. Preview it with `--dry-run` (reports the segment count and affected sessions without deleting), then confirm the scope before `memento forget --harness H --project PROJECT --session S`, `--lineage S` (S and its descendants), or `--whole-project` (all harnesses). The CLI asks for confirmation unless `--yes` is supplied.
-
-### Skills
-
-Preview or install the embedded skills; `--source` is optional:
-
-```sh
-memento install-skills --harness all --project DIR --dry-run
-memento install-skills --harness all --project DIR
-```
-
-Use `--user` instead of `--project DIR` for user-wide installation. The installer skips foreign skills. Project locations are `.opencode/skills`, `.claude/skills`, and `.agents/skills` (shared by Codex and agy); user locations are `~/.config/opencode/skills`, `~/.claude/skills`, `~/.agents/skills`, and `~/.gemini/config/skills`, respectively.
-
-## Jev
-
-The adapter uses `opencode/jev-1.13-free` (free tier, cost 0) through `ctx.experimental.generate.decisions` to classify assistant notes and filter search hits. The paid `opencode/jev-1.13` bills OpenCode Models credits and returns HTTP 402 without balance. On any Jev failure the adapter falls back to score ordering and unclassified notes, and pauses Jev for `jevCooldownMs`. Disable it with `jev: false`.
-
-## Development
+Checks:
 
 ```sh
 cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings && cargo test
@@ -103,4 +153,19 @@ cd adapters/opencode && bun test && bunx tsc --noEmit
 
 ### Releasing
 
-Bump the workspace version in the root `Cargo.toml`, tag it `vX.Y.Z`, and push the tag to trigger the release workflow.
+1. Bump `[workspace.package] version` in the root `Cargo.toml` and run `cargo update -w`.
+2. Bump `version` in `adapters/agy/plugin.json`, `adapters/codex/plugin.json`, and `adapters/claude-code/.claude-plugin/plugin.json`.
+3. Commit as `chore: release vX.Y.Z`, tag `vX.Y.Z`, and push main and the tag.
+
+`.github/workflows/release.yml` publishes release tarballs, `install.sh`, and the multi-architecture GHCR daemon image.
+
+## Documentation
+
+- [Design and verified contracts](docs/DESIGN.md)
+- [Code map](docs/MAP.md)
+- Adapter guides: [OpenCode](adapters/opencode/README.md), [Claude Code](adapters/claude-code/README.md), [Codex](adapters/codex/README.md), [agy](adapters/agy/README.md)
+- [Deployment guide](deploy/README.md)
+
+## License
+
+MIT, see [LICENSE](LICENSE).
