@@ -1,5 +1,6 @@
 {
     "name": "@memento-pool/opencode",
+    "license": "MIT",
     "private": true,
     "type": "module",
     "exports": {
