@@ -2577,7 +2577,11 @@ fn handle_hook(
     }
 }
 
-fn memento_hook_command(command: &str, harness: Harness) -> bool {
+pub(super) fn memento_hook_command(command: &str, harness: Harness) -> bool {
+    memento_hook_words(command, harness).is_some()
+}
+
+pub(super) fn memento_hook_words(command: &str, harness: Harness) -> Option<Vec<String>> {
     let bytes = command.as_bytes();
     let mut words = Vec::new();
     let mut word = String::new();
@@ -2593,13 +2597,13 @@ fn memento_hook_command(command: &str, harness: Harness) -> bool {
             Some(b'"') if byte == b'\\' => {
                 index += 1;
                 if index == bytes.len() {
-                    return false;
+                    return None;
                 }
                 word.push(bytes[index] as char);
             }
             Some(b'"') => {
                 if matches!(byte, b'$' | b'`') {
-                    return false;
+                    return None;
                 }
                 word.push(byte as char);
             }
@@ -2616,7 +2620,7 @@ fn memento_hook_command(command: &str, harness: Harness) -> bool {
             None if byte == b'\\' => {
                 index += 1;
                 if index == bytes.len() {
-                    return false;
+                    return None;
                 }
                 word.push(bytes[index] as char);
                 started = true;
@@ -2626,7 +2630,7 @@ fn memento_hook_command(command: &str, harness: Harness) -> bool {
                 b'|' | b'&' | b';' | b'<' | b'>' | b'(' | b')' | b'$' | b'`'
             ) =>
             {
-                return false;
+                return None;
             }
             None => {
                 word.push(byte as char);
@@ -2637,17 +2641,18 @@ fn memento_hook_command(command: &str, harness: Harness) -> bool {
         index += 1;
     }
     if quote.is_some() {
-        return false;
+        return None;
     }
     if started {
         words.push(word);
     }
-    words.len() >= 3
+    (words.len() >= 3
         && Path::new(&words[0])
             .file_name()
             .is_some_and(|name| name == "memento")
         && words[1] == "hook"
-        && words[2] == harness.name()
+        && words[2] == harness.name())
+    .then_some(words)
 }
 
 fn merge_hooks(

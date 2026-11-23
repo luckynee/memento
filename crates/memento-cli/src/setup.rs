@@ -22,6 +22,18 @@ enum Scope {
     User,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Toggle {
+    On,
+    Off,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Compaction {
+    Memento,
+    Native,
+}
+
 #[derive(Debug, Args)]
 pub struct SetupArgs {
     #[arg(
@@ -40,6 +52,10 @@ pub struct SetupArgs {
         help = "Comma-separated harness=on|off settings"
     )]
     subagent_memory: Vec<String>,
+    #[arg(long, value_enum, help = "OpenCode resume compaction")]
+    resume: Option<Toggle>,
+    #[arg(long, value_enum, help = "OpenCode compaction mode")]
+    compaction: Option<Compaction>,
     #[arg(long, conflicts_with = "no_skills", help = "Install bundled skills")]
     skills: bool,
     #[arg(long, conflicts_with = "skills", help = "Skip skills installation")]
@@ -56,6 +72,8 @@ pub struct SetupArgs {
     dry_run: bool,
 }
 
+type SettingsReporter = fn(&Path, Option<Harness>, Option<&Path>) -> Result<Vec<String>, String>;
+
 struct HarnessEntry {
     id: &'static str,
     display: &'static str,
@@ -70,6 +88,7 @@ struct HarnessEntry {
     user_skills: &'static str,
     plan: fn(&HarnessEntry, &Context, bool) -> Result<Change, CliError>,
     apply: fn(&HarnessEntry, &Context, bool) -> Result<(), CliError>,
+    settings: SettingsReporter,
 }
 
 const SCOPES: &[Scope] = &[Scope::Project, Scope::User];
@@ -88,6 +107,7 @@ const REGISTRY: &[HarnessEntry] = &[
         user_skills: ".config/opencode/skills",
         plan: plan_opencode,
         apply: apply_opencode,
+        settings: crate::doctor::opencode_settings,
     },
     HarnessEntry {
         id: "claude-code",
@@ -103,6 +123,7 @@ const REGISTRY: &[HarnessEntry] = &[
         user_skills: ".claude/skills",
         plan: plan_hook,
         apply: apply_hook,
+        settings: crate::doctor::hook_settings,
     },
     HarnessEntry {
         id: "codex",
@@ -118,6 +139,7 @@ const REGISTRY: &[HarnessEntry] = &[
         user_skills: ".agents/skills",
         plan: plan_hook,
         apply: apply_hook,
+        settings: crate::doctor::hook_settings,
     },
     HarnessEntry {
         id: "agy",
@@ -133,6 +155,7 @@ const REGISTRY: &[HarnessEntry] = &[
         user_skills: ".gemini/config/skills",
         plan: plan_hook,
         apply: apply_hook,
+        settings: crate::doctor::hook_settings,
     },
 ];
 
@@ -147,6 +170,8 @@ struct Context {
     install_skills: bool,
     embedded_plugin: bool,
     url: String,
+    resume: Option<Toggle>,
+    compaction: Option<Compaction>,
 }
 
 struct Change {
@@ -194,6 +219,31 @@ fn config_path(entry: &HarnessEntry, context: &Context) -> PathBuf {
     } else {
         entry.project_config
     })
+}
+
+pub(super) fn settings_for_harness(
+    id: &str,
+    user: bool,
+    project: &Path,
+    home: &Path,
+    xdg: &Path,
+    plugin: Option<&Path>,
+) -> Result<Vec<String>, String> {
+    let entry = REGISTRY
+        .iter()
+        .find(|entry| entry.id == id)
+        .ok_or_else(|| format!("unknown harness: {id}"))?;
+    let path = if id == "opencode" {
+        opencode_config_path(user, project, xdg)
+    } else {
+        let base = if user { home } else { project };
+        base.join(if user {
+            entry.user_config
+        } else {
+            entry.project_config
+        })
+    };
+    (entry.settings)(&path, entry.hook, plugin)
 }
 
 pub(super) fn opencode_config_path(user: bool, project: &Path, xdg: &Path) -> PathBuf {
@@ -371,18 +421,60 @@ fn opencode_merge(path: &Path, context: &Context, memory: bool) -> Result<String
                 object.append(name, value.into());
             }
         }
+        if let Some(resume) = context.resume {
+            match resume {
+                Toggle::On => {
+                    let is_object = options
+                        .to_serde_value()
+                        .and_then(|value| value.get("resume").cloned())
+                        .is_some_and(|value| value.is_object());
+                    if !is_object {
+                        if let Some(property) = options.get("resume") {
+                            property.set_value(true.into());
+                        } else {
+                            options.append("resume", true.into());
+                        }
+                    }
+                }
+                Toggle::Off => {
+                    if let Some(property) = options.get("resume") {
+                        property.remove();
+                    }
+                }
+            }
+        }
+        if let Some(compaction) = context.compaction {
+            match compaction {
+                Compaction::Memento => {
+                    if let Some(property) = options.get("compaction") {
+                        property.set_value("memento".into());
+                    } else {
+                        options.append("compaction", "memento".into());
+                    }
+                }
+                Compaction::Native => {
+                    if let Some(property) = options.get("compaction") {
+                        property.remove();
+                    }
+                }
+            }
+        }
     } else {
         let subagent_memory = if memory { "digest" } else { "off" };
         let url = context.url.as_str();
+        let mut options = vec![
+            ("url".into(), url.into()),
+            ("subagentMemory".into(), subagent_memory.into()),
+        ];
+        if context.resume == Some(Toggle::On) {
+            options.push(("resume".into(), true.into()));
+        }
+        if context.compaction == Some(Compaction::Memento) {
+            options.push(("compaction".into(), "memento".into()));
+        }
         plugins.append(CstInputValue::Object(vec![
             ("package".into(), planned_package.into()),
-            (
-                "options".into(),
-                CstInputValue::Object(vec![
-                    ("url".into(), url.into()),
-                    ("subagentMemory".into(), subagent_memory.into()),
-                ]),
-            ),
+            ("options".into(), CstInputValue::Object(options)),
         ]));
     }
     Ok(root.to_string())
@@ -616,6 +708,12 @@ pub fn run(cli: &Cli, args: &SetupArgs) -> Result<(), CliError> {
     if selected.is_empty() {
         return Err(CliError::other("select at least one harness"));
     }
+    let has_opencode = selected.iter().any(|entry| entry.id == "opencode");
+    if !has_opencode && (args.resume.is_some() || args.compaction.is_some()) {
+        return Err(CliError::other(
+            "--resume and --compaction require the opencode harness",
+        ));
+    }
     for id in overrides.keys() {
         if !selected.iter().any(|entry| entry.id == id) {
             return Err(CliError::other(format!(
@@ -729,7 +827,7 @@ pub fn run(cli: &Cli, args: &SetupArgs) -> Result<(), CliError> {
     } else {
         None
     };
-    let context = Context {
+    let mut context = Context {
         scope,
         project,
         home,
@@ -740,11 +838,72 @@ pub fn run(cli: &Cli, args: &SetupArgs) -> Result<(), CliError> {
         install_skills,
         embedded_plugin,
         url: cli.url.clone(),
+        resume: args.resume,
+        compaction: args.compaction,
     };
+    if has_opencode && interactive && (context.resume.is_none() || context.compaction.is_none()) {
+        let path = opencode_config_path(scope == Scope::User, &context.project, &context.xdg);
+        let current = if path.exists() {
+            let planned = opencode_merge(&path, &context, true)?;
+            crate::doctor::opencode_options_from_text(&planned, &path, context.plugin.as_deref())
+                .map_err(|error| {
+                    CliError::other(format!("cannot read OpenCode settings: {error}"))
+                })?
+        } else {
+            Value::Null
+        };
+        let resolved = crate::doctor::resolve_opencode_options(&current);
+        if context.resume.is_none() {
+            context.resume = Some(
+                if Confirm::new()
+                    .with_prompt("Compact long OpenCode sessions after 60 min idle (resume)?")
+                    .default(resolved.resume.is_some())
+                    .interact()
+                    .map_err(prompt_error)?
+                {
+                    Toggle::On
+                } else {
+                    Toggle::Off
+                },
+            );
+        }
+        if context.compaction.is_none() {
+            context.compaction = Some(
+                if Confirm::new()
+                    .with_prompt("Use memento digest for OpenCode compaction (no model summary)?")
+                    .default(resolved.compaction == "memento")
+                    .interact()
+                    .map_err(prompt_error)?
+                {
+                    Compaction::Memento
+                } else {
+                    Compaction::Native
+                },
+            );
+        }
+    }
     println!("Planned changes:");
     for entry in &selected {
         let memory = modes.get(entry.id).copied().unwrap_or(false);
         println!("  {}: {}", entry.display, memory_summary(entry, memory));
+        if entry.id == "opencode" {
+            let path = config_path(entry, &context);
+            let output = opencode_merge(&path, &context, memory)?;
+            let options = crate::doctor::opencode_options_from_text(
+                &output,
+                &path,
+                context.plugin.as_deref(),
+            )
+            .map_err(|error| {
+                CliError::other(format!("cannot preview OpenCode options: {error}"))
+            })?;
+            let settings = crate::doctor::resolve_opencode_options(&options);
+            println!(
+                "  OpenCode: resume={} compaction={}",
+                settings.resume_summary(),
+                settings.compaction
+            );
+        }
         let change = (entry.plan)(entry, &context, memory)?;
         println!(
             "  {}: {} - {}",
@@ -816,6 +975,16 @@ pub fn run(cli: &Cli, args: &SetupArgs) -> Result<(), CliError> {
         }
         println!("{}: setup complete", entry.display);
     }
+    let opencode_options = if has_opencode {
+        let path = opencode_config_path(scope == Scope::User, &context.project, &context.xdg);
+        let options = crate::doctor::read_opencode_options(&path, context.plugin.as_deref())
+            .map_err(|error| {
+                CliError::other(format!("cannot read resulting OpenCode options: {error}"))
+            })?;
+        Some(crate::doctor::resolve_opencode_options(&options))
+    } else {
+        None
+    };
     let setup_receipt = json!({
         "harnesses": selected.iter().map(|entry| entry.id).collect::<Vec<_>>(),
         "scope": if scope == Scope::Project { "project" } else { "user" },
@@ -825,6 +994,8 @@ pub fn run(cli: &Cli, args: &SetupArgs) -> Result<(), CliError> {
             None
         },
         "subagent_memory": modes,
+        "opencode_resume": opencode_options.as_ref().map(|options| options.resume.is_some()),
+        "opencode_compaction": opencode_options.as_ref().map(|options| options.compaction),
         "skills": install_skills,
         "managed_daemon": managed_daemon,
         "opencode_plugin": if context.embedded_plugin {
@@ -882,6 +1053,7 @@ pub(super) fn reapply_saved_setup(cli: &Cli) -> Result<(), CliError> {
         .get("opencode_plugin")
         .and_then(Value::as_str)
         .map(PathBuf::from);
+    let (resume, compaction) = saved_opencode_options(&Value::Object(setup.clone()));
     let args = SetupArgs {
         harness: harnesses,
         scope: Some(scope),
@@ -890,6 +1062,8 @@ pub(super) fn reapply_saved_setup(cli: &Cli) -> Result<(), CliError> {
             .and_then(Value::as_str)
             .map(PathBuf::from),
         subagent_memory,
+        resume,
+        compaction,
         skills,
         no_skills: !skills,
         skills_source: None,
@@ -899,6 +1073,19 @@ pub(super) fn reapply_saved_setup(cli: &Cli) -> Result<(), CliError> {
         dry_run: false,
     };
     run(cli, &args)
+}
+
+fn saved_opencode_options(setup: &Value) -> (Option<Toggle>, Option<Compaction>) {
+    let resume = setup
+        .get("opencode_resume")
+        .and_then(Value::as_bool)
+        .map(|enabled| if enabled { Toggle::On } else { Toggle::Off });
+    let compaction = match setup.get("opencode_compaction").and_then(Value::as_str) {
+        Some("memento") => Some(Compaction::Memento),
+        Some("native") => Some(Compaction::Native),
+        _ => None,
+    };
+    (resume, compaction)
 }
 
 #[cfg(test)]
@@ -918,6 +1105,8 @@ mod tests {
             install_skills: true,
             embedded_plugin: false,
             url: "http://127.0.0.1:7377".into(),
+            resume: None,
+            compaction: None,
         }
     }
 
@@ -1029,6 +1218,62 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn opencode_resume_and_compaction_merge_and_saved_options() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut context = context(temp.path());
+        fs::create_dir_all(&context.project).unwrap();
+        let path = context.project.join("opencode.jsonc");
+        fs::write(&path, r#"{"plugins":[{"package":"/old/adapters/opencode","options":{"resume":{"idleMinutes":12},"compaction":"memento","other":42}}]}"#).unwrap();
+        let preserved: Value =
+            serde_json::from_str(&opencode_merge(&path, &context, true).unwrap()).unwrap();
+        assert_eq!(
+            preserved["plugins"][0]["options"]["resume"]["idleMinutes"],
+            12
+        );
+        assert_eq!(preserved["plugins"][0]["options"]["compaction"], "memento");
+        context.resume = Some(Toggle::On);
+        context.compaction = Some(Compaction::Memento);
+        let enabled: Value =
+            serde_json::from_str(&opencode_merge(&path, &context, true).unwrap()).unwrap();
+        assert_eq!(
+            enabled["plugins"][0]["options"]["resume"]["idleMinutes"],
+            12
+        );
+        fs::write(&path, enabled.to_string()).unwrap();
+        context.resume = Some(Toggle::Off);
+        context.compaction = Some(Compaction::Native);
+        let disabled: Value =
+            serde_json::from_str(&opencode_merge(&path, &context, true).unwrap()).unwrap();
+        assert!(disabled["plugins"][0]["options"].get("resume").is_none());
+        assert!(
+            disabled["plugins"][0]["options"]
+                .get("compaction")
+                .is_none()
+        );
+        assert_eq!(disabled["plugins"][0]["options"]["other"], 42);
+        fs::write(&path, disabled.to_string()).unwrap();
+        context.resume = Some(Toggle::On);
+        context.compaction = Some(Compaction::Memento);
+        let enabled: Value =
+            serde_json::from_str(&opencode_merge(&path, &context, true).unwrap()).unwrap();
+        assert_eq!(enabled["plugins"][0]["options"]["resume"], true);
+        assert_eq!(enabled["plugins"][0]["options"]["compaction"], "memento");
+        assert_eq!(
+            saved_opencode_options(
+                &json!({"opencode_resume":true,"opencode_compaction":"memento"})
+            ),
+            (Some(Toggle::On), Some(Compaction::Memento))
+        );
+        assert_eq!(saved_opencode_options(&json!({})), (None, None));
+        assert_eq!(
+            saved_opencode_options(
+                &json!({"opencode_resume":false,"opencode_compaction":"native"})
+            ),
+            (Some(Toggle::Off), Some(Compaction::Native))
         );
     }
 
