@@ -1,5 +1,5 @@
 import type { MementoClient } from "./client";
-import { buildDigestText, cloneMessage, partSize, renderRecentTail, rewriteForSwitch, sameModel, type ConversationMessage, type ModelRef, type SwitchSnapshot, type SwitchState, type SystemText } from "./switch";
+import { buildDigestText, cloneMessage, partSize, renderCurrentTurn, renderRecentTail, rewriteForSwitch, sameModel, type ConversationMessage, type ModelRef, type SwitchSnapshot, type SwitchState, type SystemText } from "./switch";
 
 const SNAPSHOT_CACHE_TTL_MS = 300000;
 
@@ -135,7 +135,8 @@ export function createSwitchController(deps: {
                 tailUserTurns: deps.tailUserTurns,
                 tailCharBudget: deps.tailCharBudget,
             }) : "";
-            const summary = buildDigestText(digest.text) + (tail ? "\n\n" + tail : "");
+            const currentTurn = sameModelCompaction ? renderCurrentTurn(messages.slice(lastUserIndex), deps.tailCharBudget) : "";
+            const summary = [buildDigestText(digest.text), tail, currentTurn].filter(Boolean).join("\n\n");
             await persist(event.sessionID, {
                 ...state,
                 origin: state.origin ?? previous ?? model,
