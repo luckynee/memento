@@ -1,6 +1,6 @@
 {
     "name": "memento",
-    "version": "0.2.0",
+    "version": "0.2.1",
     "description": "Cross-session and cross-harness memory for Claude Code.",
     "author": {
         "name": "memento-pool"
