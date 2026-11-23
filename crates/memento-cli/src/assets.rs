@@ -81,7 +81,10 @@ mod tests {
 
     #[test]
     fn compose_rendering_substitutes_default_and_override() {
-        assert!(render_compose(None).contains("\"ghcr.io/luckynee/mementod:0.1.0\""));
+        assert!(render_compose(None).contains(&format!(
+            "\"ghcr.io/luckynee/mementod:{}\"",
+            env!("CARGO_PKG_VERSION")
+        )));
         assert!(
             render_compose(Some("example/mementod:test"))
                 .contains("image: \"example/mementod:test\"")
