@@ -7,6 +7,8 @@ use std::time::Duration;
 
 use clap::{Args, ValueEnum};
 use dialoguer::{Confirm, Input, MultiSelect, Select};
+use jsonc_parser::ParseOptions;
+use jsonc_parser::cst::{CstInputValue, CstRootNode};
 use serde_json::{Value, json};
 
 use crate::cross_harness::{
@@ -184,27 +186,40 @@ fn base(context: &Context) -> &Path {
 }
 
 fn config_path(entry: &HarnessEntry, context: &Context) -> PathBuf {
-    if entry.id == "opencode" && context.scope == Scope::User {
-        return context.xdg.join("opencode/opencode.jsonc");
-    }
-    if entry.id == "opencode" && context.scope == Scope::Project {
-        for name in [
-            "opencode.json",
-            "opencode.jsonc",
-            ".opencode/opencode.json",
-            ".opencode/opencode.jsonc",
-        ] {
-            let path = context.project.join(name);
-            if path.is_file() {
-                return path;
-            }
-        }
+    if entry.id == "opencode" {
+        return opencode_config_path(context.scope == Scope::User, &context.project, &context.xdg);
     }
     base(context).join(if context.scope == Scope::User {
         entry.user_config
     } else {
         entry.project_config
     })
+}
+
+pub(super) fn opencode_config_path(user: bool, project: &Path, xdg: &Path) -> PathBuf {
+    if user {
+        let directory = xdg.join("opencode");
+        let jsonc = directory.join("opencode.jsonc");
+        let json = directory.join("opencode.json");
+        if !jsonc.is_file() && json.is_file() {
+            json
+        } else {
+            jsonc
+        }
+    } else {
+        for name in [
+            "opencode.json",
+            "opencode.jsonc",
+            ".opencode/opencode.json",
+            ".opencode/opencode.jsonc",
+        ] {
+            let path = project.join(name);
+            if path.is_file() {
+                return path;
+            }
+        }
+        project.join("opencode.jsonc")
+    }
 }
 
 fn skill_path(entry: &HarnessEntry, context: &Context) -> PathBuf {
@@ -281,11 +296,7 @@ fn plugin_entry(context: &Context, memory: bool) -> Result<Value, CliError> {
     )
 }
 
-fn opencode_merge(
-    path: &Path,
-    context: &Context,
-    memory: bool,
-) -> Result<Option<String>, CliError> {
+fn opencode_merge(path: &Path, context: &Context, memory: bool) -> Result<String, CliError> {
     let original = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == io::ErrorKind::NotFound => "{}".into(),
@@ -296,62 +307,85 @@ fn opencode_merge(
             )));
         }
     };
-    let mut value: Value = match serde_json::from_str(&original) {
-        Ok(value) => value,
-        Err(_) => return Ok(None),
-    };
-    let root = value.as_object_mut().ok_or_else(|| {
+    let root = CstRootNode::parse(&original, &ParseOptions::default()).map_err(|error| {
+        let snippet = plugin_entry(context, memory)
+            .and_then(|entry| {
+                serde_json::to_string_pretty(&entry).map_err(|error| {
+                    CliError::other(format!("cannot serialize plugin entry: {error}"))
+                })
+            })
+            .unwrap_or_else(|error| error.message);
+        CliError::other(format!(
+            "cannot parse OpenCode config {}: {error}\nAdd this entry to the plugins array after fixing the config:\n{snippet}",
+            path.display()
+        ))
+    })?;
+    let object = root.object_value().ok_or_else(|| {
         CliError::other(format!(
             "OpenCode config {} must be an object",
             path.display()
         ))
     })?;
-    let plugins = root
-        .entry("plugins")
-        .or_insert_with(|| json!([]))
-        .as_array_mut()
-        .ok_or_else(|| {
-            CliError::other(format!(
-                "OpenCode plugins in {} must be an array",
-                path.display()
-            ))
-        })?;
+    let plugins = object.array_value_or_create("plugins").ok_or_else(|| {
+        CliError::other(format!(
+            "OpenCode plugins in {} must be an array",
+            path.display()
+        ))
+    })?;
     let new_entry = plugin_entry(context, memory)?;
-    if let Some(existing) = plugins.iter_mut().find(|entry| {
-        entry
+    let planned_package = new_entry["package"].as_str().expect("plugin package");
+    if let Some(existing) = plugins.elements().into_iter().find_map(|entry| {
+        let object = entry.as_object()?;
+        let value = object.to_serde_value()?;
+        let matched = value
             .get("package")
             .and_then(Value::as_str)
             .is_some_and(|package| {
-                package
-                    .trim_end_matches('/')
-                    .ends_with("/adapters/opencode")
+                let package = package.trim_end_matches('/');
+                package.ends_with("/adapters/opencode")
+                    || package == planned_package.trim_end_matches('/')
+                    || package.ends_with("/memento/opencode-plugin")
             })
-            || entry
+            || value
                 .get("options")
                 .and_then(|options| options.get("memento"))
                 .and_then(Value::as_bool)
-                == Some(true)
+                == Some(true);
+        matched.then_some(object)
     }) {
-        let object = existing
-            .as_object_mut()
-            .ok_or_else(|| CliError::other("invalid memento plugin entry"))?;
-        object.insert("package".into(), new_entry["package"].clone());
-        let options = object
-            .entry("options")
-            .or_insert_with(|| json!({}))
-            .as_object_mut()
+        let options = existing
+            .object_value_or_create("options")
             .ok_or_else(|| CliError::other("memento plugin options must be an object"))?;
-        options.insert("url".into(), new_entry["options"]["url"].clone());
-        options.insert(
-            "subagentMemory".into(),
-            new_entry["options"]["subagentMemory"].clone(),
-        );
+        for (object, name, value) in [
+            (&existing, "package", planned_package),
+            (&options, "url", context.url.as_str()),
+            (
+                &options,
+                "subagentMemory",
+                if memory { "digest" } else { "off" },
+            ),
+        ] {
+            if let Some(property) = object.get(name) {
+                property.set_value(value.into());
+            } else {
+                object.append(name, value.into());
+            }
+        }
     } else {
-        plugins.push(new_entry);
+        let subagent_memory = if memory { "digest" } else { "off" };
+        let url = context.url.as_str();
+        plugins.append(CstInputValue::Object(vec![
+            ("package".into(), planned_package.into()),
+            (
+                "options".into(),
+                CstInputValue::Object(vec![
+                    ("url".into(), url.into()),
+                    ("subagentMemory".into(), subagent_memory.into()),
+                ]),
+            ),
+        ]));
     }
-    serde_json::to_string_pretty(&value)
-        .map(Some)
-        .map_err(|error| CliError::other(format!("cannot serialize OpenCode config: {error}")))
+    Ok(root.to_string())
 }
 
 fn plan_opencode(
@@ -360,47 +394,22 @@ fn plan_opencode(
     memory: bool,
 ) -> Result<Change, CliError> {
     let path = config_path(entry, context);
-    let description = if opencode_merge(&path, context, memory)?.is_some() {
-        "merge OpenCode plugin"
-    } else {
-        "manual OpenCode plugin entry required (JSONC or invalid JSON)"
-    };
-    if description.starts_with("manual") {
-        let snippet = serde_json::to_string_pretty(&plugin_entry(context, memory)?)
-            .map_err(|error| CliError::other(format!("cannot serialize plugin entry: {error}")))?;
-        println!(
-            "Add this entry to the plugins array in {}:\n{snippet}",
-            path.display()
-        );
-    }
+    opencode_merge(&path, context, memory)?;
     Ok(Change {
         path,
-        description: description.into(),
+        description: "merge OpenCode plugin".into(),
     })
 }
 
 fn apply_opencode(entry: &HarnessEntry, context: &Context, memory: bool) -> Result<(), CliError> {
     let path = config_path(entry, context);
-    match opencode_merge(&path, context, memory)? {
-        Some(output) => {
-            let parent = path
-                .parent()
-                .ok_or_else(|| CliError::other("OpenCode config has no parent"))?;
-            fs::create_dir_all(parent).map_err(|error| {
-                CliError::other(format!("cannot create {}: {error}", parent.display()))
-            })?;
-            cross_harness::save_atomic(&path, output.as_bytes())?;
-        }
-        None => {
-            println!(
-                "Add this entry to the plugins array in {}:\n{}",
-                path.display(),
-                serde_json::to_string_pretty(&plugin_entry(context, memory)?).map_err(|error| {
-                    CliError::other(format!("cannot serialize plugin entry: {error}"))
-                })?
-            );
-        }
-    }
+    let output = opencode_merge(&path, context, memory)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| CliError::other("OpenCode config has no parent"))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| CliError::other(format!("cannot create {}: {error}", parent.display())))?;
+    cross_harness::save_atomic(&path, output.as_bytes())?;
     Ok(())
 }
 
@@ -994,26 +1003,81 @@ mod tests {
         fs::create_dir_all(&context.project).unwrap();
         let path = context.project.join("opencode.jsonc");
         let initial: Value =
-            serde_json::from_str(&opencode_merge(&path, &context, true).unwrap().unwrap()).unwrap();
+            serde_json::from_str(&opencode_merge(&path, &context, true).unwrap()).unwrap();
         assert_eq!(initial["plugins"][0]["options"]["subagentMemory"], "digest");
         fs::write(&path, r#"{"other":42,"plugins":[{"package":"foreign"}]}"#).unwrap();
         let merged: Value =
-            serde_json::from_str(&opencode_merge(&path, &context, false).unwrap().unwrap())
-                .unwrap();
+            serde_json::from_str(&opencode_merge(&path, &context, false).unwrap()).unwrap();
         assert_eq!(merged["other"], 42);
         assert_eq!(merged["plugins"][0]["package"], "foreign");
         assert_eq!(merged["plugins"][1]["options"]["subagentMemory"], "off");
         fs::write(&path, r#"{"plugins":[{"package":"/old/adapters/opencode","options":{"jev":false,"url":"old"}}]}"#).unwrap();
         let updated: Value =
-            serde_json::from_str(&opencode_merge(&path, &context, true).unwrap().unwrap()).unwrap();
+            serde_json::from_str(&opencode_merge(&path, &context, true).unwrap()).unwrap();
         assert_eq!(updated["plugins"].as_array().unwrap().len(), 1);
         assert_eq!(updated["plugins"][0]["options"]["jev"], false);
         assert_eq!(updated["plugins"][0]["options"]["url"], context.url);
         let jsonc = "{\n // keep this\n \"plugins\": [],\n}";
         fs::write(&path, jsonc).unwrap();
-        assert!(opencode_merge(&path, &context, true).unwrap().is_none());
         apply_opencode(&REGISTRY[0], &context, true).unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), jsonc);
+        let merged = fs::read_to_string(&path).unwrap();
+        assert!(merged.contains("// keep this"));
+        let root = CstRootNode::parse(&merged, &ParseOptions::default()).unwrap();
+        assert_eq!(
+            root.to_serde_value().unwrap()["plugins"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn opencode_jsonc_update_is_idempotent_and_keeps_comments() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut context = context(temp.path());
+        context.plugin = Some(temp.path().join("memento/opencode-plugin"));
+        fs::create_dir_all(&context.project).unwrap();
+        let path = context.project.join("opencode.jsonc");
+        fs::write(
+            &path,
+            format!(
+                "{{\n  // root comment\n  \"plugins\": [{{\n    \"package\": \"{}/\",\n    \"options\": {{\n      // option comment\n      \"jev\": false,\n      \"url\": \"old\",\n    }},\n  }},],\n}}",
+                context.plugin.as_ref().unwrap().display()
+            ),
+        )
+        .unwrap();
+        apply_opencode(&REGISTRY[0], &context, true).unwrap();
+        apply_opencode(&REGISTRY[0], &context, false).unwrap();
+        let merged = fs::read_to_string(&path).unwrap();
+        assert!(merged.contains("// root comment"));
+        assert!(merged.contains("// option comment"));
+        let root = CstRootNode::parse(&merged, &ParseOptions::default()).unwrap();
+        let value = root.to_serde_value().unwrap();
+        assert_eq!(value["plugins"].as_array().unwrap().len(), 1);
+        assert_eq!(value["plugins"][0]["options"]["jev"], false);
+        assert_eq!(value["plugins"][0]["options"]["subagentMemory"], "off");
+    }
+
+    #[test]
+    fn invalid_opencode_config_fails_plan_and_apply_with_snippet() {
+        let temp = tempfile::tempdir().unwrap();
+        let context = context(temp.path());
+        fs::create_dir_all(&context.project).unwrap();
+        let path = context.project.join("opencode.jsonc");
+        fs::write(&path, "{\"plugins\": [invalid]}").unwrap();
+        for error in [
+            plan_opencode(&REGISTRY[0], &context, true).err().unwrap(),
+            apply_opencode(&REGISTRY[0], &context, true).unwrap_err(),
+        ] {
+            assert!(error.message.contains(path.to_str().unwrap()));
+            assert!(error.message.contains("Add this entry"));
+            assert!(error.message.contains("\"package\""));
+        }
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "{\"plugins\": [invalid]}"
+        );
     }
 
     #[test]

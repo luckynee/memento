@@ -1,9 +1,11 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
 use clap::Args;
+use jsonc_parser::ParseOptions;
+use jsonc_parser::cst::CstRootNode;
 use serde_json::Value;
 
 use crate::{Cli, CliError};
@@ -125,6 +127,127 @@ fn check_plugin(setup: &Value) {
     }
 }
 
+fn normalized_path(path: &Path, base: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+    if let Ok(canonical) = absolute.canonicalize() {
+        return canonical;
+    }
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn plugin_registered(config: &Path, directory: &Path) -> Result<bool, String> {
+    let contents = fs::read_to_string(config).map_err(|error| error.to_string())?;
+    let root = CstRootNode::parse(&contents, &ParseOptions::default())
+        .map_err(|error| error.to_string())?;
+    let value = root.to_serde_value().ok_or("config has no root value")?;
+    let base = config.parent().ok_or("config has no parent")?;
+    let expected = normalized_path(directory, base);
+    Ok(value
+        .get("plugins")
+        .and_then(Value::as_array)
+        .is_some_and(|plugins| {
+            plugins.iter().any(|entry| {
+                entry
+                    .as_str()
+                    .or_else(|| entry.get("package").and_then(Value::as_str))
+                    .is_some_and(|package| normalized_path(Path::new(package), base) == expected)
+            })
+        }))
+}
+
+fn check_registration(setup: &Value) -> bool {
+    if !setup
+        .get("harnesses")
+        .and_then(Value::as_array)
+        .is_some_and(|harnesses| {
+            harnesses
+                .iter()
+                .any(|entry| entry.as_str() == Some("opencode"))
+        })
+    {
+        return true;
+    }
+    let directory = match plugin_directory(setup) {
+        Ok(Some(directory)) => directory,
+        Ok(None) => {
+            println!("fail: cannot resolve OpenCode plugin directory for registration");
+            return false;
+        }
+        Err(error) => {
+            println!(
+                "fail: cannot resolve OpenCode plugin directory: {}",
+                error.message
+            );
+            return false;
+        }
+    };
+    let user = match setup.get("scope").and_then(Value::as_str) {
+        Some("user") => true,
+        Some("project") => false,
+        _ => {
+            println!("fail: saved OpenCode setup has invalid scope");
+            return false;
+        }
+    };
+    let project = if user {
+        PathBuf::new()
+    } else if let Some(project) = setup.get("project").and_then(Value::as_str) {
+        PathBuf::from(project)
+    } else {
+        println!("fail: saved OpenCode project directory missing");
+        return false;
+    };
+    let xdg = if user {
+        match std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        {
+            Some(xdg) => xdg,
+            None => {
+                println!("fail: cannot resolve OpenCode config: HOME is not set");
+                return false;
+            }
+        }
+    } else {
+        PathBuf::new()
+    };
+    let config = crate::setup::opencode_config_path(user, &project, &xdg);
+    match plugin_registered(&config, &directory) {
+        Ok(true) => {
+            println!("ok: OpenCode plugin registered in {}", config.display());
+            true
+        }
+        result => {
+            println!(
+                "fail: OpenCode plugin not registered in {}",
+                config.display()
+            );
+            if let Err(error) = result {
+                println!("  cannot read or parse config: {error}");
+            }
+            println!(
+                "  Add this entry to the plugins array: {}",
+                serde_json::json!({"package": directory})
+            );
+            false
+        }
+    }
+}
+
 pub(super) fn run(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
     let mut failed = false;
     println!(
@@ -201,6 +324,7 @@ pub(super) fn run(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
     }
     if let Some(setup) = receipt.get("setup") {
         check_plugin(setup);
+        failed |= !check_registration(setup);
         println!("ok: saved setup {setup}");
     } else {
         println!("warn: no saved setup");
@@ -209,5 +333,53 @@ pub(super) fn run(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
         Err(CliError::other("doctor found failed checks"))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registration_checks_jsonc_objects_strings_and_missing_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("opencode.jsonc");
+        let plugin = temp.path().join("memento/opencode-plugin");
+        fs::write(
+            &config,
+            format!(
+                "{{\n  // keep\n  \"plugins\": [{{\"package\": \"{}/\"}},],\n}}",
+                plugin.display()
+            ),
+        )
+        .unwrap();
+        assert!(plugin_registered(&config, &plugin).unwrap());
+        fs::write(&config, r#"{"plugins":["memento/./opencode-plugin/"]}"#).unwrap();
+        assert!(plugin_registered(&config, &plugin).unwrap());
+        fs::write(&config, r#"{"plugins":[{"package":"/other"}]}"#).unwrap();
+        assert!(!plugin_registered(&config, &plugin).unwrap());
+        fs::write(&config, r#"{"plugins":[invalid]}"#).unwrap();
+        assert!(plugin_registered(&config, &plugin).is_err());
+    }
+
+    #[test]
+    fn registration_respects_saved_project_and_reports_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin = temp.path().join("plugin");
+        let config = temp.path().join("opencode.json");
+        let setup = serde_json::json!({
+            "harnesses": ["opencode"],
+            "scope": "project",
+            "project": temp.path(),
+            "opencode_plugin": plugin
+        });
+        fs::write(
+            &config,
+            serde_json::json!({"plugins": [plugin]}).to_string(),
+        )
+        .unwrap();
+        assert!(check_registration(&setup));
+        fs::write(&config, r#"{"plugins":[]}"#).unwrap();
+        assert!(!check_registration(&setup));
     }
 }
