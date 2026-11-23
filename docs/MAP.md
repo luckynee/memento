@@ -29,11 +29,11 @@
 | `crates/memento-cli/src/assets.rs` | Embedded skills, plugin bundle writer (`<data>/memento/opencode-plugin/`), compose renderer |
 | `crates/memento-cli/assets/compose.yaml` | Managed daemon template; image `ghcr.io/luckynee/mementod:<version>` or `MEMENTO_DAEMON_IMAGE`; project `memento` |
 | `crates/memento-cli/src/daemon.rs` | `memento daemon up/down/status/logs/pull`; `managed_refresh_steps` |
-| `crates/memento-cli/src/receipt.rs` | `${XDG_CONFIG_HOME:-~/.config}/memento/install.json`: installer fields `method`, `bin_dir`, `version` plus `setup` |
+| `crates/memento-cli/src/receipt.rs` | `${XDG_CONFIG_HOME:-~/.config}/memento/install.json`: installer fields `method`, `bin_dir`, `version` plus `setup`; setup records only the latest scope and project |
 | `crates/memento-cli/src/setup.rs::reapply_saved_setup` | Non-interactive re-apply of saved setup (hidden `reapply-setup`), used by `update --refresh`; OpenCode `--resume` and `--compaction` choices persist as `opencode_resume` and `opencode_compaction` |
 | `crates/memento-cli/src/update.rs` | `memento update`: GitHub release lookup (`MEMENTO_RELEASES_API`, `MEMENTO_DOWNLOAD_BASE` test overrides), sha256, guarded binary swap, refresh |
 | `crates/memento-cli/src/doctor.rs` | `memento doctor [--offline]` and hidden `write-receipt` (called by `install.sh`); reports registered harness settings from installed configs; fails when a readable OpenCode config has no `plugins` entry for the plugin directory (config check only, not proof the running service loaded it) |
-| `crates/memento-cli/src/setup.rs::opencode_config_path` | OpenCode config resolution shared by setup and doctor; setup edits JSONC through `jsonc-parser` CST (comments kept), manages `--resume on|off` and `--compaction memento|native`, and fails on unparsable configs |
+| `crates/memento-cli/src/setup.rs::opencode_config_path` | OpenCode config resolution shared by setup and doctor; setup edits JSONC through `jsonc-parser` CST (comments kept), manages `--resume on|off` and `--compaction memento|native`, and fails on unparsable configs; `remove` plans registry-driven integration removal and preserves shared assets conservatively |
 | `install.sh` | POSIX installer: `memento-<target>.tar.gz` + `.sha256`, `MEMENTO_VERSION`, `MEMENTO_INSTALL_DIR`, `MEMENTO_NO_SETUP` |
 | `.github/workflows/` | `ci.yml` (fmt, clippy, test, adapter, shellcheck); `release.yml` (tag: musl/darwin tarballs, multi-arch GHCR image, GitHub release) |
 

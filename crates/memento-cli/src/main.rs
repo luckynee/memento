@@ -64,6 +64,8 @@ struct Cli {
 enum Command {
     #[command(about = "Set up harnesses interactively")]
     Setup(setup::SetupArgs),
+    #[command(about = "Remove harness integrations")]
+    Remove(setup::RemoveArgs),
     #[command(about = "Check daemon health")]
     Health,
     #[command(about = "Show memory counts by kind")]
@@ -467,6 +469,7 @@ fn build_request(
         Command::Ingest(_) => (Method::POST, vec!["v1", "ingest"]),
         Command::Note(_)
         | Command::Setup(_)
+        | Command::Remove(_)
         | Command::ProjectKey { .. }
         | Command::Gc(_)
         | Command::Import(_)
@@ -623,6 +626,7 @@ fn build_request(
         }
         Command::Note(_)
         | Command::Setup(_)
+        | Command::Remove(_)
         | Command::ProjectKey { .. }
         | Command::Gc(_)
         | Command::Import(_)
@@ -859,6 +863,7 @@ fn render(command: &Command, body: &str) -> Result<String, CliError> {
         }
         Command::Note(_)
         | Command::Setup(_)
+        | Command::Remove(_)
         | Command::ProjectKey { .. }
         | Command::Gc(_)
         | Command::Import(_)
@@ -1104,6 +1109,9 @@ fn run(mut cli: Cli) -> Result<(), CliError> {
     }
     if let Command::Setup(args) = &cli.command {
         return setup::run(&cli, args);
+    }
+    if let Command::Remove(args) = &cli.command {
+        return setup::remove(args);
     }
     if matches!(&cli.command, Command::ReapplySetup) {
         return setup::reapply_saved_setup(&cli);

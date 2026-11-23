@@ -72,6 +72,26 @@ pub struct SetupArgs {
     dry_run: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct RemoveArgs {
+    #[arg(
+        long,
+        value_delimiter = ',',
+        help = "Comma-separated harness identifiers"
+    )]
+    harness: Vec<String>,
+    #[arg(long, value_enum, help = "Installation scope")]
+    scope: Option<Scope>,
+    #[arg(long, help = "Project directory")]
+    project: Option<PathBuf>,
+    #[arg(long, help = "Apply without prompting")]
+    yes: bool,
+    #[arg(long, help = "Preview without writing")]
+    dry_run: bool,
+    #[arg(long, help = "Also destroy managed daemon data and embedded plugin")]
+    purge: bool,
+}
+
 type SettingsReporter = fn(&Path, Option<Harness>, Option<&Path>) -> Result<Vec<String>, String>;
 
 struct HarnessEntry {
@@ -88,6 +108,7 @@ struct HarnessEntry {
     user_skills: &'static str,
     plan: fn(&HarnessEntry, &Context, bool) -> Result<Change, CliError>,
     apply: fn(&HarnessEntry, &Context, bool) -> Result<(), CliError>,
+    plan_remove: fn(&HarnessEntry, &Context) -> Result<Option<String>, CliError>,
     settings: SettingsReporter,
 }
 
@@ -107,6 +128,7 @@ const REGISTRY: &[HarnessEntry] = &[
         user_skills: ".config/opencode/skills",
         plan: plan_opencode,
         apply: apply_opencode,
+        plan_remove: remove_opencode,
         settings: crate::doctor::opencode_settings,
     },
     HarnessEntry {
@@ -123,6 +145,7 @@ const REGISTRY: &[HarnessEntry] = &[
         user_skills: ".claude/skills",
         plan: plan_hook,
         apply: apply_hook,
+        plan_remove: remove_hook,
         settings: crate::doctor::hook_settings,
     },
     HarnessEntry {
@@ -139,6 +162,7 @@ const REGISTRY: &[HarnessEntry] = &[
         user_skills: ".agents/skills",
         plan: plan_hook,
         apply: apply_hook,
+        plan_remove: remove_hook,
         settings: crate::doctor::hook_settings,
     },
     HarnessEntry {
@@ -155,6 +179,7 @@ const REGISTRY: &[HarnessEntry] = &[
         user_skills: ".gemini/config/skills",
         plan: plan_hook,
         apply: apply_hook,
+        plan_remove: remove_hook,
         settings: crate::doctor::hook_settings,
     },
 ];
@@ -1088,6 +1113,522 @@ fn saved_opencode_options(setup: &Value) -> (Option<Toggle>, Option<Compaction>)
     (resume, compaction)
 }
 
+fn remove_opencode(entry: &HarnessEntry, context: &Context) -> Result<Option<String>, CliError> {
+    let path = config_path(entry, context);
+    let original = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(CliError::other(format!(
+                "cannot read {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let root = CstRootNode::parse(&original, &ParseOptions::default())
+        .map_err(|error| CliError::other(format!("cannot parse {}: {error}", path.display())))?;
+    let object = root
+        .object_value()
+        .ok_or_else(|| CliError::other(format!("{} must be an object", path.display())))?;
+    let Some(property) = object.get("plugins") else {
+        return Ok(None);
+    };
+    let plugins = property
+        .value()
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| {
+            CliError::other(format!("plugins in {} must be an array", path.display()))
+        })?;
+    let mut changed = false;
+    for value in plugins.elements() {
+        let matched = value
+            .to_serde_value()
+            .and_then(|value| {
+                value
+                    .get("package")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .is_some_and(|package| {
+                let package = package.trim_end_matches('/');
+                package.ends_with("/memento/opencode-plugin")
+                    || package.ends_with("/adapters/opencode")
+                    || context.plugin.as_ref().is_some_and(|plugin| {
+                        plugin
+                            .to_str()
+                            .is_some_and(|expected| package == expected.trim_end_matches('/'))
+                    })
+            });
+        if matched {
+            value.remove();
+            changed = true;
+        }
+    }
+    Ok(changed.then(|| root.to_string()))
+}
+
+fn remove_hook(entry: &HarnessEntry, context: &Context) -> Result<Option<String>, CliError> {
+    let path = config_path(entry, context);
+    let original = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(CliError::other(format!(
+                "cannot read {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let mut value: Value = serde_json::from_slice(&original)
+        .map_err(|error| CliError::other(format!("cannot parse {}: {error}", path.display())))?;
+    let root = value
+        .as_object_mut()
+        .ok_or_else(|| CliError::other(format!("{} must be an object", path.display())))?;
+    let harness = entry.hook.expect("hook registry entry");
+    let is_agy = matches!(harness, Harness::Agy);
+    let key = if is_agy { "memento" } else { "hooks" };
+    let Some(hooks_value) = root.get_mut(key) else {
+        return Ok(None);
+    };
+    let hooks = hooks_value
+        .as_object_mut()
+        .ok_or_else(|| CliError::other(format!("{key} in {} must be an object", path.display())))?;
+    let mut changed = false;
+    hooks.retain(|_, groups| {
+        let Some(groups) = groups.as_array_mut() else {
+            return true;
+        };
+        let before = groups.len();
+        if is_agy {
+            groups.retain(|handler| {
+                !handler
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(|command| cross_harness::memento_hook_command(command, harness))
+            });
+        } else {
+            groups.retain_mut(|group| {
+                let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+                    return true;
+                };
+                let before = handlers.len();
+                handlers.retain(|handler| {
+                    !handler
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(|command| {
+                            cross_harness::memento_hook_command(command, harness)
+                        })
+                });
+                changed |= before != handlers.len();
+                before == handlers.len() || !handlers.is_empty()
+            });
+        }
+        changed |= before != groups.len();
+        before == groups.len() || !groups.is_empty()
+    });
+    if changed && hooks.is_empty() {
+        root.remove(key);
+    }
+    if !changed {
+        return Ok(None);
+    }
+    serde_json::to_string_pretty(&value)
+        .map(Some)
+        .map_err(|error| CliError::other(format!("cannot serialize {}: {error}", path.display())))
+}
+
+fn saved_scope_matches(setup: &serde_json::Map<String, Value>, context: &Context) -> bool {
+    match (setup.get("scope").and_then(Value::as_str), context.scope) {
+        (Some("user"), Scope::User) => true,
+        (Some("project"), Scope::Project) => setup
+            .get("project")
+            .and_then(Value::as_str)
+            .is_some_and(|project| {
+                let saved = Path::new(project);
+                match (saved.canonicalize(), context.project.canonicalize()) {
+                    (Ok(saved), Ok(current)) => saved == current,
+                    _ => saved == context.project,
+                }
+            }),
+        _ => false,
+    }
+}
+
+fn update_removed_receipt(
+    receipt: &mut serde_json::Map<String, Value>,
+    selected: &[&HarnessEntry],
+    context: &Context,
+) -> bool {
+    let Some(setup) = receipt.get_mut("setup").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    if !saved_scope_matches(setup, context) {
+        return false;
+    }
+    let Some(harnesses) = setup.get_mut("harnesses").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let before = harnesses.len();
+    harnesses.retain(|value| {
+        !selected
+            .iter()
+            .any(|entry| value.as_str() == Some(entry.id))
+    });
+    if before == harnesses.len() {
+        return false;
+    }
+    let empty = harnesses.is_empty();
+    if let Some(modes) = setup
+        .get_mut("subagent_memory")
+        .and_then(Value::as_object_mut)
+    {
+        for entry in selected {
+            modes.remove(entry.id);
+        }
+    }
+    if selected.iter().any(|entry| entry.id == "opencode") {
+        for key in ["opencode_plugin", "opencode_resume", "opencode_compaction"] {
+            setup.remove(key);
+        }
+    }
+    if empty {
+        receipt.remove("setup");
+    }
+    true
+}
+
+fn remove_directory(path: &Path) -> Result<(), CliError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => fs::remove_file(path),
+        Ok(_) => fs::remove_dir_all(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => Err(error),
+    }
+    .map_err(|error| CliError::other(format!("cannot remove {}: {error}", path.display())))
+}
+
+fn purge_allowed(
+    managed: bool,
+    terminal: bool,
+    yes: bool,
+    confirmation: Option<&str>,
+) -> Result<(), CliError> {
+    if !managed {
+        return Err(CliError::other(
+            "cannot purge a non-managed daemon or without saved setup",
+        ));
+    }
+    if terminal {
+        if confirmation != Some("purge") {
+            return Err(CliError::other("purge not confirmed"));
+        }
+    } else if !yes {
+        return Err(CliError::other(
+            "non-interactive purge requires --yes --purge",
+        ));
+    }
+    Ok(())
+}
+
+fn skill_removal_blocker(
+    directory: &Path,
+    selected: &[&HarnessEntry],
+    context: &Context,
+) -> Option<String> {
+    let resolved = directory.canonicalize().ok();
+    for other in REGISTRY.iter().filter(|other| {
+        if selected.iter().any(|selected| selected.id == other.id) {
+            return false;
+        }
+        let other_directory = skill_path(other, context);
+        other_directory == directory
+            || resolved
+                .as_ref()
+                .is_some_and(|path| other_directory.canonicalize().ok().as_ref() == Some(path))
+    }) {
+        match (other.plan_remove)(other, context) {
+            Ok(Some(_)) => return Some(format!("{} integration remains", other.display)),
+            Err(error) => {
+                return Some(format!(
+                    "{} detection ambiguous: {}",
+                    other.display, error.message
+                ));
+            }
+            Ok(None) => {}
+        }
+    }
+    None
+}
+
+pub fn remove(args: &RemoveArgs) -> Result<(), CliError> {
+    let terminal = io::stdin().is_terminal() && io::stderr().is_terminal();
+    if !terminal && !args.yes && !args.dry_run {
+        return Err(CliError::other("non-interactive removal requires --yes"));
+    }
+    let interactive = terminal && !args.yes;
+    let mut receipt = crate::receipt::read()
+        .map_err(|error| CliError::other(format!("cannot read install receipt: {error}")))?;
+    let setup = receipt.get("setup").and_then(Value::as_object).cloned();
+    let managed = setup
+        .as_ref()
+        .and_then(|setup| setup.get("managed_daemon"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    if args.purge && !managed {
+        return Err(CliError::other(
+            "cannot purge a non-managed daemon or without saved setup",
+        ));
+    }
+    let scope = args
+        .scope
+        .or_else(|| match setup.as_ref()?.get("scope")?.as_str()? {
+            "user" => Some(Scope::User),
+            "project" => Some(Scope::Project),
+            _ => None,
+        })
+        .ok_or_else(|| CliError::other("--scope is required without saved setup"))?;
+    if scope == Scope::User && args.project.is_some() {
+        return Err(CliError::other("--project cannot be used with user scope"));
+    }
+    let project =
+        args.project
+            .clone()
+            .or_else(|| {
+                (scope == Scope::Project && args.scope.is_none())
+                    .then(|| setup.as_ref()?.get("project")?.as_str().map(PathBuf::from))
+                    .flatten()
+            })
+            .unwrap_or(env::current_dir().map_err(|error| {
+                CliError::other(format!("cannot get current directory: {error}"))
+            })?);
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| CliError::other("HOME is required"))?;
+    let xdg = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    let plugin = setup
+        .as_ref()
+        .and_then(|setup| setup.get("opencode_plugin"))
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .or_else(|| {
+            crate::assets::data_dir()
+                .ok()
+                .map(|path| path.join("opencode-plugin"))
+        });
+    let context = Context {
+        scope,
+        project,
+        home,
+        xdg,
+        executable: PathBuf::new(),
+        plugin,
+        skills_source: None,
+        install_skills: false,
+        embedded_plugin: false,
+        url: String::new(),
+        resume: None,
+        compaction: None,
+    };
+    let saved_matches = setup
+        .as_ref()
+        .is_some_and(|setup| saved_scope_matches(setup, &context));
+    let saved_ids: Vec<&str> = if saved_matches {
+        setup
+            .as_ref()
+            .and_then(|setup| setup.get("harnesses"))
+            .and_then(Value::as_array)
+            .map(|items| items.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let selected: Vec<&HarnessEntry> = if !args.harness.is_empty() {
+        let mut selected = Vec::new();
+        for id in &args.harness {
+            let entry = REGISTRY
+                .iter()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| CliError::other(format!("unknown harness: {id}")))?;
+            if selected
+                .iter()
+                .any(|other: &&HarnessEntry| other.id == entry.id)
+            {
+                return Err(CliError::other(format!("duplicate harness: {id}")));
+            }
+            selected.push(entry);
+        }
+        selected
+    } else if interactive {
+        let candidates: Vec<&HarnessEntry> = REGISTRY
+            .iter()
+            .filter(|entry| {
+                saved_ids.contains(&entry.id)
+                    || (entry.plan_remove)(entry, &context)
+                        .ok()
+                        .flatten()
+                        .is_some()
+            })
+            .collect();
+        let labels: Vec<&str> = candidates.iter().map(|entry| entry.display).collect();
+        let defaults: Vec<bool> = candidates
+            .iter()
+            .map(|entry| saved_ids.contains(&entry.id))
+            .collect();
+        MultiSelect::new()
+            .with_prompt("Harnesses to remove")
+            .items(&labels)
+            .defaults(&defaults)
+            .interact()
+            .map_err(prompt_error)?
+            .into_iter()
+            .map(|index| candidates[index])
+            .collect()
+    } else {
+        REGISTRY
+            .iter()
+            .filter(|entry| saved_ids.contains(&entry.id))
+            .collect()
+    };
+    if selected.is_empty() {
+        return Err(CliError::other("no harnesses selected; specify --harness"));
+    }
+    let mut changes = Vec::new();
+    println!("Planned changes:");
+    for entry in &selected {
+        let path = config_path(entry, &context);
+        match (entry.plan_remove)(entry, &context)? {
+            Some(output) => {
+                println!(
+                    "  {}: {} - remove memento integration",
+                    entry.display,
+                    path.display()
+                );
+                changes.push((path, output));
+            }
+            None => println!(
+                "  {}: {} - nothing to remove",
+                entry.display,
+                path.display()
+            ),
+        }
+        if entry.hook.is_some() {
+            println!(
+                "  {}: marketplace plugins are not removed; use the harness plugin manager if installed",
+                entry.display
+            );
+        }
+    }
+    let skills_installed = saved_matches
+        && setup
+            .as_ref()
+            .and_then(|setup| setup.get("skills"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+    let mut skill_dirs = Vec::new();
+    if skills_installed {
+        let mut processed = Vec::new();
+        for entry in &selected {
+            if !saved_ids.contains(&entry.id) {
+                continue;
+            }
+            let directory = skill_path(entry, &context);
+            if processed.contains(&directory) {
+                continue;
+            }
+            processed.push(directory.clone());
+            if let Some(reason) = skill_removal_blocker(&directory, &selected, &context) {
+                println!("  {} - retain skills: {reason}", directory.display());
+            } else {
+                for (name, _) in crate::assets::SKILLS {
+                    let path = directory.join(name);
+                    if path.exists() {
+                        println!("  {} - remove bundled skill", path.display());
+                        skill_dirs.push(path);
+                    }
+                }
+            }
+        }
+    }
+    let data = crate::assets::data_dir()?;
+    let embedded = data.join("opencode-plugin");
+    if args.purge {
+        println!(
+            "WARNING: purge will destroy compose project memento, volume memento_qdrant_storage, {}, and {}",
+            data.join("compose.yaml").display(),
+            embedded.display()
+        );
+    } else {
+        println!(
+            "  {} - retained: other projects may use this plugin",
+            embedded.display()
+        );
+    }
+    let receipt_changed = update_removed_receipt(&mut receipt, &selected, &context);
+    if receipt_changed {
+        println!(
+            "  {} - update saved setup",
+            crate::receipt::receipt_path()
+                .map_err(CliError::other)?
+                .display()
+        );
+    }
+    if args.dry_run {
+        println!("Dry run: no changes made.");
+        return Ok(());
+    }
+    if interactive
+        && !Confirm::new()
+            .with_prompt("Apply these changes?")
+            .default(false)
+            .interact()
+            .map_err(prompt_error)?
+    {
+        println!("Removal cancelled.");
+        return Ok(());
+    }
+    if args.purge {
+        let confirmation = if terminal {
+            Some(
+                Input::<String>::new()
+                    .with_prompt("Type purge to destroy managed daemon data")
+                    .interact_text()
+                    .map_err(prompt_error)?,
+            )
+        } else {
+            eprintln!(
+                "WARNING: non-interactive purge will permanently destroy managed daemon data"
+            );
+            None
+        };
+        purge_allowed(managed, terminal, args.yes, confirmation.as_deref())?;
+    }
+    for (path, output) in changes {
+        cross_harness::save_atomic(&path, output.as_bytes())?;
+    }
+    for path in skill_dirs {
+        remove_directory(&path)?;
+    }
+    if receipt_changed {
+        crate::receipt::write(receipt.clone())
+            .map_err(|error| CliError::other(format!("cannot update install receipt: {error}")))?;
+    }
+    if args.purge {
+        crate::daemon::purge()?;
+        remove_directory(&embedded)?;
+        if let Some(setup) = receipt.get_mut("setup").and_then(Value::as_object_mut) {
+            setup.insert("managed_daemon".into(), Value::Bool(false));
+            crate::receipt::write(receipt).map_err(|error| {
+                CliError::other(format!("cannot update install receipt: {error}"))
+            })?;
+        }
+    }
+    println!("Removal complete. Restart your harness.");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1107,6 +1648,118 @@ mod tests {
             url: "http://127.0.0.1:7377".into(),
             resume: None,
             compaction: None,
+        }
+    }
+
+    #[test]
+    fn remove_opencode_preserves_foreign_entries_and_comments() {
+        let temp = tempfile::tempdir().unwrap();
+        let context = context(temp.path());
+        fs::create_dir_all(&context.project).unwrap();
+        let path = config_path(&REGISTRY[0], &context);
+        fs::write(&path, "{\n // keep\n \"plugins\": [{\"package\":\"foreign\"},{\"package\":\"/x/memento/opencode-plugin\"}],\n \"setting\":42\n}").unwrap();
+        let output = remove_opencode(&REGISTRY[0], &context).unwrap().unwrap();
+        assert!(output.contains("// keep"));
+        let value = CstRootNode::parse(&output, &ParseOptions::default())
+            .unwrap()
+            .to_serde_value()
+            .unwrap();
+        assert_eq!(value["plugins"], json!([{"package":"foreign"}]));
+        assert_eq!(value["setting"], 42);
+    }
+
+    #[test]
+    fn remove_hooks_preserves_foreign_hooks_and_prunes_empty_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let context = context(temp.path());
+        let entry = &REGISTRY[2];
+        let path = config_path(entry, &context);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, json!({"hooks":{"SessionStart":[{"matcher":"x","hooks":[{"command":"memento hook codex"},{"command":"foreign"}]}],"Stop":[{"hooks":[{"command":"memento hook codex"}]}]},"other":1}).to_string()).unwrap();
+        let value: Value =
+            serde_json::from_str(&remove_hook(entry, &context).unwrap().unwrap()).unwrap();
+        assert_eq!(
+            value,
+            json!({"hooks":{"SessionStart":[{"matcher":"x","hooks":[{"command":"foreign"}]}]},"other":1})
+        );
+    }
+
+    #[test]
+    fn shared_skill_directory_retained_for_remaining_integration_and_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let context = context(temp.path());
+        let codex = &REGISTRY[2];
+        let agy = &REGISTRY[3];
+        let path = config_path(agy, &context);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"memento":{"Stop":[{"command":"memento hook agy"}]}}"#,
+        )
+        .unwrap();
+        assert!(skill_removal_blocker(&skill_path(codex, &context), &[codex], &context).is_some());
+        fs::write(&path, "{").unwrap();
+        assert!(
+            skill_removal_blocker(&skill_path(codex, &context), &[codex], &context)
+                .unwrap()
+                .contains("ambiguous")
+        );
+    }
+
+    #[test]
+    fn receipt_removal_preserves_installer_fields_and_other_harnesses() {
+        let temp = tempfile::tempdir().unwrap();
+        let context = context(temp.path());
+        let mut receipt = json!({"method":"script","version":"1","setup":{"scope":"project","project":context.project,"harnesses":["opencode","codex"],"subagent_memory":{"opencode":true,"codex":true},"opencode_plugin":"/x"}}).as_object().unwrap().clone();
+        assert!(update_removed_receipt(
+            &mut receipt,
+            &[&REGISTRY[0]],
+            &context
+        ));
+        assert_eq!(receipt["setup"]["harnesses"], json!(["codex"]));
+        assert!(receipt["setup"].get("opencode_plugin").is_none());
+        assert!(
+            receipt["setup"]["subagent_memory"]
+                .get("opencode")
+                .is_none()
+        );
+        assert!(update_removed_receipt(
+            &mut receipt,
+            &[&REGISTRY[2]],
+            &context
+        ));
+        assert!(!receipt.contains_key("setup"));
+        assert_eq!(receipt["method"], "script");
+        assert_eq!(receipt["version"], "1");
+    }
+
+    #[test]
+    fn purge_requires_managed_and_confirmation() {
+        assert!(purge_allowed(false, false, true, None).is_err());
+        assert!(purge_allowed(true, false, false, None).is_err());
+        assert!(purge_allowed(true, true, true, Some("yes")).is_err());
+        assert!(purge_allowed(true, true, true, Some("purge")).is_ok());
+        assert!(purge_allowed(true, false, true, None).is_ok());
+    }
+
+    #[test]
+    fn integration_round_trip_for_each_harness() {
+        let temp = tempfile::tempdir().unwrap();
+        let context = context(temp.path());
+        fs::create_dir_all(&context.project).unwrap();
+        for entry in REGISTRY {
+            let path = config_path(entry, &context);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let initial = if entry.hook.is_none() {
+                json!({"plugins":[{"package":"foreign"}],"other":true})
+            } else {
+                json!({"other":true})
+            };
+            fs::write(&path, initial.to_string()).unwrap();
+            (entry.apply)(entry, &context, entry.subagent_default.unwrap_or(false)).unwrap();
+            let output = (entry.plan_remove)(entry, &context).unwrap().unwrap();
+            let result: Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(result, initial, "{}", entry.id);
         }
     }
 

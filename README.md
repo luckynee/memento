@@ -23,6 +23,8 @@ Override install settings with `MEMENTO_VERSION` (for example `0.2.0` or `v0.2.0
 
 Run `memento setup` to configure detected harnesses, install embedded skills and the embedded OpenCode plugin, and optionally start the managed daemon. The wizard previews changes before confirmation. `memento setup --start-daemon` starts the managed daemon without prompting; for non-interactive setup, also specify `--yes --harness ... --scope ...`.
 
+Run `memento remove` to preview and remove saved harness integrations. It preserves memory data and binaries; `memento remove --purge` additionally destroys the managed daemon's Qdrant data and embedded plugin after confirmation.
+
 Alternatively, configure harnesses manually with `memento install-hooks <harness>` and `memento install-skills`, then add the installed OpenCode plugin at `${XDG_DATA_HOME:-~/.local/share}/memento/opencode-plugin/` to `opencode.jsonc` (see [Other harnesses](#other-harnesses) and [adapters/opencode/README.md](adapters/opencode/README.md)). Your own tooling can use the generic hook, `memento import`/`memento ingest`, MCP, or the daemon HTTP API ([docs/DESIGN.md](docs/DESIGN.md)).
 
 ```sh

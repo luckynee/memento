@@ -112,6 +112,21 @@ fn docker(compose: &std::path::Path, args: &[&str], inherit: bool) -> Result<(),
     Ok(())
 }
 
+pub(super) fn purge() -> Result<(), CliError> {
+    let compose = assets::data_dir()?.join("compose.yaml");
+    if !compose.is_file() {
+        return Err(CliError::other(format!(
+            "cannot purge managed daemon: compose file {} is missing",
+            compose.display()
+        )));
+    }
+    docker(&compose, &["down", "-v"], true)?;
+    fs::remove_file(&compose).map_err(|error| {
+        CliError::other(format!("cannot remove {}: {error}", compose.display()))
+    })?;
+    Ok(())
+}
+
 fn health(cli: &Cli) -> Result<Option<Health>, CliError> {
     let url = crate::endpoint(&cli.url, &["health"])?;
     let client = reqwest::blocking::Client::builder()

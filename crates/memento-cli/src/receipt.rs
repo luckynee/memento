@@ -48,7 +48,7 @@ fn merge_value(mut value: Map<String, Value>, setup: Value) -> Map<String, Value
     value
 }
 
-fn write(value: Map<String, Value>) -> Result<(), String> {
+pub(super) fn write(value: Map<String, Value>) -> Result<(), String> {
     let path = receipt_path()?;
     write_path(&path, value)
 }
