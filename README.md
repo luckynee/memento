@@ -4,7 +4,7 @@ Long coding sessions can replay a huge transcript when you switch models, while 
 
 memento-pool gives coding agents a compact working-state digest, a bounded recent verbatim tail, and `memory_search` over a filtered copy of the session. It works across OpenCode, Claude Code, Codex, and agy.
 
-[Watch the memento-pool preview](docs/media/memento-pool-preview.mp4)
+https://github.com/user-attachments/assets/7d5a1290-f95e-4998-a06a-b6ffac6d8676
 
 ## How it works
 
