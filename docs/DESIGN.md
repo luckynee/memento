@@ -149,7 +149,7 @@ Search:
 | Section | Share | Selection | Rendered order |
 | --- | --- | --- | --- |
 | Header (harness, project, lineage) | fixed | | |
-| Constraints and decisions | 27% | newest entries that fit | chronological |
+| Constraints and decisions | 27% | newest entries that fit; bare acknowledgements are omitted and entries longer than 300 chars are truncated deterministically | chronological |
 | Current tasks | 8% | latest `task` entry only | as stored |
 | Recent notes | 8% | newest `assistant_note` entries that fit | chronological |
 | Past user requests (already handled) | 32% | newest entries that fit; an entry longer than 600 chars is truncated deterministically | chronological |

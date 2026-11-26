@@ -161,6 +161,39 @@ fn truncate_request(text: &str) -> String {
     format!("{prefix}...[truncated {} chars]", count - 600)
 }
 
+fn is_bare_acknowledgement(text: &str) -> bool {
+    let mut words = text
+        .split(|character: char| !character.is_alphanumeric() && character != '\'')
+        .filter(|word| !word.is_empty())
+        .peekable();
+    words.peek().is_some()
+        && words.all(|word| {
+            matches!(
+                word.to_ascii_lowercase().as_str(),
+                "yes"
+                    | "yeah"
+                    | "yep"
+                    | "yup"
+                    | "ye"
+                    | "ok"
+                    | "okay"
+                    | "sure"
+                    | "proceed"
+                    | "go"
+                    | "ahead"
+            )
+        })
+}
+
+fn decision_excerpt(text: &str) -> String {
+    let count = text.chars().count();
+    if count <= 300 {
+        return text.to_owned();
+    }
+    let prefix: String = text.chars().take(300).collect();
+    format!("{prefix}...[truncated {} chars]", count - 300)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CommandStatus {
     Code(i64),
@@ -305,9 +338,12 @@ pub fn render_digest_with_profile(
                 Kind::Decision => "decision",
                 _ => return None,
             };
+            if is_bare_acknowledgement(&entry.text) {
+                return None;
+            }
             Some(list_item(&format!(
                 "[{label}] {}",
-                neutralize_wrappers(&entry.text)
+                neutralize_wrappers(&decision_excerpt(&entry.text))
             )))
         }),
         budget,
@@ -623,6 +659,54 @@ mod tests {
         assert!(digest.text.contains("...[truncated 4 chars]"));
         assert!(!digest.text.contains(&"x".repeat(3000)));
         assert!(digest.text.chars().count() <= 5000);
+    }
+
+    #[test]
+    fn decision_section_omits_only_bare_acknowledgements() {
+        let data = input(vec![
+            segment(Kind::Decision, "yes", 0, "Yes"),
+            segment(Kind::Decision, "proceed", 1, "OK, go ahead!"),
+            segment(Kind::Constraint, "ye", 2, "ye"),
+            segment(
+                Kind::Decision,
+                "backup",
+                3,
+                "ok proceed we can concern backup later",
+            ),
+            segment(
+                Kind::Constraint,
+                "bound",
+                4,
+                "ye only update the bound area",
+            ),
+            segment(Kind::Decision, "negative", 5, "no"),
+        ]);
+        let digest = render_digest(&data, 4000);
+        assert!(digest.text.contains(
+            "## Constraints and decisions\n- [decision] ok proceed we can concern backup later\n- [constraint] ye only update the bound area\n- [decision] no\n"
+        ));
+        assert!(!digest.text.contains("[decision] Yes"));
+        assert!(!digest.text.contains("[decision] OK, go ahead!"));
+        assert!(!digest.text.contains("[constraint] ye\n"));
+        assert_eq!(digest.segments, 3);
+    }
+
+    #[test]
+    fn decision_excerpts_are_bounded_unicode_safe_and_stable() {
+        let long_text = format!("{}\nLater detail", "é".repeat(300));
+        let mut data = input(vec![
+            segment(Kind::Decision, "long", 0, &long_text),
+            segment(Kind::Constraint, "short", 1, "keep this constraint"),
+        ]);
+        let digest = render_digest(&data, 4000);
+        assert!(digest.text.contains(&format!(
+            "- [decision] {}...[truncated 13 chars]\n- [constraint] keep this constraint\n",
+            "é".repeat(300)
+        )));
+        assert!(!digest.text.contains("Later detail"));
+        assert_eq!(digest.segments, 2);
+        data.segments.reverse();
+        assert_eq!(digest, render_digest(&data, 4000));
     }
 
     #[test]
