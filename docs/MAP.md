@@ -16,7 +16,7 @@
 | `crates/mementod/src/embed.rs` | `Embedder` trait, `FastEmbedder` (spawn_blocking), `FakeEmbedder` for tests |
 | `crates/mementod/tests/` | Live Qdrant tests, gated on `MEMENTO_TEST_QDRANT_URL` |
 | `crates/memento-cli/src/main.rs` | `memento` CLI, HTTP client of mementod |
-| `adapters/opencode/src/` | OpenCode V2 plugin: `client`, `transcript`, `ingest`, `session-ownership` (`normalizeDirectory` for `global` projects), `jev` (`stripScaffolding`, `forEachJevItem` 4-way concurrency for ingest and search), `switch` (pure rewrite), `switch-controller`, `subagent-memory` (opt-in parent digest for child sessions), `activity-log`, `tools`, `commands`, `options`, `index` |
+| `adapters/opencode/src/` | OpenCode V2 plugin: `client`, `transcript`, `ingest`, `session-ownership` (`normalizeDirectory` for `global` projects), `jev` (`stripScaffolding`, `forEachJevItem` 4-way concurrency for ingest and search), `switch` (pure rewrite), `switch-controller`, `subagent-memory` (parent digest for child sessions), `project-primer` (opt-in recent project digest), `activity-log`, `tools`, `commands`, `options`, `index` |
 | `adapters/opencode/test/` | `bun test` suites (mocked daemon and Jev) |
 | `deploy/` | `Dockerfile` (rust:1.95-trixie builder, debian:trixie-slim + libc++1 runtime, model baked by `mementod warmup`), `compose.yaml` (source builds) |
 
@@ -30,7 +30,7 @@
 | `crates/memento-cli/assets/compose.yaml` | Managed daemon template; image `ghcr.io/luckynee/mementod:<version>` or `MEMENTO_DAEMON_IMAGE`; project `memento` |
 | `crates/memento-cli/src/daemon.rs` | `memento daemon up/down/status/logs/pull`; `managed_refresh_steps` |
 | `crates/memento-cli/src/receipt.rs` | `${XDG_CONFIG_HOME:-~/.config}/memento/install.json`: installer fields `method`, `bin_dir`, `version` plus `setup`; setup records only the latest scope and project |
-| `crates/memento-cli/src/setup.rs::reapply_saved_setup` | Non-interactive re-apply of saved setup (hidden `reapply-setup`), used by `update --refresh`; OpenCode `--resume` and `--compaction` choices persist as `opencode_resume` and `opencode_compaction` |
+| `crates/memento-cli/src/setup.rs::reapply_saved_setup` | Non-interactive re-apply of saved setup (hidden `reapply-setup`), used by `update --refresh`; OpenCode `--resume`, `--primer` and `--compaction` choices persist as `opencode_resume`, `opencode_primer` and `opencode_compaction` |
 | `crates/memento-cli/src/update.rs` | `memento update`: GitHub release lookup (`MEMENTO_RELEASES_API`, `MEMENTO_DOWNLOAD_BASE` test overrides), sha256, guarded binary swap, refresh |
 | `crates/memento-cli/src/doctor.rs` | `memento doctor [--offline]` and hidden `write-receipt` (called by `install.sh`); reports registered harness settings from installed configs; fails when a readable OpenCode config has no `plugins` entry for the plugin directory (config check only, not proof the running service loaded it) |
 | `crates/memento-cli/src/setup.rs::opencode_config_path` | OpenCode config resolution shared by setup and doctor; setup edits JSONC through `jsonc-parser` CST (comments kept), manages `--resume on|off` and `--compaction memento|native`, and fails on unparsable configs; `remove` plans registry-driven integration removal and preserves shared assets conservatively |
@@ -43,6 +43,7 @@
 - `memento/registered/<sessionID>`: session registered with the daemon
 - `memento/switch/<sessionID>`: `{ origin, lastModel, snapshots: { "<provider>/<id>": { cutMessageID, digest, compacted?, lastMessageID?, lastRequestAt? } } }`
 - `memento/subagent/<childID>`: frozen framed parent digest for a child session (`subagentMemory: "digest"`); `""` when the parent digest had zero segments
+- `memento/primer/<sessionID>`: frozen project primer or `""` when none qualifies
 
 ## Cross-harness pieces
 

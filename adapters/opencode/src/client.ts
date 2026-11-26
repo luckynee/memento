@@ -21,6 +21,8 @@ export type SessionRecord = SessionIdentity & {
     require_parent?: boolean;
     retention?: string;
     title?: string;
+    last_active_at?: string | null;
+    deleted_at?: string | null;
 };
 
 export type LineageResponse = {
@@ -118,9 +120,18 @@ export class MementoClient {
         return this.request("/v1/sessions", "PUT", payload);
     }
 
-    listSessions(harness: string, project: string): Promise<{ sessions: SessionIdentity[] }> {
-        const query = new URLSearchParams({ harness, project });
-        return this.request(`/v1/sessions?${query}`, "GET");
+    listSessions(harness: string | undefined, project: string, signal?: AbortSignal): Promise<{ sessions: SessionRecord[] }> {
+        const query = new URLSearchParams();
+        if (harness !== undefined) {
+            query.set("harness", harness);
+        }
+        query.set("project", project);
+        return this.request(`/v1/sessions?${query}`, "GET", undefined, signal);
+    }
+
+    stats(identity: SessionIdentity, signal?: AbortSignal): Promise<{ by_kind: Record<string, number> }> {
+        const query = new URLSearchParams(identity);
+        return this.request(`/v1/stats?${query}`, "GET", undefined, signal);
     }
 
     releaseSession(payload: SessionIdentity & { reason?: string }): Promise<{ released: boolean; removed: { harness: string; session: string }[] }> {

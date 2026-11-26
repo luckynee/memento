@@ -134,6 +134,116 @@ test("context claims inject once, preserve existing continuation, and coexist wi
     }
 });
 
+test("project primer skips subagents and claimed continuations", async () => {
+    const values = new Map<string, unknown>();
+    const hooks = new Map<string, (event: any) => Promise<void>>();
+    const requests: string[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url, init) => {
+        const path = new URL(String(url)).pathname;
+        requests.push(`${init?.method ?? "GET"} ${path}`);
+        if (path === "/v1/continuations/claim") {
+            return Response.json({ claimed: true, parent_harness: "codex", parent: "parent", digest: "memory" });
+        }
+        return Response.json({});
+    }) as typeof fetch;
+    const registration = () => ({ async dispose() {} });
+    const ctx = {
+        options: { jev: false, reconcile: false, activityLog: false, projectPrimer: true, subagentMemory: "off" },
+        location: { project: { id: "p" } },
+        storage: {
+            async get(key: string) { return values.get(key); },
+            async set(key: string, value: unknown) { values.set(key, value); },
+        },
+        session: {
+            async get({ sessionID }: { sessionID: string }) { return { projectID: "p", ...(sessionID === "child" ? { parentID: "parent" } : {}), time: { created: 0 } }; },
+            async context() { return [{ type: "user" }]; },
+            async hook(name: string, handler: (event: any) => Promise<void>) { hooks.set(name, handler); return registration(); },
+            instructions: { entry: { async put() {} } },
+        },
+        tool: { async transform() { return registration(); } },
+        command: { async transform() { return registration(); } },
+        event: {
+            async *subscribe(input: { signal: AbortSignal }) {
+                if (!input.signal.aborted) {
+                    await new Promise<void>((resolve) => input.signal.addEventListener("abort", () => resolve(), { once: true }));
+                }
+            },
+        },
+    } as unknown as Plugin.Context;
+    let cleanup: void | (() => void | Promise<void>) = undefined;
+    try {
+        cleanup = await plugin.setup(ctx);
+        for (const sessionID of ["child", "primary"]) {
+            await hooks.get("context")!({ sessionID, model: { providerID: "p", id: "m" }, system: [], messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }] });
+        }
+        expect(values.has("memento/primer/child")).toBe(false);
+        expect(values.get("memento/primer/primary")).toBe("");
+        expect(requests).not.toContain("GET /v1/sessions");
+    } finally {
+        await cleanup?.();
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test("project primer survives a model-selected event before the first context", async () => {
+    const values = new Map<string, unknown>();
+    const hooks = new Map<string, (event: any) => Promise<void>>();
+    let selected!: () => void;
+    const selection = new Promise<void>((resolve) => { selected = resolve; });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (url, init) => {
+        const path = new URL(String(url)).pathname;
+        if (path === "/v1/continuations/claim") { return Response.json({ claimed: false }); }
+        if (path === "/v1/sessions" && init?.method === "GET") {
+            return Response.json({ sessions: [{ harness: "codex", project: "p", session: "previous", last_active_at: new Date().toISOString() }] });
+        }
+        if (path === "/v1/stats") { return Response.json({ by_kind: { decision: 1 } }); }
+        if (path === "/v1/digest") { return Response.json({ text: "earlier fact", segments: 1 }); }
+        return Response.json({});
+    }) as typeof fetch;
+    const registration = () => ({ async dispose() {} });
+    const ctx = {
+        options: { jev: false, reconcile: false, activityLog: false, projectPrimer: true },
+        location: { project: { id: "p" } },
+        storage: {
+            async get(key: string) { return values.get(key); },
+            async set(key: string, value: unknown) { values.set(key, value); if (key === "memento/switch/new") { selected(); } },
+        },
+        session: {
+            async get() { return { projectID: "p", time: { created: 0 } }; },
+            async context() { return [{ type: "user" }]; },
+            async hook(name: string, handler: (event: any) => Promise<void>) { hooks.set(name, handler); return registration(); },
+            instructions: { entry: { async put() {} } },
+        },
+        tool: { async transform() { return registration(); } },
+        command: { async transform() { return registration(); } },
+        event: {
+            async *subscribe(input: { signal: AbortSignal }) {
+                yield { type: "session.model.selected", data: { sessionID: "new", model: { providerID: "p", id: "m" } } };
+                if (!input.signal.aborted) {
+                    await new Promise<void>((resolve) => input.signal.addEventListener("abort", () => resolve(), { once: true }));
+                }
+            },
+        },
+    } as unknown as Plugin.Context;
+    let cleanup: void | (() => void | Promise<void>) = undefined;
+    try {
+        cleanup = await plugin.setup(ctx);
+        await selection;
+        const event = () => ({ sessionID: "new", model: { providerID: "p", id: "m" }, system: [], messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }] });
+        const first = event();
+        const second = event();
+        await hooks.get("context")!(first);
+        await hooks.get("context")!(second);
+        expect(first.messages[0].content[0].text).toContain("earlier fact");
+        expect(second.messages[0].content[0].text).toBe(first.messages[0].content[0].text);
+    } finally {
+        await cleanup?.();
+        globalThis.fetch = originalFetch;
+    }
+});
+
 test("step ended dispatches ingestion and cleanup stops the subscription", async () => {
     const values = new Map<string, unknown>();
     const ingests: unknown[] = [];

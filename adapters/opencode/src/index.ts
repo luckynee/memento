@@ -5,6 +5,7 @@ import { createContinueCommand, createHandoffCommand } from "./commands";
 import { createIngestor } from "./ingest";
 import { createJevGate, type DecisionsFn } from "./jev";
 import { resolveOptions } from "./options";
+import { createProjectPrimerController } from "./project-primer";
 import { createResumeController } from "./resume";
 import { createSessionOwnership, normalizeDirectory } from "./session-ownership";
 import { createSubagentMemoryController } from "./subagent-memory";
@@ -149,6 +150,16 @@ export default Plugin.define({
             storage: ctx.storage,
             log,
         });
+        const projectPrimer = createProjectPrimerController({
+            options: options.projectPrimer,
+            project,
+            client,
+            storage: ctx.storage,
+            loadSession: (sessionID) => ctx.session.get({ sessionID }),
+            loadContext: (sessionID) => ctx.session.context({ sessionID }),
+            activity,
+            log,
+        });
         const tool = createMemorySearchTool({ client, decide, jevModel: options.jevModel, harness: options.harness, project });
         const command = createContinueCommand({
             client,
@@ -209,7 +220,9 @@ export default Plugin.define({
             if (continuation) {
                 injectContinuation(event, continuation);
             }
+            await projectPrimer.onContext(event);
             await switchController.onContext(event);
+            await projectPrimer.onContext(event);
             if (continuation) {
                 injectContinuation(event, continuation);
             }
@@ -233,6 +246,7 @@ export default Plugin.define({
         const releaseSession = async (sessionID: string, reason?: string, harness = options.harness) => {
             try {
                 await subagentMemory.forget(sessionID);
+                await projectPrimer.forget(sessionID);
                 await switchController.forget(sessionID);
                 await resumeController.forget(sessionID);
                 await ingestor.forget(sessionID);
@@ -240,7 +254,7 @@ export default Plugin.define({
             } catch (error) {
                 log(`Failed to release session ${sessionID}`, error);
             } finally {
-                for (const key of ["ingest", "registered", "fork", "claimed", "parent", "switch", "subagent", "resume"]) {
+                for (const key of ["ingest", "registered", "fork", "claimed", "parent", "switch", "subagent", "resume", "primer"]) {
                     try {
                         await ctx.storage.remove(`memento/${key}/${sessionID}`);
                     } catch (error) {

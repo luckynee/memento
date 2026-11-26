@@ -2,7 +2,7 @@ import { appendFile, mkdir, rename, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
-export type ActivityEvent = "register" | "ingest" | "compaction" | "switch" | "subagent_digest" | "resume" | "continuation" | "error";
+export type ActivityEvent = "register" | "ingest" | "compaction" | "switch" | "subagent_digest" | "resume" | "continuation" | "primer" | "error";
 export type ActivityLevel = "info" | "warn" | "error";
 export type ActivityDetail = Record<string, number | string | boolean>;
 export type ActivityEntry = {

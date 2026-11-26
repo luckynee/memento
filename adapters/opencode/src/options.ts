@@ -15,6 +15,13 @@ export function resolveOptions(raw: Record<string, unknown>) {
         idleMinutes: positiveNumber(resumeInput.idleMinutes, 60),
         minContextTokens: positiveNumber(resumeInput.minContextTokens, 100000),
     } : undefined;
+    const primerInput = raw.projectPrimer === true ? {} : raw.projectPrimer && typeof raw.projectPrimer === "object" && !Array.isArray(raw.projectPrimer)
+        ? raw.projectPrimer as Record<string, unknown> : undefined;
+    const projectPrimer = primerInput ? {
+        budget: typeof primerInput.budget === "number" && Number.isSafeInteger(primerInput.budget) && primerInput.budget > 0
+            ? primerInput.budget : 4000,
+        maxAgeHours: positiveNumber(primerInput.maxAgeHours, 72),
+    } : undefined;
     const url = typeof raw.url === "string" && raw.url.trim()
         ? raw.url
         : typeof process.env.MEMENTO_URL === "string" && process.env.MEMENTO_URL.trim()
@@ -44,6 +51,7 @@ export function resolveOptions(raw: Record<string, unknown>) {
         digestBudget,
         compaction: raw.compaction === "memento" ? "memento" as const : "native" as const,
         resume,
+        projectPrimer,
         subagentMemory: isSubagentMemoryMode(raw.subagentMemory) ? raw.subagentMemory : "digest" as const,
         subagentMemoryAgents,
         subagentDigestBudget,

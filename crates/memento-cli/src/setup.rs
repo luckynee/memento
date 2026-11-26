@@ -54,6 +54,8 @@ pub struct SetupArgs {
     subagent_memory: Vec<String>,
     #[arg(long, value_enum, help = "OpenCode resume compaction")]
     resume: Option<Toggle>,
+    #[arg(long, value_enum, help = "OpenCode project memory primer")]
+    primer: Option<Toggle>,
     #[arg(long, value_enum, help = "OpenCode compaction mode")]
     compaction: Option<Compaction>,
     #[arg(long, conflicts_with = "no_skills", help = "Install bundled skills")]
@@ -196,6 +198,7 @@ struct Context {
     embedded_plugin: bool,
     url: String,
     resume: Option<Toggle>,
+    primer: Option<Toggle>,
     compaction: Option<Compaction>,
 }
 
@@ -468,6 +471,28 @@ fn opencode_merge(path: &Path, context: &Context, memory: bool) -> Result<String
                 }
             }
         }
+        if let Some(primer) = context.primer {
+            match primer {
+                Toggle::On => {
+                    let is_object = options
+                        .to_serde_value()
+                        .and_then(|value| value.get("projectPrimer").cloned())
+                        .is_some_and(|value| value.is_object());
+                    if !is_object {
+                        if let Some(property) = options.get("projectPrimer") {
+                            property.set_value(true.into());
+                        } else {
+                            options.append("projectPrimer", true.into());
+                        }
+                    }
+                }
+                Toggle::Off => {
+                    if let Some(property) = options.get("projectPrimer") {
+                        property.remove();
+                    }
+                }
+            }
+        }
         if let Some(compaction) = context.compaction {
             match compaction {
                 Compaction::Memento => {
@@ -493,6 +518,9 @@ fn opencode_merge(path: &Path, context: &Context, memory: bool) -> Result<String
         ];
         if context.resume == Some(Toggle::On) {
             options.push(("resume".into(), true.into()));
+        }
+        if context.primer == Some(Toggle::On) {
+            options.push(("projectPrimer".into(), true.into()));
         }
         if context.compaction == Some(Compaction::Memento) {
             options.push(("compaction".into(), "memento".into()));
@@ -734,9 +762,11 @@ pub fn run(cli: &Cli, args: &SetupArgs) -> Result<(), CliError> {
         return Err(CliError::other("select at least one harness"));
     }
     let has_opencode = selected.iter().any(|entry| entry.id == "opencode");
-    if !has_opencode && (args.resume.is_some() || args.compaction.is_some()) {
+    if !has_opencode
+        && (args.resume.is_some() || args.primer.is_some() || args.compaction.is_some())
+    {
         return Err(CliError::other(
-            "--resume and --compaction require the opencode harness",
+            "--resume, --primer and --compaction require the opencode harness",
         ));
     }
     for id in overrides.keys() {
@@ -864,9 +894,13 @@ pub fn run(cli: &Cli, args: &SetupArgs) -> Result<(), CliError> {
         embedded_plugin,
         url: cli.url.clone(),
         resume: args.resume,
+        primer: args.primer,
         compaction: args.compaction,
     };
-    if has_opencode && interactive && (context.resume.is_none() || context.compaction.is_none()) {
+    if has_opencode
+        && interactive
+        && (context.resume.is_none() || context.primer.is_none() || context.compaction.is_none())
+    {
         let path = opencode_config_path(scope == Scope::User, &context.project, &context.xdg);
         let current = if path.exists() {
             let planned = opencode_merge(&path, &context, true)?;
@@ -883,6 +917,20 @@ pub fn run(cli: &Cli, args: &SetupArgs) -> Result<(), CliError> {
                 if Confirm::new()
                     .with_prompt("Compact long OpenCode sessions after 60 min idle (resume)?")
                     .default(resolved.resume.is_some())
+                    .interact()
+                    .map_err(prompt_error)?
+                {
+                    Toggle::On
+                } else {
+                    Toggle::Off
+                },
+            );
+        }
+        if context.primer.is_none() {
+            context.primer = Some(
+                if Confirm::new()
+                    .with_prompt("Include recent project memory in new OpenCode sessions (primer)?")
+                    .default(resolved.primer)
                     .interact()
                     .map_err(prompt_error)?
                 {
@@ -924,9 +972,10 @@ pub fn run(cli: &Cli, args: &SetupArgs) -> Result<(), CliError> {
             })?;
             let settings = crate::doctor::resolve_opencode_options(&options);
             println!(
-                "  OpenCode: resume={} compaction={}",
+                "  OpenCode: resume={} compaction={} primer={}",
                 settings.resume_summary(),
-                settings.compaction
+                settings.compaction,
+                if settings.primer { "on" } else { "off" }
             );
         }
         let change = (entry.plan)(entry, &context, memory)?;
@@ -1020,6 +1069,7 @@ pub fn run(cli: &Cli, args: &SetupArgs) -> Result<(), CliError> {
         },
         "subagent_memory": modes,
         "opencode_resume": opencode_options.as_ref().map(|options| options.resume.is_some()),
+        "opencode_primer": opencode_options.as_ref().map(|options| options.primer),
         "opencode_compaction": opencode_options.as_ref().map(|options| options.compaction),
         "skills": install_skills,
         "managed_daemon": managed_daemon,
@@ -1078,7 +1128,7 @@ pub(super) fn reapply_saved_setup(cli: &Cli) -> Result<(), CliError> {
         .get("opencode_plugin")
         .and_then(Value::as_str)
         .map(PathBuf::from);
-    let (resume, compaction) = saved_opencode_options(&Value::Object(setup.clone()));
+    let (resume, primer, compaction) = saved_opencode_options(&Value::Object(setup.clone()));
     let args = SetupArgs {
         harness: harnesses,
         scope: Some(scope),
@@ -1088,6 +1138,7 @@ pub(super) fn reapply_saved_setup(cli: &Cli) -> Result<(), CliError> {
             .map(PathBuf::from),
         subagent_memory,
         resume,
+        primer,
         compaction,
         skills,
         no_skills: !skills,
@@ -1100,7 +1151,7 @@ pub(super) fn reapply_saved_setup(cli: &Cli) -> Result<(), CliError> {
     run(cli, &args)
 }
 
-fn saved_opencode_options(setup: &Value) -> (Option<Toggle>, Option<Compaction>) {
+fn saved_opencode_options(setup: &Value) -> (Option<Toggle>, Option<Toggle>, Option<Compaction>) {
     let resume = setup
         .get("opencode_resume")
         .and_then(Value::as_bool)
@@ -1110,7 +1161,11 @@ fn saved_opencode_options(setup: &Value) -> (Option<Toggle>, Option<Compaction>)
         Some("native") => Some(Compaction::Native),
         _ => None,
     };
-    (resume, compaction)
+    let primer = setup
+        .get("opencode_primer")
+        .and_then(Value::as_bool)
+        .map(|enabled| if enabled { Toggle::On } else { Toggle::Off });
+    (resume, primer, compaction)
 }
 
 fn remove_opencode(entry: &HarnessEntry, context: &Context) -> Result<Option<String>, CliError> {
@@ -1288,7 +1343,12 @@ fn update_removed_receipt(
         }
     }
     if selected.iter().any(|entry| entry.id == "opencode") {
-        for key in ["opencode_plugin", "opencode_resume", "opencode_compaction"] {
+        for key in [
+            "opencode_plugin",
+            "opencode_resume",
+            "opencode_primer",
+            "opencode_compaction",
+        ] {
             setup.remove(key);
         }
     }
@@ -1430,6 +1490,7 @@ pub fn remove(args: &RemoveArgs) -> Result<(), CliError> {
         embedded_plugin: false,
         url: String::new(),
         resume: None,
+        primer: None,
         compaction: None,
     };
     let saved_matches = setup
@@ -1647,6 +1708,7 @@ mod tests {
             embedded_plugin: false,
             url: "http://127.0.0.1:7377".into(),
             resume: None,
+            primer: None,
             compaction: None,
         }
     }
@@ -1813,6 +1875,8 @@ mod tests {
             "project",
             "--subagent-memory",
             "opencode=on,codex=off",
+            "--primer",
+            "on",
             "--no-skills",
             "--yes",
             "--dry-run",
@@ -1822,6 +1886,8 @@ mod tests {
             panic!("expected setup")
         };
         assert_eq!(args.harness, ["opencode", "codex"]);
+        assert_eq!(args.primer, Some(Toggle::On));
+        assert!(Cli::try_parse_from(["memento", "setup", "--primer", "invalid"]).is_err());
         assert!(!parse_memory(&args.subagent_memory).unwrap()["codex"]);
         assert!(parse_memory(&["agy=off".into()]).is_err());
         assert!(parse_memory(&["codex=invalid".into()]).is_err());
@@ -1875,12 +1941,12 @@ mod tests {
     }
 
     #[test]
-    fn opencode_resume_and_compaction_merge_and_saved_options() {
+    fn opencode_resume_primer_and_compaction_merge_and_saved_options() {
         let temp = tempfile::tempdir().unwrap();
         let mut context = context(temp.path());
         fs::create_dir_all(&context.project).unwrap();
         let path = context.project.join("opencode.jsonc");
-        fs::write(&path, r#"{"plugins":[{"package":"/old/adapters/opencode","options":{"resume":{"idleMinutes":12},"compaction":"memento","other":42}}]}"#).unwrap();
+        fs::write(&path, r#"{"plugins":[{"package":"/old/adapters/opencode","options":{"resume":{"idleMinutes":12},"projectPrimer":{"budget":1234},"compaction":"memento","other":42}}]}"#).unwrap();
         let preserved: Value =
             serde_json::from_str(&opencode_merge(&path, &context, true).unwrap()).unwrap();
         assert_eq!(
@@ -1889,6 +1955,7 @@ mod tests {
         );
         assert_eq!(preserved["plugins"][0]["options"]["compaction"], "memento");
         context.resume = Some(Toggle::On);
+        context.primer = Some(Toggle::On);
         context.compaction = Some(Compaction::Memento);
         let enabled: Value =
             serde_json::from_str(&opencode_merge(&path, &context, true).unwrap()).unwrap();
@@ -1896,12 +1963,22 @@ mod tests {
             enabled["plugins"][0]["options"]["resume"]["idleMinutes"],
             12
         );
+        assert_eq!(
+            enabled["plugins"][0]["options"]["projectPrimer"]["budget"],
+            1234
+        );
         fs::write(&path, enabled.to_string()).unwrap();
         context.resume = Some(Toggle::Off);
+        context.primer = Some(Toggle::Off);
         context.compaction = Some(Compaction::Native);
         let disabled: Value =
             serde_json::from_str(&opencode_merge(&path, &context, true).unwrap()).unwrap();
         assert!(disabled["plugins"][0]["options"].get("resume").is_none());
+        assert!(
+            disabled["plugins"][0]["options"]
+                .get("projectPrimer")
+                .is_none()
+        );
         assert!(
             disabled["plugins"][0]["options"]
                 .get("compaction")
@@ -1910,23 +1987,33 @@ mod tests {
         assert_eq!(disabled["plugins"][0]["options"]["other"], 42);
         fs::write(&path, disabled.to_string()).unwrap();
         context.resume = Some(Toggle::On);
+        context.primer = Some(Toggle::On);
         context.compaction = Some(Compaction::Memento);
         let enabled: Value =
             serde_json::from_str(&opencode_merge(&path, &context, true).unwrap()).unwrap();
         assert_eq!(enabled["plugins"][0]["options"]["resume"], true);
+        assert_eq!(enabled["plugins"][0]["options"]["projectPrimer"], true);
         assert_eq!(enabled["plugins"][0]["options"]["compaction"], "memento");
         assert_eq!(
             saved_opencode_options(
-                &json!({"opencode_resume":true,"opencode_compaction":"memento"})
+                &json!({"opencode_resume":true,"opencode_primer":true,"opencode_compaction":"memento"})
             ),
-            (Some(Toggle::On), Some(Compaction::Memento))
+            (
+                Some(Toggle::On),
+                Some(Toggle::On),
+                Some(Compaction::Memento)
+            )
         );
-        assert_eq!(saved_opencode_options(&json!({})), (None, None));
+        assert_eq!(saved_opencode_options(&json!({})), (None, None, None));
         assert_eq!(
             saved_opencode_options(
-                &json!({"opencode_resume":false,"opencode_compaction":"native"})
+                &json!({"opencode_resume":false,"opencode_primer":false,"opencode_compaction":"native"})
             ),
-            (Some(Toggle::Off), Some(Compaction::Native))
+            (
+                Some(Toggle::Off),
+                Some(Toggle::Off),
+                Some(Compaction::Native)
+            )
         );
     }
 

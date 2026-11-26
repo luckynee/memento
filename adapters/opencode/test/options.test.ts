@@ -50,3 +50,16 @@ test("resume options are opt-in and validate positive finite thresholds", () => 
             .toEqual({ idleMinutes: 60, minContextTokens: 100000 });
     }
 });
+
+test("project primer is opt-in and validates thresholds", () => {
+    for (const projectPrimer of [undefined, false, null, [], "true", 1]) {
+        expect(resolveOptions({ projectPrimer }).projectPrimer).toBeUndefined();
+    }
+    expect(resolveOptions({ projectPrimer: true }).projectPrimer).toEqual({ budget: 4000, maxAgeHours: 72 });
+    expect(resolveOptions({ projectPrimer: { budget: 500, maxAgeHours: 1.5 } }).projectPrimer)
+        .toEqual({ budget: 500, maxAgeHours: 1.5 });
+    for (const value of [0, -1, Infinity, NaN, "5", null]) {
+        expect(resolveOptions({ projectPrimer: { budget: value, maxAgeHours: value } }).projectPrimer)
+            .toEqual({ budget: 4000, maxAgeHours: 72 });
+    }
+});

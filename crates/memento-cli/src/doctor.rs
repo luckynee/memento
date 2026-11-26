@@ -172,6 +172,7 @@ fn plugin_registered(config: &Path, directory: &Path) -> Result<bool, String> {
 
 pub(super) struct OpenCodeOptions {
     pub(super) resume: Option<(f64, f64)>,
+    pub(super) primer: bool,
     pub(super) compaction: &'static str,
     subagent_memory: &'static str,
 }
@@ -215,6 +216,9 @@ pub(super) fn resolve_opencode_options(options: &Value) -> OpenCodeOptions {
     };
     OpenCodeOptions {
         resume,
+        primer: options
+            .get("projectPrimer")
+            .is_some_and(|value| value == &Value::Bool(true) || value.is_object()),
         compaction,
         subagent_memory,
     }
@@ -263,10 +267,11 @@ pub(super) fn opencode_settings(
 ) -> Result<Vec<String>, String> {
     let options = resolve_opencode_options(&read_opencode_options(path, plugin)?);
     let mut lines = vec![format!(
-        "ok: settings opencode subagent_memory={} resume={} compaction={}",
+        "ok: settings opencode subagent_memory={} resume={} compaction={} primer={}",
         options.subagent_memory,
         options.resume_summary(),
-        options.compaction
+        options.compaction,
+        if options.primer { "on" } else { "off" }
     )];
     if options.resume.is_none() {
         lines.push("warn: opencode resume off (enable: memento setup --resume on)".into());
@@ -481,7 +486,7 @@ fn check_registration(setup: &Value) -> bool {
 }
 
 fn activity_lines(path: &Path, now: i64) -> Vec<String> {
-    let mut counts = [0_u64; 5];
+    let mut counts = [0_u64; 6];
     let mut latest = None::<i64>;
     let mut errors = Vec::<(i64, String)>::new();
     let mut found = false;
@@ -531,6 +536,7 @@ fn activity_lines(path: &Path, now: i64) -> Vec<String> {
                     "switch",
                     "subagent_digest",
                     "resume",
+                    "primer",
                 ]
                 .iter()
                 .position(|event| entry.get("event").and_then(Value::as_str) == Some(event))
@@ -574,8 +580,8 @@ fn activity_lines(path: &Path, now: i64) -> Vec<String> {
         .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
         .unwrap_or_else(|| "unknown".into());
     let mut lines = vec![format!(
-        "ok: opencode activity last={last} events(7d): ingest={} compaction={} switch={} subagent_digest={} resume={}",
-        counts[0], counts[1], counts[2], counts[3], counts[4]
+        "ok: opencode activity last={last} events(7d): ingest={} compaction={} switch={} subagent_digest={} resume={} primer={}",
+        counts[0], counts[1], counts[2], counts[3], counts[4], counts[5]
     )];
     if !errors.is_empty() {
         errors.sort_by_key(|entry| std::cmp::Reverse(entry.0));
@@ -718,18 +724,19 @@ mod tests {
         fs::write(
             &path,
             format!(
-                "{{\"ts\":{},\"level\":\"warn\",\"event\":\"compaction\",\"message\":\"first\"}}\n{{\"ts\":{},\"level\":\"error\",\"event\":\"resume\",\"message\":\"{}\"}}\n{{\"ts\":{},\"level\":\"info\",\"event\":\"subagent_digest\"}}\n",
+                "{{\"ts\":{},\"level\":\"warn\",\"event\":\"compaction\",\"message\":\"first\"}}\n{{\"ts\":{},\"level\":\"error\",\"event\":\"resume\",\"message\":\"{}\"}}\n{{\"ts\":{},\"level\":\"info\",\"event\":\"subagent_digest\"}}\n{{\"ts\":{},\"level\":\"info\",\"event\":\"primer\"}}\n",
                 now - 1000,
                 now - 500,
                 "x".repeat(400),
-                now - 100
+                now - 100,
+                now - 200
             ),
         )
         .unwrap();
         let lines = activity_lines(&path, now);
         assert_eq!(
             lines[0],
-            "ok: opencode activity last=2023-11-14T22:13:19Z events(7d): ingest=1 compaction=1 switch=0 subagent_digest=1 resume=1"
+            "ok: opencode activity last=2023-11-14T22:13:19Z events(7d): ingest=1 compaction=1 switch=0 subagent_digest=1 resume=1 primer=1"
         );
         assert_eq!(
             lines[1],
@@ -812,21 +819,22 @@ mod tests {
         let lines = opencode_settings(&path, None, Some(&plugin)).unwrap();
         assert_eq!(
             lines[0],
-            "ok: settings opencode subagent_memory=digest resume=off compaction=native"
+            "ok: settings opencode subagent_memory=digest resume=off compaction=native primer=off"
         );
         assert!(lines[1].contains("resume off"));
-        write(serde_json::json!({"resume":true}));
+        write(serde_json::json!({"resume":true,"projectPrimer":true}));
         let lines = opencode_settings(&path, None, Some(&plugin)).unwrap();
         assert!(lines[0].contains("resume=on(idle=60m,min_tokens=100000)"));
+        assert!(lines[0].contains("primer=on"));
         assert!(lines[1].contains("native compaction"));
         write(
-            serde_json::json!({"resume":{"idleMinutes":12.5,"minContextTokens":0},"compaction":"memento","subagentMemory":"filtered"}),
+            serde_json::json!({"resume":{"idleMinutes":12.5,"minContextTokens":0},"compaction":"memento","subagentMemory":"filtered","projectPrimer":{"budget":2000}}),
         );
         let lines = opencode_settings(&path, None, Some(&plugin)).unwrap();
         assert_eq!(
             lines,
             [
-                "ok: settings opencode subagent_memory=filtered resume=on(idle=12.5m,min_tokens=100000) compaction=memento"
+                "ok: settings opencode subagent_memory=filtered resume=on(idle=12.5m,min_tokens=100000) compaction=memento primer=on"
             ]
         );
         write(serde_json::json!({"resume":[],"compaction":"other","subagentMemory":"invalid"}));
