@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -439,6 +440,23 @@ fn check_registration(setup: &Value) -> bool {
     match plugin_registered(&config, &directory) {
         Ok(true) => {
             println!("ok: OpenCode plugin registered in {}", config.display());
+            let state_home = std::env::var_os("XDG_STATE_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
+                });
+            match state_home {
+                Some(state_home) => {
+                    for line in activity_lines(
+                        &state_home.join("memento/opencode-activity.jsonl"),
+                        chrono::Utc::now().timestamp_millis(),
+                    ) {
+                        println!("{line}");
+                    }
+                }
+                None => println!("warn: opencode activity unavailable: HOME is not set"),
+            }
             true
         }
         Err(error) => {
@@ -460,6 +478,124 @@ fn check_registration(setup: &Value) -> bool {
             false
         }
     }
+}
+
+fn activity_lines(path: &Path, now: i64) -> Vec<String> {
+    let mut counts = [0_u64; 5];
+    let mut latest = None::<i64>;
+    let mut errors = Vec::<(i64, String)>::new();
+    let mut found = false;
+    let mut read_error = false;
+    let rotated = path.with_file_name(format!(
+        "{}.1",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    for candidate in [&rotated, path] {
+        let file = match fs::File::open(candidate) {
+            Ok(file) => {
+                found = true;
+                file
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                read_error = true;
+                continue;
+            }
+        };
+        for line in BufReader::new(file).lines() {
+            let line = match line {
+                Ok(line) => line,
+                Err(_) => {
+                    read_error = true;
+                    break;
+                }
+            };
+            let Ok(entry) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let Some(ts) = entry
+                .get("ts")
+                .and_then(Value::as_i64)
+                .filter(|ts| *ts <= now)
+            else {
+                continue;
+            };
+            if chrono::DateTime::from_timestamp_millis(ts).is_none() {
+                continue;
+            }
+            latest = Some(latest.map_or(ts, |previous| previous.max(ts)));
+            if now.saturating_sub(ts) <= 7 * 24 * 60 * 60 * 1000
+                && let Some(index) = [
+                    "ingest",
+                    "compaction",
+                    "switch",
+                    "subagent_digest",
+                    "resume",
+                ]
+                .iter()
+                .position(|event| entry.get("event").and_then(Value::as_str) == Some(event))
+            {
+                counts[index] += 1;
+            }
+            if now.saturating_sub(ts) <= 24 * 60 * 60 * 1000
+                && matches!(
+                    entry.get("level").and_then(Value::as_str),
+                    Some("warn" | "error")
+                )
+            {
+                let message = entry
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .or_else(|| entry.get("event").and_then(Value::as_str))
+                    .unwrap_or("unknown")
+                    .chars()
+                    .map(|character| {
+                        if character.is_control() {
+                            ' '
+                        } else {
+                            character
+                        }
+                    })
+                    .take(300)
+                    .collect();
+                errors.push((ts, message));
+            }
+        }
+    }
+    if !found {
+        return vec![if read_error {
+            "warn: opencode activity unavailable: cannot read activity file".into()
+        } else {
+            "warn: no opencode plugin activity recorded yet (plugin may predate activity logging or has not run)".into()
+        }];
+    }
+    let last = latest
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| "unknown".into());
+    let mut lines = vec![format!(
+        "ok: opencode activity last={last} events(7d): ingest={} compaction={} switch={} subagent_digest={} resume={}",
+        counts[0], counts[1], counts[2], counts[3], counts[4]
+    )];
+    if !errors.is_empty() {
+        errors.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+        let messages = errors
+            .iter()
+            .take(3)
+            .map(|(_, message)| message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        lines.push(format!(
+            "warn: opencode activity errors(24h)={} latest: {messages}",
+            errors.len()
+        ));
+    }
+    if read_error {
+        lines.push(
+            "warn: opencode activity partially unavailable: cannot read activity file".into(),
+        );
+    }
+    lines
 }
 
 pub(super) fn run(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
@@ -563,6 +699,59 @@ pub(super) fn run(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activity_counts_rotated_and_current_files_and_tolerates_malformed_lines() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("activity.jsonl");
+        let now = 1_700_000_000_000_i64;
+        let day = 24 * 60 * 60 * 1000;
+        fs::write(
+            path.with_file_name("activity.jsonl.1"),
+            format!(
+                "{{\"ts\":{},\"level\":\"info\",\"event\":\"ingest\"}}\ninvalid\n{{\"ts\":{},\"level\":\"info\",\"event\":\"switch\"}}\n",
+                now - 2 * day,
+                now - 8 * day
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &path,
+            format!(
+                "{{\"ts\":{},\"level\":\"warn\",\"event\":\"compaction\",\"message\":\"first\"}}\n{{\"ts\":{},\"level\":\"error\",\"event\":\"resume\",\"message\":\"{}\"}}\n{{\"ts\":{},\"level\":\"info\",\"event\":\"subagent_digest\"}}\n",
+                now - 1000,
+                now - 500,
+                "x".repeat(400),
+                now - 100
+            ),
+        )
+        .unwrap();
+        let lines = activity_lines(&path, now);
+        assert_eq!(
+            lines[0],
+            "ok: opencode activity last=2023-11-14T22:13:19Z events(7d): ingest=1 compaction=1 switch=0 subagent_digest=1 resume=1"
+        );
+        assert_eq!(
+            lines[1],
+            format!(
+                "warn: opencode activity errors(24h)=2 latest: {}; first",
+                "x".repeat(300)
+            )
+        );
+    }
+
+    #[test]
+    fn activity_missing_and_unreadable_files_only_warn() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("activity.jsonl");
+        assert!(activity_lines(&path, 0)[0].starts_with("warn: no opencode plugin activity"));
+        fs::create_dir(&path).unwrap();
+        assert!(
+            activity_lines(&path, 0)
+                .iter()
+                .any(|line| line.starts_with("warn:"))
+        );
+    }
 
     #[test]
     fn registration_checks_jsonc_objects_strings_and_missing_entries() {
