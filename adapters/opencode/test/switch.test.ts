@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { Message } from "@opencode/ai";
 import { createSwitchController } from "../src/switch-controller";
+import type { ActivityEntry } from "../src/activity-log";
 import { buildDigestText, cloneMessage, dedupeCompactionSummary, renderCurrentTurn, renderRecentTail, rewriteForSwitch, sameModel, type ConversationMessage, type ModelRef, type SystemText } from "../src/switch";
 
 const a = { providerID: "p", id: "a" };
@@ -304,6 +305,7 @@ describe("switch controller", () => {
         const values = new Map<string, unknown>();
         const order: string[] = [];
         const errors: unknown[] = [];
+        const activity: ActivityEntry[] = [];
         let context: unknown[] = [];
         let calls = 0;
         let currentTime = 1000;
@@ -313,11 +315,12 @@ describe("switch controller", () => {
             async flush() { order.push("flush"); if (failFlush) { throw new Error("flush failed"); } await Promise.resolve(); order.push("flushed"); },
             async loadContext() { return context; },
             harness: "opencode", project: "p", digestBudget: 100, compactionMode, tailUserTurns: 3, tailCharBudget: 40000,
+            activity: { record(entry) { activity.push(entry); } },
             now: () => currentTime,
             log(_message, error) { errors.push(error); },
         });
         const event = (model: ModelRef) => ({ sessionID: "s", model, system: system(), messages: history() });
-        return { controller, values, errors, order, event, calls: () => calls, setContext(messages: unknown[]) { context = messages; }, setTime(value: number) { currentTime = value; } };
+        return { controller, values, errors, activity, order, event, calls: () => calls, setContext(messages: unknown[]) { context = messages; }, setTime(value: number) { currentTime = value; } };
     }
 
     test("detects a fork's first switch from the most recent assistant model", async () => {
@@ -388,6 +391,11 @@ describe("switch controller", () => {
         expect(JSON.stringify({ system: second.system, messages: second.messages })).toBe(JSON.stringify({ system: first.system, messages: first.messages }));
         expect(fake.calls()).toBe(2);
         expect(fake.order).toEqual(["flush", "flushed", "digest", "flush", "flushed", "digest"]);
+        expect(fake.activity).toEqual([
+            { level: "info", event: "switch", session: "s", project: "p", detail: { fromModel: "p/a", toModel: "p/b", reused: false, chars: 8 } },
+            { level: "info", event: "switch", session: "s", project: "p", detail: { fromModel: "p/b", toModel: "p/c", reused: false, chars: 8 } },
+            { level: "info", event: "switch", session: "s", project: "p", detail: { fromModel: "p/c", toModel: "p/b", reused: true, chars: 8 } },
+        ]);
     });
 
     test("refreshes the returning model after uncached messages exceed the budget", async () => {
@@ -511,6 +519,7 @@ describe("switch controller", () => {
         };
         await fake.controller.onCompaction(event);
         expect(event.result).toEqual({ summary: buildDigestText("digest-1"), metadata: { source: "memento" } });
+        expect(fake.activity).toEqual([{ level: "info", event: "compaction", session: "s", project: "p", detail: { mode: "switch", model: "p/b", chars: event.result!.summary.length, durationMs: expect.any(Number) } }]);
         expect(fake.order).toEqual(["flush", "flushed", "digest"]);
         expect(fake.values.get("memento/switch/s")).toEqual({
             origin: a,
@@ -551,6 +560,7 @@ describe("switch controller", () => {
             summary: buildDigestText("digest-1") + "\n\n" + renderRecentTail(event.messages.slice(0, 8), options) + "\n\n" + renderCurrentTurn(event.messages.slice(8), options.tailCharBudget),
             metadata: { source: "memento", mode: "same-model" },
         });
+        expect(fake.activity).toEqual([{ level: "info", event: "compaction", session: "s", project: "p", detail: { mode: "same-model", model: "p/a", chars: event.result!.summary.length, durationMs: expect.any(Number) } }]);
         expect(event.result!.summary).toContain("[user] three");
         expect(event.result!.summary).toContain("[user] four");
         expect(event.result!.summary).toContain("[assistant] after");

@@ -13,6 +13,15 @@ export type ActivityEntry = {
     message?: string;
     detail?: ActivityDetail;
 };
+export type ActivitySink = { record(entry: ActivityEntry): void };
+
+export function recordActivity(activity: ActivitySink | undefined, entry: ActivityEntry): void {
+    try {
+        activity?.record(entry);
+    } catch {
+        return;
+    }
+}
 export type ActivityLogOptions = {
     path?: string;
     maxBytes?: number;

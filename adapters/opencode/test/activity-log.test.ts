@@ -2,7 +2,11 @@ import { expect, test } from "bun:test";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createActivityLog } from "../src/activity-log";
+import { createActivityLog, recordActivity } from "../src/activity-log";
+
+test("ignores a throwing activity sink", () => {
+    expect(() => recordActivity({ record() { throw new Error("sink failed"); } }, { level: "info", event: "register" })).not.toThrow();
+});
 
 test("serializes activity records and filters detail fields", async () => {
     const directory = await mkdtemp(join(tmpdir(), "memento-activity-"));

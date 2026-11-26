@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import type { ActivityEntry } from "../src/activity-log";
 import { createSubagentMemoryController, frameParentMemory, injectParentMemory } from "../src/subagent-memory";
 import type { SubagentMemoryMode } from "../src/options";
 import type { ConversationMessage, SystemText } from "../src/switch";
@@ -19,12 +20,14 @@ function fixture(mode: SubagentMemoryMode = "digest") {
     const values = new Map<string, unknown>();
     const calls: string[] = [];
     const logs: string[] = [];
+    const activity: ActivityEntry[] = [];
     const deps = {
         mode,
         agents: {} as Record<string, SubagentMemoryMode>,
         budget: 456,
         harness: "opencode",
         project: "project",
+        activity: { record(entry: ActivityEntry) { activity.push(entry); } },
         async lookup(sessionID: string): Promise<{ owned: boolean; parentID?: string; agent?: string }> {
             calls.push(`lookup:${sessionID}`);
             return sessionID === "root" ? { owned: true } : { owned: true, parentID: "middle" };
@@ -48,7 +51,7 @@ function fixture(mode: SubagentMemoryMode = "digest") {
         },
         log(message: string) { logs.push(message); },
     };
-    return { values, calls, logs, deps };
+    return { values, calls, logs, activity, deps };
 }
 
 test("frames parent memory deterministically and neutralizes nested memento tags", () => {
@@ -72,7 +75,7 @@ test("injects into the first user message without mutating the original, or fall
 });
 
 test("flushes root before digest and reuses stored text across requests and controllers", async () => {
-    const { deps, calls, values } = fixture();
+    const { deps, calls, values, activity } = fixture();
     const controller = createSubagentMemoryController(deps);
     const first = event();
     const second = event();
@@ -82,6 +85,7 @@ test("flushes root before digest and reuses stored text across requests and cont
     expect(first.messages[1].content[0]).toEqual({ type: "text", text });
     expect(second.messages[1].content[0]).toEqual({ type: "text", text });
     expect(values.get("memento/subagent/child")).toBe(text);
+    expect(activity).toEqual([{ level: "info", event: "subagent_digest", session: "child", project: "project", detail: { chars: text.length, segments: 1 } }]);
     expect(calls).toEqual([
         "lookup:child",
         "root:child",

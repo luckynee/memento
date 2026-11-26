@@ -8,6 +8,10 @@ test("validates adapter options and model references", () => {
     expect(resolveOptions({ enabled: false, reconcile: false, harness: "custom", tailCharBudget: 99, jevCooldownMs: 0 })).toMatchObject({ enabled: false, reconcile: false, harness: "custom", tailCharBudget: 99, jevCooldownMs: 0 });
     expect(resolveOptions({})).toMatchObject({ subagentMemory: "digest", subagentMemoryAgents: {}, subagentDigestBudget: 12000 });
     expect(resolveOptions({}).compaction).toBe("native");
+    expect(resolveOptions({}).activityLog).toBe(true);
+    expect(resolveOptions({ activityLog: false }).activityLog).toBe(false);
+    expect(resolveOptions({ activityLog: "/custom/activity.jsonl" }).activityLog).toBe("/custom/activity.jsonl");
+    expect(resolveOptions({ activityLog: "" }).activityLog).toBe(true);
     expect(resolveOptions({ compaction: "native" }).compaction).toBe("native");
     expect(resolveOptions({ compaction: "memento" }).compaction).toBe("memento");
     for (const value of ["other", true, null]) {

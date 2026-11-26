@@ -1,3 +1,4 @@
+import { recordActivity, type ActivitySink } from "./activity-log";
 import { partSize } from "./switch";
 
 type ResumeOptions = { idleMinutes: number; minContextTokens: number };
@@ -53,6 +54,8 @@ export function createResumeController(deps: {
     loadContext(sessionID: string): Promise<unknown[]>;
     compact(input: { sessionID: string; delivery: "steer" }): Promise<unknown>;
     now(): number;
+    project?: string;
+    activity?: ActivitySink;
     log(message: string, error?: unknown): void;
 }) {
     const states = new Map<string, ResumeState>();
@@ -101,6 +104,7 @@ export function createResumeController(deps: {
             }
             deps.log(`resume compaction for ${sessionID} after ${Math.floor((now - lastRequestAt!) / 60000)} min idle, ~${Math.round(estimatedTokens)} tokens`);
             await deps.compact({ sessionID, delivery: "steer" });
+            recordActivity(deps.activity, { level: "info", event: "resume", session: sessionID, project: deps.project, detail: { idleMinutes: (now - lastRequestAt!) / 60000, estimatedTokens } });
             await persist(sessionID, now);
         });
     }

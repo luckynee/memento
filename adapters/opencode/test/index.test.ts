@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import type { Plugin } from "@opencode/plugin";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { frameContinuation } from "../src/commands";
@@ -365,6 +365,8 @@ test("deletion waits for ingest, releases without ownership lookup, and clears s
 });
 
 test("release failure is logged and later events are processed", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "memento-plugin-activity-"));
+    const activityPath = join(directory, "activity.jsonl");
     const values = new Map<string, unknown>([["memento/registered/deleted", true]]);
     const requests: string[] = [];
     const warnings: unknown[][] = [];
@@ -382,7 +384,7 @@ test("release failure is logged and later events are processed", async () => {
     }) as typeof fetch;
     const registration = () => ({ async dispose() {} });
     const ctx = {
-        options: { jev: false, reconcile: false },
+        options: { jev: false, reconcile: false, activityLog: activityPath },
         location: { project: { id: "p" } },
         storage: {
             async get(key: string) { return values.get(key); },
@@ -421,10 +423,17 @@ test("release failure is logged and later events are processed", async () => {
         expect(values.has("memento/switch/next")).toBe(true);
         expect(requests).toContain("/v1/sessions/release");
         expect(requests.filter((path) => path === "/v1/sessions/release")).toHaveLength(1);
+        await cleanup?.();
+        cleanup = undefined;
+        const entries = readFileSync(activityPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+        expect(entries).toContainEqual({ ts: expect.any(Number), level: "warn", event: "error", project: "p", message: "Failed to release session deleted", detail: { errorClass: "MementoError" } });
+        expect(JSON.stringify(entries)).not.toContain("release failed");
+        expect(entries).toContainEqual({ ts: expect.any(Number), level: "info", event: "register", project: "p", session: "next" });
     } finally {
         await cleanup?.();
         globalThis.fetch = originalFetch;
         console.warn = originalWarn;
+        rmSync(directory, { recursive: true, force: true });
     }
 });
 

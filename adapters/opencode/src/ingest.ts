@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { recordActivity, type ActivitySink } from "./activity-log";
 import { MementoError, type MementoClient } from "./client";
 import { frameContinuation } from "./commands";
 import { classifyKind, forEachJevItem, type DecisionsFn, type JevModel } from "./jev";
@@ -20,6 +21,7 @@ export function createIngestor(deps: {
     jevModel: JevModel;
     harness: string;
     project: string;
+    activity?: ActivitySink;
     log(message: string, error?: unknown): void;
 }) {
     const chains = new Map<string, Promise<void>>();
@@ -99,6 +101,7 @@ export function createIngestor(deps: {
                 }
                 await deps.storage.set(claimKey, true);
                 state.retryClaim = false;
+                recordActivity(deps.activity, { level: "info", event: "continuation", session: sessionID, project: deps.project, detail: { claimed: claim.claimed } });
             } catch (error) {
                 if (await deps.storage.get(claimKey) !== true) {
                     state.retryClaim = true;
@@ -128,6 +131,7 @@ export function createIngestor(deps: {
                 await deps.storage.remove(`memento/fork/${sessionID}`);
                 await deps.client.putSession(identity);
             }
+            recordActivity(deps.activity, { level: "info", event: "register", session: sessionID, project: deps.project });
             if (state.retryClaim) {
                 await deps.storage.set(`memento/registered/${sessionID}`, "claim-pending");
                 state.registered = true;
@@ -187,7 +191,9 @@ export function createIngestor(deps: {
         if (items.length) {
             const hash = createHash("sha256").update(JSON.stringify(items)).digest("hex");
             if (selection.nextCursor !== cursor || sessionState(sessionID).lastIngestHash !== hash) {
-                await deps.client.ingest({ harness: deps.harness, project: deps.project, session: sessionID, items });
+                const started = Date.now();
+                const result = await deps.client.ingest({ harness: deps.harness, project: deps.project, session: sessionID, items });
+                recordActivity(deps.activity, { level: "info", event: "ingest", session: sessionID, project: deps.project, detail: { items: items.length, segments: result.segments, skipped: result.skipped, durationMs: Date.now() - started } });
                 sessionState(sessionID).lastIngestHash = hash;
             }
         }

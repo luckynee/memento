@@ -1,3 +1,4 @@
+import { recordActivity, type ActivitySink } from "./activity-log";
 import type { MementoClient } from "./client";
 import { buildDigestText, cloneMessage, dedupeCompactionSummary, isUserTurn, partSize, renderCurrentTurn, renderRecentTail, rewriteForSwitch, sameModel, type ConversationMessage, type ModelRef, type SwitchSnapshot, type SwitchState, type SystemText } from "./switch";
 
@@ -15,6 +16,7 @@ export function createSwitchController(deps: {
     loadContext(sessionID: string): Promise<unknown[]>;
     harness: string;
     project: string;
+    activity?: ActivitySink;
     digestBudget: number;
     compactionMode?: "native" | "memento";
     tailUserTurns: number;
@@ -108,6 +110,7 @@ export function createSwitchController(deps: {
 
     function onCompaction(event: { sessionID: string; model: ModelRef; messages?: ReadonlyArray<ConversationMessage>; result?: { summary: string; metadata?: Record<string, unknown> } }): Promise<void> {
         return serialize(event.sessionID, async () => {
+            const started = Date.now();
             const state = await load(event.sessionID);
             let context: unknown[];
             try {
@@ -157,6 +160,7 @@ export function createSwitchController(deps: {
                 snapshots: { ...state.snapshots, [modelKey]: { cutMessageID: null, digest: digest.text, compacted: true } },
             });
             event.result = { summary, metadata: sameModelCompaction ? { source: "memento", mode: "same-model" } : { source: "memento" } };
+            recordActivity(deps.activity, { level: "info", event: "compaction", session: event.sessionID, project: deps.project, detail: { mode: sameModelCompaction ? "same-model" : "switch", model: modelKey, chars: summary.length, durationMs: Date.now() - started } });
         });
     }
 
@@ -185,7 +189,10 @@ export function createSwitchController(deps: {
             let snapshot = state.snapshots[modelKey];
             const now = (deps.now ?? Date.now)();
             const switched = !sameModel(event.model, state.lastModel!);
+            const previousModel = state.lastModel!;
+            let reused = true;
             if (!snapshot || (switched && snapshotIsStale(snapshot, event.messages, now))) {
+                reused = false;
                 try {
                     await deps.flush(event.sessionID);
                 } catch (error) {
@@ -219,6 +226,9 @@ export function createSwitchController(deps: {
                 snapshots: { ...state.snapshots, [modelKey]: snapshot },
             };
             await persist(event.sessionID, state);
+            if (switched) {
+                recordActivity(deps.activity, { level: "info", event: "switch", session: event.sessionID, project: deps.project, detail: { fromModel: `${previousModel.providerID}/${previousModel.id}`, toModel: modelKey, reused, chars: snapshot.digest.length } });
+            }
             if (snapshot.compacted) {
                 return;
             }

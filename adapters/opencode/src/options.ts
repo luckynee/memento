@@ -48,6 +48,7 @@ export function resolveOptions(raw: Record<string, unknown>) {
         subagentMemoryAgents,
         subagentDigestBudget,
         enabled: typeof raw.enabled === "boolean" ? raw.enabled : true,
+        activityLog: raw.activityLog === false ? false : typeof raw.activityLog === "string" && raw.activityLog.trim() ? raw.activityLog : true,
         reconcile: typeof raw.reconcile === "boolean" ? raw.reconcile : true,
         jev: typeof raw.jev === "boolean" ? raw.jev : true,
         jevCooldownMs,

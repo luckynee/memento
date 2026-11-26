@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import type { ActivityEntry } from "../src/activity-log";
 import { createResumeController, shouldCompactOnResume } from "../src/resume";
 
 test("resume decision requires a previous request, strictly more idle time, and enough context", () => {
@@ -15,6 +16,7 @@ test("resume controller persists context activity and compacts once on a qualify
     const values = new Map<string, unknown>();
     const calls: unknown[] = [];
     const logs: string[] = [];
+    const activity: ActivityEntry[] = [];
     let now = 1000;
     let loads = 0;
     const controller = createResumeController({
@@ -34,6 +36,8 @@ test("resume controller persists context activity and compacts once on a qualify
         },
         async compact(input) { calls.push(input); },
         now: () => now,
+        project: "p",
+        activity: { record(entry) { activity.push(entry); } },
         log: (message) => logs.push(message),
     });
     await controller.onPrompt("new");
@@ -48,6 +52,7 @@ test("resume controller persists context activity and compacts once on a qualify
     expect(calls).toEqual([{ sessionID: "s", delivery: "steer" }]);
     expect(values.get("memento/resume/s")).toEqual({ lastRequestAt: 31001 });
     expect(logs).toEqual(["resume compaction for s after 0 min idle, ~10 tokens"]);
+    expect(activity).toEqual([{ level: "info", event: "resume", session: "s", project: "p", detail: { idleMinutes: 30001 / 60000, estimatedTokens: 10 } }]);
     await controller.forget("s");
     now += 30001;
     await controller.onPrompt("s");

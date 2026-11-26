@@ -1,4 +1,5 @@
 import { Plugin } from "@opencode/plugin";
+import { createActivityLog, recordActivity } from "./activity-log";
 import { MementoClient } from "./client";
 import { createContinueCommand, createHandoffCommand } from "./commands";
 import { createIngestor } from "./ingest";
@@ -70,7 +71,20 @@ export default Plugin.define({
         }
         const project = projectKey(ctx.location.project, ctx.location.directory);
         const client = new MementoClient({ url: options.url, token: options.token });
-        const log = (message: string, error?: unknown) => console.warn("[memento] " + message, error ?? "");
+        const activity = options.activityLog === false ? undefined : createActivityLog(typeof options.activityLog === "string" ? { path: options.activityLog } : {});
+        const log = (message: string, error?: unknown) => {
+            console.warn("[memento] " + message, error ?? "");
+            if (error === undefined && message.startsWith("resume compaction")) {
+                return;
+            }
+            let errorClass: string | undefined;
+            try {
+                errorClass = error instanceof Error ? error.constructor.name : undefined;
+            } catch {
+                errorClass = undefined;
+            }
+            recordActivity(activity, { level: "warn", event: "error", project, message, ...(errorClass ? { detail: { errorClass } } : {}) });
+        };
         const ownsSession = createSessionOwnership({
             getSession: (sessionID) => ctx.session.get({ sessionID }),
             projectID: ctx.location.project.id,
@@ -94,6 +108,7 @@ export default Plugin.define({
             jevModel: options.jevModel,
             harness: options.harness,
             project,
+            activity,
             log,
         });
         const switchController = createSwitchController({
@@ -103,6 +118,7 @@ export default Plugin.define({
             loadContext: (sessionID) => ctx.session.context({ sessionID }).catch(() => []),
             harness: options.harness,
             project,
+            activity,
             digestBudget: options.digestBudget,
             compactionMode: options.compaction,
             tailUserTurns: options.tailUserTurns,
@@ -115,6 +131,8 @@ export default Plugin.define({
             loadContext: (sessionID) => ctx.session.context({ sessionID }),
             compact: (input) => ctx.session.compact(input),
             now: Date.now,
+            project,
+            activity,
             log,
         });
         const subagentMemory = createSubagentMemoryController({
@@ -123,6 +141,7 @@ export default Plugin.define({
             budget: options.subagentDigestBudget,
             harness: options.harness,
             project,
+            activity,
             lookup: ownsSession.lookup,
             root: ownsSession.root,
             flush: ingestor.flush,
@@ -314,6 +333,7 @@ export default Plugin.define({
             await eventLoop;
             await reconciliation;
             await ingestor.idle();
+            await activity?.flush();
             const results = await disposals;
             const failure = results.find((result) => result.status === "rejected");
             if (failure?.status === "rejected") {

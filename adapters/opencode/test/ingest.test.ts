@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import type { ActivityEntry } from "../src/activity-log";
 import { MementoError } from "../src/client";
 import { createIngestor } from "../src/ingest";
 import { DEFAULT_JEV_MODEL, type DecisionsFn } from "../src/jev";
@@ -13,6 +14,7 @@ function setup(decide?: DecisionsFn, loadSession?: (sessionID: string) => Promis
     const puts: unknown[] = [];
     const ingests: { session: string; items: IngestItem[] }[] = [];
     const errors: unknown[] = [];
+    const activity: ActivityEntry[] = [];
     let fail = false;
     const ingestor = createIngestor({
         client: {
@@ -35,12 +37,25 @@ function setup(decide?: DecisionsFn, loadSession?: (sessionID: string) => Promis
         jevModel: DEFAULT_JEV_MODEL,
         harness: "opencode",
         project: "p",
+        activity: { record(entry) { activity.push(entry); } },
         log(_message, error) { errors.push(error); },
     });
-    return { ingestor, values, contexts, puts, ingests, errors, setFail(value: boolean) { fail = value; } };
+    return { ingestor, values, contexts, puts, ingests, errors, activity, setFail(value: boolean) { fail = value; } };
 }
 
 describe("incremental ingestion", () => {
+    test("records successful claims, registrations, and sent batches without message content", async () => {
+        const fake = setup();
+        fake.contexts.set("s", [user("private-text")]);
+        await fake.ingestor.flush("s");
+        await fake.ingestor.flush("s");
+        expect(fake.activity).toEqual([
+            { level: "info", event: "continuation", session: "s", project: "p", detail: { claimed: false } },
+            { level: "info", event: "register", session: "s", project: "p" },
+            { level: "info", event: "ingest", session: "s", project: "p", detail: { items: 1, segments: 1, skipped: 0, durationMs: expect.any(Number) } },
+        ]);
+        expect(JSON.stringify(fake.activity)).not.toContain("private-text");
+    });
     test("links forks and ingests only messages created at or after the fork", async () => {
         const fake = setup(undefined, async () => ({ fork: { sessionID: "parent" }, time: { created: 100 } }));
         fake.contexts.set("fork", [

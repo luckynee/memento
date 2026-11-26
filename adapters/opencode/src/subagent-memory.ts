@@ -1,3 +1,4 @@
+import { recordActivity, type ActivitySink } from "./activity-log";
 import type { MementoClient } from "./client";
 import type { SubagentMemoryMode } from "./options";
 import { cloneMessage, neutralizeMementoTags, type ConversationMessage, type SystemText } from "./switch";
@@ -36,6 +37,7 @@ export function createSubagentMemoryController(deps: {
     budget: number;
     harness: string;
     project: string;
+    activity?: ActivitySink;
     lookup(sessionID: string): Promise<{ owned: boolean; parentID?: string; agent?: string } | undefined>;
     root(sessionID: string): Promise<string | undefined>;
     flush(sessionID: string): Promise<void>;
@@ -68,6 +70,9 @@ export function createSubagentMemoryController(deps: {
         });
         const text = digest.segments > 0 && digest.text.trim() ? frameParentMemory(digest.text) : "";
         await deps.storage.set(key, text);
+        if (text) {
+            recordActivity(deps.activity, { level: "info", event: "subagent_digest", session: sessionID, project: deps.project, detail: { chars: text.length, segments: digest.segments } });
+        }
         return text || undefined;
     }
 
