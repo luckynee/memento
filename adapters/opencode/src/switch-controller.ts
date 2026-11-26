@@ -1,5 +1,5 @@
 import type { MementoClient } from "./client";
-import { buildDigestText, cloneMessage, partSize, renderCurrentTurn, renderRecentTail, rewriteForSwitch, sameModel, type ConversationMessage, type ModelRef, type SwitchSnapshot, type SwitchState, type SystemText } from "./switch";
+import { buildDigestText, cloneMessage, dedupeCompactionSummary, isUserTurn, partSize, renderCurrentTurn, renderRecentTail, rewriteForSwitch, sameModel, type ConversationMessage, type ModelRef, type SwitchSnapshot, type SwitchState, type SystemText } from "./switch";
 
 const SNAPSHOT_CACHE_TTL_MS = 300000;
 
@@ -109,7 +109,13 @@ export function createSwitchController(deps: {
     function onCompaction(event: { sessionID: string; model: ModelRef; messages?: ReadonlyArray<ConversationMessage>; result?: { summary: string; metadata?: Record<string, unknown> } }): Promise<void> {
         return serialize(event.sessionID, async () => {
             const state = await load(event.sessionID);
-            const previous = state.lastModel ?? historyModel(await deps.loadContext(event.sessionID)) ?? state.origin;
+            let context: unknown[];
+            try {
+                context = await deps.loadContext(event.sessionID);
+            } catch (error) {
+                throw new Error(`Failed to load context for compaction of session ${event.sessionID}`, { cause: error });
+            }
+            const previous = state.lastModel ?? historyModel(context) ?? state.origin;
             const sameModelCompaction = !previous || sameModel(event.model, previous);
             if (sameModelCompaction && deps.compactionMode !== "memento") {
                 return;
@@ -124,9 +130,15 @@ export function createSwitchController(deps: {
             const model = { providerID: event.model.providerID, id: event.model.id };
             const modelKey = `${model.providerID}/${model.id}`;
             const messages = event.messages ?? [];
+            const syntheticIDs = new Set(context.flatMap((message) => {
+                if (!message || typeof message !== "object" || !("id" in message) || typeof message.id !== "string" || !("type" in message) || message.type !== "synthetic") {
+                    return [];
+                }
+                return [message.id];
+            }));
             let lastUserIndex = messages.length;
             for (let index = messages.length - 1; index >= 0; index--) {
-                if (messages[index].role === "user") {
+                if (isUserTurn(messages[index], syntheticIDs)) {
                     lastUserIndex = index;
                     break;
                 }
@@ -134,8 +146,9 @@ export function createSwitchController(deps: {
             const tail = sameModelCompaction ? renderRecentTail(messages.slice(0, lastUserIndex), {
                 tailUserTurns: deps.tailUserTurns,
                 tailCharBudget: deps.tailCharBudget,
+                syntheticIDs,
             }) : "";
-            const currentTurn = sameModelCompaction ? renderCurrentTurn(messages.slice(lastUserIndex), deps.tailCharBudget) : "";
+            const currentTurn = sameModelCompaction ? renderCurrentTurn(messages.slice(lastUserIndex), deps.tailCharBudget, syntheticIDs) : "";
             const summary = [buildDigestText(digest.text), tail, currentTurn].filter(Boolean).join("\n\n");
             await persist(event.sessionID, {
                 ...state,
@@ -149,6 +162,7 @@ export function createSwitchController(deps: {
 
     function onContext<M extends ConversationMessage, S extends SystemText>(event: { sessionID: string; model: ModelRef; system: S[]; messages: M[] }): Promise<void> {
         return serialize(event.sessionID, async () => {
+            event.messages = dedupeCompactionSummary(event.messages);
             let state = await load(event.sessionID);
             let changed = false;
             if (!state.origin) {
