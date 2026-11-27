@@ -1,7 +1,7 @@
 {
     "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
     "name": "memento",
-    "version": "0.3.2",
+    "version": "0.3.3",
     "description": "Cross-session and cross-harness memory for Codex.",
     "author": {
         "name": "luckynee"
