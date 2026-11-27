@@ -70,6 +70,8 @@ pub struct SetupArgs {
     yes: bool,
     #[arg(long, help = "Start the managed daemon if it is unavailable")]
     start_daemon: bool,
+    #[arg(long, value_enum, help = "Daemon mode")]
+    daemon: Option<crate::daemon::DaemonMode>,
     #[arg(long, help = "Preview without writing")]
     dry_run: bool,
 }
@@ -657,23 +659,28 @@ pub fn run(cli: &Cli, args: &SetupArgs) -> Result<(), CliError> {
     let daemon_healthy = request
         .send()
         .is_ok_and(|response| response.status().is_success());
-    let mut managed_daemon = false;
-    if !daemon_healthy {
-        let should_start = args.start_daemon
-            || (interactive
-                && crate::daemon::docker_available()
-                && Confirm::new()
-                    .with_prompt("Daemon is unavailable. Start the managed daemon?")
-                    .default(true)
-                    .interact()
-                    .map_err(prompt_error)?);
-        if should_start {
-            crate::daemon::start(cli)?;
-            managed_daemon = true;
-        } else {
-            eprintln!("warning: daemon health check failed; start it with memento daemon up");
-        }
-    }
+    let previous_setup = crate::daemon::current_setup()?;
+    let previous_mode = crate::daemon::saved_mode(Some(&previous_setup))?;
+    let daemon_mode = match args.daemon {
+        Some(mode) => mode,
+        None if interactive => match Select::new()
+            .with_prompt("Daemon mode")
+            .items(["Docker (default)", "Native (Docker-free)", "External"])
+            .default(match previous_mode {
+                crate::daemon::DaemonMode::Docker => 0,
+                crate::daemon::DaemonMode::Native => 1,
+                crate::daemon::DaemonMode::External => 0,
+            })
+            .interact()
+            .map_err(prompt_error)?
+        {
+            0 => crate::daemon::DaemonMode::Docker,
+            1 => crate::daemon::DaemonMode::Native,
+            _ => crate::daemon::DaemonMode::External,
+        },
+        None if previous_setup.is_empty() => crate::daemon::DaemonMode::Docker,
+        None => previous_mode,
+    };
     let scope = match args.scope {
         Some(scope) => scope,
         None if interactive => {
@@ -1020,6 +1027,36 @@ pub fn run(cli: &Cli, args: &SetupArgs) -> Result<(), CliError> {
         println!("Setup cancelled.");
         return Ok(());
     }
+    if daemon_mode == crate::daemon::DaemonMode::Native {
+        if previous_mode == crate::daemon::DaemonMode::Docker {
+            eprintln!(
+                "Existing Docker memories are not migrated automatically; see mementod migrate."
+            );
+            if daemon_healthy {
+                return Err(CliError::other(
+                    "stop the Docker daemon before starting native mode at the same URL",
+                ));
+            }
+        }
+        crate::daemon::warmup()?;
+        if !daemon_healthy || previous_mode != crate::daemon::DaemonMode::Native {
+            crate::daemon::start_native(cli, crate::daemon::idle_seconds(&previous_setup))?;
+        }
+    } else if !daemon_healthy && daemon_mode == crate::daemon::DaemonMode::Docker {
+        let should_start = args.start_daemon
+            || (interactive
+                && crate::daemon::docker_available()
+                && Confirm::new()
+                    .with_prompt("Daemon is unavailable. Start the managed daemon?")
+                    .default(true)
+                    .interact()
+                    .map_err(prompt_error)?);
+        if should_start {
+            crate::daemon::start(cli)?;
+        } else {
+            eprintln!("warning: daemon health check failed; start it with memento daemon up");
+        }
+    }
     if context.embedded_plugin {
         crate::assets::write_opencode_plugin(&crate::assets::data_dir()?)?;
     }
@@ -1072,7 +1109,9 @@ pub fn run(cli: &Cli, args: &SetupArgs) -> Result<(), CliError> {
         "opencode_primer": opencode_options.as_ref().map(|options| options.primer),
         "opencode_compaction": opencode_options.as_ref().map(|options| options.compaction),
         "skills": install_skills,
-        "managed_daemon": managed_daemon,
+        "managed_daemon": daemon_mode == crate::daemon::DaemonMode::Docker,
+        "daemon_mode": daemon_mode.name(),
+        "native_idle_exit_secs": crate::daemon::idle_seconds(&previous_setup),
         "opencode_plugin": if context.embedded_plugin {
             None
         } else {
@@ -1146,6 +1185,7 @@ pub(super) fn reapply_saved_setup(cli: &Cli) -> Result<(), CliError> {
         opencode_plugin: plugin,
         yes: true,
         start_daemon: false,
+        daemon: Some(crate::daemon::saved_mode(Some(setup))?),
         dry_run: false,
     };
     run(cli, &args)
@@ -1681,6 +1721,7 @@ pub fn remove(args: &RemoveArgs) -> Result<(), CliError> {
         remove_directory(&embedded)?;
         if let Some(setup) = receipt.get_mut("setup").and_then(Value::as_object_mut) {
             setup.insert("managed_daemon".into(), Value::Bool(false));
+            setup.insert("daemon_mode".into(), Value::String("external".into()));
             crate::receipt::write(receipt).map_err(|error| {
                 CliError::other(format!("cannot update install receipt: {error}"))
             })?;

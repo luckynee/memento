@@ -186,9 +186,47 @@ impl Server {
     }
 
     async fn send<T: DeserializeOwned>(&self, request: RequestBuilder) -> Result<T> {
-        let response = request.send().await.map_err(|error| {
+        let retry = request.try_clone();
+        let response = match request.send().await {
+            Err(error) if error.is_connect() && retry.is_some() => {
+                let sibling = std::env::current_exe()
+                    .context("cannot find memento executable")?
+                    .with_file_name("memento");
+                let executable = if sibling.is_file() {
+                    sibling
+                } else {
+                    PathBuf::from("memento")
+                };
+                let url = self.url.to_string();
+                let token = self.token.clone();
+                let status = tokio::task::spawn_blocking(move || {
+                    let mut command = Command::new(executable);
+                    command.arg("--url").arg(url).args(["daemon", "ensure"]);
+                    if let Some(token) = token {
+                        command.env("MEMENTO_TOKEN", token);
+                    }
+                    command
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                })
+                .await
+                .context("joining daemon ensure")?
+                .context("running daemon ensure")?;
+                if !status.success() {
+                    return Err(anyhow!("cannot start native daemon for {}", self.url));
+                }
+                retry.unwrap().send().await
+            }
+            result => result,
+        }
+        .map_err(|error| {
             if error.is_connect() {
-                anyhow!("cannot connect to {}: {error}; start the daemon with docker compose -f deploy/compose.yaml -p memento up -d", self.url)
+                anyhow!(
+                    "cannot connect to {}: {error}; start the daemon with memento daemon up",
+                    self.url
+                )
             } else {
                 anyhow!("request to {} failed: {error}", self.url)
             }

@@ -28,7 +28,7 @@ OpenCode plugin (TypeScript, adapters/opencode)      memento (Rust workspace)
 
 - Core (Rust) is harness-agnostic and model-free. Harness adapters map native transcripts to the neutral ingest schema.
 - Jev (System 1) is used only inside the OpenCode adapter through `ctx.experimental.generate.decisions` with model `{ providerID: "opencode", id: "jev-1.13-free" }` (free tier, verified 2026-11-18; paid `jev-1.13` needs OpenCode Models credits). Jev is a decision model: `predicate`, `choice`, and `score` questions; it cannot embed or generate text.
-- Deployment: Docker Compose with `qdrant/qdrant:v1.20.2` and a `mementod` image. The CLI runs on the host.
+- Deployment defaults to Docker Compose with `qdrant/qdrant:v1.20.2` and a `mementod` image. Opt-in native mode runs SQLite and the Candle embedder on the host.
 
 ## Pinned stack
 
@@ -178,6 +178,7 @@ All routes under `http://127.0.0.1:7377`. Optional bearer token via `MEMENTO_TOK
 | Method and path | Body or query | Response |
 | --- | --- | --- |
 | `GET /health` | | `{ "ok": true, "qdrant": true, "version"?: "x.y.z" }` |
+| `POST /admin/shutdown` | loopback peer and bearer token when configured | graceful shutdown accepted |
 | `PUT /v1/sessions` | `{ harness, project, session, parent?, parent_harness?, parent_cutoff?, require_parent?, parent_if_unset?, retention?, title? }`; `parent_cutoff` is an RFC 3339 timestamp; absent fields keep stored values, except an explicit parent link without a cutoff clears it; `parent_if_unset` atomically applies parent fields only when the stored parent is absent or matches, preserving an existing cutoff when none is supplied; `created` is set once | session record |
 | `GET /v1/sessions` | `?harness?&project?&include_deleted?` | `{ sessions: [...] }` |
 | `POST /v1/sessions/release` | `{ harness, project, session, reason? }` | `{ released, removed: [{ harness, session }] }` |
@@ -198,6 +199,10 @@ Errors: `{ "error": { "code": "...", "message": "..." } }` with 4xx/5xx.
 The release binary embeds the OpenCode plugin bundle, harness skills, and daemon Compose definition. `memento setup` installs the plugin under `${XDG_DATA_HOME:-~/.local/share}/memento/opencode-plugin/`, configures OpenCode to load it, installs embedded skills by default, and saves choices in `${XDG_CONFIG_HOME:-~/.config}/memento/install.json`. The receipt also records installer method, binary directory, and version. `--opencode-plugin DIR`, `--skills-source DIR`, `MEMENTO_OPENCODE_PLUGIN`, and `MEMENTO_SKILLS_DIR` override embedded assets for development checkouts. `install-skills --source DIR` accepts an optional source override. Setup can offer to start the managed daemon; `--start-daemon` requests that in non-interactive use.
 
 `memento daemon up|down|status|logs [-f]|pull` manages the embedded Compose definition at `${XDG_DATA_HOME:-~/.local/share}/memento/compose.yaml` through `docker compose -p memento`; `up` waits for health. The daemon image defaults to `ghcr.io/luckynee/mementod:<cli version>` and can be overridden with `MEMENTO_DAEMON_IMAGE`. Qdrant v1.20.2 uses the existing `memento_qdrant_storage` volume. `MEMENTO_TOKEN`, `MEMENTO_STALE_DAYS`, and `MEMENTO_STALE_SWEEP_SECS` pass through to the daemon.
+
+Setup saves `daemon_mode` as `docker`, `native` or `external`; legacy `managed_daemon` true maps to Docker and false to external, and the boolean remains for older clients. Docker is the fresh-setup default. Native setup warms the Candle model, then starts `mementod` with SQLite, a loopback bind, `MEMENTO_LOCK_PATH=${XDG_STATE_HOME:-~/.local/state}/memento/mementod.lock`, and `MEMENTO_IDLE_EXIT_SECS=1800` unless `native_idle_exit_secs` is saved. An exclusive nonblocking OS lock lasts for the serve process; its PID is informational only. Idle shutdown follows the last completed HTTP request and waits for in-flight requests; background sweeps do not count. `MEMENTO_IDLE_EXIT_SECS=0` disables idle shutdown. `daemon down` posts to the loopback-only authenticated shutdown endpoint and waits for the lock to release; it never signals the PID. Logs append to the state directory's `mementod.log`.
+
+CLI and MCP requests that cannot connect invoke native `daemon ensure` and retry once; concurrent starters contend on the same lock. Native startup may wait up to 120 seconds for model loading; synchronous hook context remains bounded by the existing eight-second deadline. Detached imports start independently. OpenCode plugin autostart is not included. Docker and external modes are not automatically started by ensure. Native SQLite data is separate from Docker Qdrant data and requires explicit `mementod migrate`.
 
 `memento update` checks the latest GitHub release, verifies the archive SHA-256, replaces `memento` and `memento-mcp` for installer-managed installs, then runs `update --refresh` to reapply saved setup and pull/restart a managed daemon. `--check`, `--version <x.y.z>`, and `--refresh` control these actions. Binary replacement requires a script-install receipt and execution from its recorded binary directory; Cargo installs should use Cargo or the installer. `memento doctor [--offline]` reports installation receipt, latest release, Docker/Compose, daemon health, plugin and saved setup status, plus per-harness settings read from the installed configuration. Missing or unreadable settings warn without failing the check; `--offline` skips the latest-release check, and failures make it exit 1.
 

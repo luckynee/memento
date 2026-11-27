@@ -648,6 +648,43 @@ pub(super) fn run(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
             Err(error) => println!("warn: latest release unavailable: {}", error.message),
         }
     }
+    let setup = receipt.get("setup").and_then(Value::as_object);
+    let mode = crate::daemon::saved_mode(setup)?;
+    println!("ok: daemon mode {}", mode.name());
+    if mode == crate::daemon::DaemonMode::Native {
+        match crate::daemon::native_binary() {
+            Ok(path) => println!("ok: native binary {}", path.display()),
+            Err(error) => println!("warn: native binary: {}", error.message),
+        }
+        let state = crate::daemon::state_dir()?;
+        let lock = state.join("mementod.lock");
+        match crate::daemon::running_pid(&lock) {
+            Ok(Some(pid)) => println!("ok: native lock {} pid={pid}", lock.display()),
+            Ok(None) => println!("ok: native lock {} stopped", lock.display()),
+            Err(error) => println!("warn: native lock: {}", error.message),
+        }
+        println!("ok: native log {}", state.join("mementod.log").display());
+        println!(
+            "ok: native idle exit {} seconds",
+            setup.map(crate::daemon::idle_seconds).unwrap_or(1800)
+        );
+        let cache = std::env::var_os("HF_HOME")
+            .or_else(|| std::env::var_os("FASTEMBED_CACHE_DIR"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::var_os("XDG_CACHE_HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache")
+                    })
+                    .join("memento/models")
+            });
+        println!(
+            "{}: native model cache {}",
+            if cache.is_dir() { "ok" } else { "warn" },
+            cache.display()
+        );
+    }
     let docker = docker_check(&["--version"]);
     println!(
         "{}: docker {}",

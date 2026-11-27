@@ -29,7 +29,7 @@ Model-switch rewriting, memento compaction, resume compaction, and the opt-in pr
 | LLM-written summary | Deterministic, byte-stable digest, friendly to prompt caches and requiring no summarizer call |
 | Replay the full transcript on model switch | Digest plus a bounded recent verbatim tail in OpenCode |
 | Separate memory per harness | One project key shared across supported harnesses and linked worktrees |
-| Remote memory service | Local service bound to `127.0.0.1`, with Docker and Qdrant |
+| Remote memory service | Local service bound to `127.0.0.1`, with Docker and Qdrant or opt-in native SQLite |
 
 ## What a digest looks like
 
@@ -58,7 +58,7 @@ Add validation tests.
 
 ## Quickstart
 
-Requirements: Docker with Compose and Linux or macOS on x86_64 or aarch64.
+Requirements: Linux or macOS on x86_64 or aarch64. Docker with Compose is required for the default mode, not the opt-in native mode.
 
 ```sh
 curl -fsSL https://github.com/luckynee/memento/releases/latest/download/install.sh | sh
@@ -83,19 +83,19 @@ The installer may run setup automatically on a terminal. Setup can start the man
 ## How it works
 
 1. A harness adapter ingests session activity and filters it into searchable segments.
-2. `mementod` stores segments in Qdrant. Hybrid search combines fastembed BGE-small dense vectors and Qdrant BM25 using RRF, then reranks for recency.
+2. `mementod` stores segments in Qdrant by default or SQLite in native mode. Hybrid search combines fastembed BGE-small dense vectors and lexical search using RRF, then reranks for recency.
 3. The adapter supplies a digest and recent context when continuing work; the agent can search memory for details it needs.
 
 The main components are:
 
-- `mementod`: the Rust daemon and Qdrant-backed memory service.
+- `mementod`: the Rust daemon and Qdrant- or SQLite-backed memory service.
 - `memento`: the Rust CLI for setup, maintenance, and memory operations.
 - `memento-mcp`: an optional MCP server exposing memory tools.
 - Adapters: the OpenCode V2 plugin and native Claude Code, Codex, and agy integrations.
 
 ## Requirements
 
-- Docker with Compose for the managed daemon.
+- Docker with Compose for the default daemon mode; native mode does not require Docker.
 - A published GitHub release for the installer.
 - A supported CLI target: x86_64 or aarch64 Linux (musl), or x86_64 or aarch64 macOS.
 
@@ -105,7 +105,7 @@ The main components are:
 curl -fsSL https://github.com/luckynee/memento/releases/latest/download/install.sh | sh
 ```
 
-The installer downloads `memento` and `memento-mcp`, verifies their archive's SHA-256 checksum, and runs `memento setup` when a terminal is available.
+The installer downloads `memento`, `memento-mcp` and `mementod`, verifies their archive's SHA-256 checksum, and runs `memento setup` when a terminal is available.
 
 Set `MEMENTO_VERSION` to select a release (for example `0.2.0` or `v0.2.0`), `MEMENTO_INSTALL_DIR` to change the binary directory (default `~/.local/bin`), or `MEMENTO_NO_SETUP=1` to skip setup.
 
@@ -118,6 +118,14 @@ For non-interactive setup, specify `--yes`, `--harness`, and `--scope`; add `--s
 ```sh
 memento setup --yes --harness opencode --scope project --start-daemon
 ```
+
+Docker remains the default. To opt into the Docker-free native SQLite daemon, choose **Native** in the wizard or run:
+
+```sh
+memento setup --yes --harness opencode --scope project --daemon native
+```
+
+Native setup downloads an approximately 133 MB embedding model on first use and loads it in memory. The daemon starts on demand for CLI and MCP requests and exits after 30 minutes without requests. OpenCode plugin requests do not yet start it automatically; start it with `memento daemon up` before using the plugin. Existing Docker memories are not copied automatically; see `mementod migrate` and [deployment notes](deploy/README.md).
 
 For OpenCode, setup also accepts:
 

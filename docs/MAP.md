@@ -11,7 +11,8 @@
 | `crates/memento-core/src/rerank.rs` | RRF normalization + recency rerank (no wall clock); question `user_request` factor 0.6, absence-only factor 0.4; identifier bonus proportional to token-boundary matches |
 | `crates/memento-core/src/absence.rs` | `is_absence_statement`: shared by digest (skip) and rerank (penalty); phrase heuristics, not semantic |
 | `crates/memento-core/src/digest.rs` | `render_digest`, `merge_chunks`; byte-stable output |
-| `crates/mementod/src/routes.rs` | All HTTP routes, bearer auth, error mapping; `RouterState` (shared locks) and `run_stale_sweep`, started and joined by `main.rs` (`router()` spawns nothing) |
+| `crates/mementod/src/routes.rs` | HTTP routes, bearer auth, loopback-only admin shutdown, error mapping; `RouterState` (shared locks) and `run_stale_sweep`, started and joined by `main.rs` |
+| `crates/mementod/src/main.rs` | Serve lifecycle, optional exclusive lock, request activity tracking, idle and graceful shutdown |
 | `crates/mementod/src/store.rs` | `Store` backend dispatch and `QdrantStore`: schema, hybrid RRF, session registry and continuation slots (`list_continuations` keeps legacy project-only ids) |
 | `crates/mementod/src/sqlite_store.rs` | `SqliteStore`: versioned WAL schema, FTS5, exact cosine and RRF, scope filters, session and continuation storage |
 | `crates/mementod/src/config.rs` | Environment configuration, SQLite path and model cache defaults |
@@ -31,7 +32,7 @@
 | `crates/memento-cli/build.rs` | Embeds `adapters/opencode/dist/index.js` (or `MEMENTO_OPENCODE_BUNDLE`) when present; sets `MEMENTO_TARGET`. A plain `cargo install --git` build has no bundle, so it cannot install the OpenCode plugin |
 | `crates/memento-cli/src/assets.rs` | Embedded skills, plugin bundle writer (`<data>/memento/opencode-plugin/`), compose renderer |
 | `crates/memento-cli/assets/compose.yaml` | Managed daemon template; image `ghcr.io/luckynee/mementod:<version>` or `MEMENTO_DAEMON_IMAGE`; project `memento` |
-| `crates/memento-cli/src/daemon.rs` | `memento daemon up/down/status/logs/pull`; `managed_refresh_steps` |
+| `crates/memento-cli/src/daemon.rs` | Docker/native/external modes, native launcher and lock status, `daemon ensure`, refresh steps |
 | `crates/memento-cli/src/receipt.rs` | `${XDG_CONFIG_HOME:-~/.config}/memento/install.json`: installer fields `method`, `bin_dir`, `version` plus `setup`; setup records only the latest scope and project |
 | `crates/memento-cli/src/setup.rs::reapply_saved_setup` | Non-interactive re-apply of saved setup (hidden `reapply-setup`), used by `update --refresh`; OpenCode `--resume`, `--primer` and `--compaction` choices persist as `opencode_resume`, `opencode_primer` and `opencode_compaction` |
 | `crates/memento-cli/src/update.rs` | `memento update`: GitHub release lookup (`MEMENTO_RELEASES_API`, `MEMENTO_DOWNLOAD_BASE` test overrides), sha256, guarded binary swap, refresh |

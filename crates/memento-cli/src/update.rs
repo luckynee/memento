@@ -120,7 +120,7 @@ fn extract_binaries(archive: &[u8]) -> Result<Vec<(String, Vec<u8>)>, CliError> 
             (Some(Component::Normal(name)), None) => name.to_string_lossy().to_string(),
             _ => return Err(CliError::other("release archive contains an unsafe path")),
         };
-        if !["memento", "memento-mcp"].contains(&name.as_str())
+        if !["memento", "memento-mcp", "mementod"].contains(&name.as_str())
             || !entry.header().entry_type().is_file()
         {
             return Err(CliError::other(format!(
@@ -132,12 +132,13 @@ fn extract_binaries(archive: &[u8]) -> Result<Vec<(String, Vec<u8>)>, CliError> 
             .map_err(|error| CliError::other(format!("cannot extract {name}: {error}")))?;
         binaries.push((name, bytes));
     }
-    if binaries.len() != 2
+    if binaries.len() != 3
         || !binaries.iter().any(|(name, _)| name == "memento")
         || !binaries.iter().any(|(name, _)| name == "memento-mcp")
+        || !binaries.iter().any(|(name, _)| name == "mementod")
     {
         return Err(CliError::other(
-            "release archive must contain memento and memento-mcp",
+            "release archive must contain memento, memento-mcp and mementod",
         ));
     }
     Ok(binaries)
@@ -154,6 +155,11 @@ fn refresh(cli: &Cli) -> Result<(), CliError> {
                 crate::daemon::RefreshStep::Pull => crate::daemon::pull()?,
                 crate::daemon::RefreshStep::Up => crate::daemon::start(cli)?,
             }
+        }
+        if let Some(setup) = receipt.get("setup").and_then(serde_json::Value::as_object)
+            && crate::daemon::saved_mode(Some(setup))? == crate::daemon::DaemonMode::Native
+        {
+            crate::daemon::restart_native(cli, setup)?;
         }
     } else {
         println!("nothing to refresh");
@@ -236,6 +242,9 @@ pub(super) fn run(_cli: &Cli, args: &UpdateArgs) -> Result<(), CliError> {
     crate::receipt::merge_fields(serde_json::json!({"version": target}))
         .map_err(|error| CliError::other(format!("cannot update receipt: {error}")))?;
     let status = Command::new(bin_dir.join("memento"))
+        .arg("--url")
+        .arg(&_cli.url)
+        .env("MEMENTO_TOKEN", _cli.token.as_deref().unwrap_or_default())
         .args(["update", "--refresh"])
         .status()
         .map_err(|error| CliError::other(format!("cannot run post-update refresh: {error}")))?;
@@ -296,10 +305,14 @@ mod tests {
     }
 
     #[test]
-    fn extracts_both_expected_archive_binaries() {
+    fn extracts_all_expected_archive_binaries() {
         let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         let mut archive = tar::Builder::new(encoder);
-        for (path, bytes) in [("memento", b"cli".as_slice()), ("memento-mcp", b"mcp")] {
+        for (path, bytes) in [
+            ("memento", b"cli".as_slice()),
+            ("memento-mcp", b"mcp"),
+            ("mementod", b"daemon"),
+        ] {
             let mut header = tar::Header::new_gnu();
             header.set_size(bytes.len() as u64);
             header.set_mode(0o755);
@@ -308,9 +321,10 @@ mod tests {
         }
         let bytes = archive.into_inner().unwrap().finish().unwrap();
         let extracted = extract_binaries(&bytes).unwrap();
-        assert_eq!(extracted.len(), 2);
+        assert_eq!(extracted.len(), 3);
         assert!(extracted.contains(&("memento".into(), b"cli".to_vec())));
         assert!(extracted.contains(&("memento-mcp".into(), b"mcp".to_vec())));
+        assert!(extracted.contains(&("mementod".into(), b"daemon".to_vec())));
     }
 
     #[test]
