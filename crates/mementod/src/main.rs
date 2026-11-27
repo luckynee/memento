@@ -47,6 +47,25 @@ enum Command {
 fn main() -> Result<()> {
     let cache = cache_dir()?;
     unsafe { std::env::set_var("FASTEMBED_CACHE_DIR", &cache) };
+    if std::env::var("MEMENTO_EMBEDDER").unwrap_or_else(|_| default_embedder().into()) == "candle" {
+        let threads = match std::env::var("MEMENTO_EMBED_THREADS") {
+            Ok(value) => {
+                let threads = value
+                    .parse::<usize>()
+                    .context("invalid MEMENTO_EMBED_THREADS")?;
+                anyhow::ensure!(threads > 0, "MEMENTO_EMBED_THREADS must be positive");
+                threads
+            }
+            Err(std::env::VarError::NotPresent) => std::thread::available_parallelism()
+                .map(|threads| threads.get().min(4))
+                .unwrap_or(1),
+            Err(error) => return Err(error).context("reading MEMENTO_EMBED_THREADS"),
+        };
+        unsafe {
+            std::env::set_var("RAYON_NUM_THREADS", threads.to_string());
+            std::env::set_var("CANDLE_NUM_THREADS", threads.to_string());
+        }
+    }
     tokio::runtime::Runtime::new()
         .context("creating async runtime")?
         .block_on(run())

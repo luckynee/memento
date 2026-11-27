@@ -103,6 +103,132 @@ async fn route_workflow() {
 }
 
 #[tokio::test]
+async fn digest_and_scroll_match_sqlite_and_qdrant() {
+    let Ok(url) = std::env::var("MEMENTO_TEST_QDRANT_URL") else {
+        eprintln!("skipping digest parity test: MEMENTO_TEST_QDRANT_URL is unset");
+        return;
+    };
+    let client = Qdrant::from_url(&url).build().unwrap();
+    let prefix = format!(
+        "memento_parity_{}",
+        Uuid::new_v5(
+            &Uuid::NAMESPACE_OID,
+            format!("{:?}", std::time::SystemTime::now()).as_bytes()
+        )
+        .simple()
+    );
+    let qdrant = Arc::new(Store::new(client.clone(), &prefix, Arc::new(FakeEmbedder)));
+    let sqlite = Arc::new(
+        Store::sqlite(":memory:".into(), Arc::new(FakeEmbedder))
+            .await
+            .unwrap(),
+    );
+    qdrant.ensure_schema().await.unwrap();
+    sqlite.ensure_schema().await.unwrap();
+    let mut servers = Vec::new();
+    for store in [Arc::clone(&qdrant), Arc::clone(&sqlite)] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let app = router(AppState {
+            store,
+            config: Config {
+                bind: listener.local_addr().unwrap(),
+                store: "sqlite".into(),
+                sqlite_path: Default::default(),
+                qdrant_url: String::new(),
+                token: None,
+                collection_prefix: String::new(),
+                cache_dir: None,
+                duplicate_cosine_threshold: 0.95,
+                duplicate_jaccard_threshold: 0.8,
+                stale_secs: 0,
+                stale_sweep_secs: 3600,
+                idle_exit_secs: 0,
+                lock_path: None,
+            },
+            policy: Default::default(),
+            rerank: Default::default(),
+        });
+        servers.push((
+            address,
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }),
+        ));
+    }
+    let result = tokio::spawn(async move {
+        for (address, _) in &servers {
+            for (method, path, body) in [
+                (
+                    "POST",
+                    "/v1/ingest",
+                    json!({"harness":"h","project":"p","session":"parent","items":[
+                        {"source_id":"before","ts":"2026-01-01T00:00:00Z","role":"user","text":"before cutoff"},
+                        {"source_id":"after","ts":"2026-01-01T00:02:00Z","role":"user","text":"after cutoff"}
+                    ]}),
+                ),
+                (
+                    "PUT",
+                    "/v1/sessions",
+                    json!({"harness":"h","project":"p","session":"child","parent":"parent","parent_cutoff":"2026-01-01T00:01:00Z"}),
+                ),
+                (
+                    "POST",
+                    "/v1/ingest",
+                    json!({"harness":"h","project":"p","session":"child","items":[
+                        {"source_id":"child","ts":"2026-01-01T00:03:00Z","role":"user","text":"child request"}
+                    ]}),
+                ),
+            ] {
+                assert_eq!(request(address, method, path, None, &body.to_string()).await.0, 200);
+            }
+        }
+        let first = request(
+            &servers[0].0,
+            "GET",
+            "/v1/digest?harness=h&project=p&session=child",
+            None,
+            "",
+        )
+        .await;
+        let second = request(
+            &servers[1].0,
+            "GET",
+            "/v1/digest?harness=h&project=p&session=child",
+            None,
+            "",
+        )
+        .await;
+        assert_eq!(first.0, 200);
+        assert_eq!(first, second);
+        let text = first.1["text"].as_str().unwrap();
+        assert!(text.contains("before cutoff"));
+        assert!(!text.contains("after cutoff"));
+        let filter = mementod::store::ScopeFilter {
+            project: Some("p".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            qdrant.scroll_segments(&filter).await.unwrap(),
+            sqlite.scroll_segments(&filter).await.unwrap()
+        );
+        for (_, server) in servers {
+            server.abort();
+        }
+    })
+    .await;
+    for collection in [
+        format!("{prefix}_segments"),
+        format!("{prefix}_sessions"),
+        format!("{prefix}_continuations"),
+    ] {
+        client
+            .delete_collection(DeleteCollectionBuilder::new(collection))
+            .await
+            .unwrap();
+    }
+    result.unwrap();
+}
+
+#[tokio::test]
 async fn sqlite_route_workflow() {
     let path = std::env::temp_dir().join(format!(
         "memento-routes-{}.db",

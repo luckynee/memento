@@ -23,8 +23,46 @@ use crate::{
 };
 
 pub struct SqliteStore {
-    connection: Arc<Mutex<Connection>>,
+    connection: Arc<Mutex<SqliteConnection>>,
     embedder: Arc<dyn Embedder>,
+}
+
+struct SqliteConnection {
+    connection: Connection,
+    dense_cache: Option<Vec<StoredSegment>>,
+    data_version: i64,
+}
+
+impl std::ops::Deref for SqliteConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
+
+impl std::ops::DerefMut for SqliteConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.connection
+    }
+}
+
+impl SqliteConnection {
+    fn invalidate_dense_cache(&mut self) {
+        self.dense_cache = None;
+    }
+
+    fn ensure_dense_cache(&mut self) -> Result<()> {
+        let version = self
+            .connection
+            .pragma_query_value(None, "data_version", |row| row.get(0))
+            .context("checking SQLite data version")?;
+        if self.dense_cache.is_none() || self.data_version != version {
+            self.dense_cache = Some(load_segments(&self.connection, &ScopeFilter::default())?);
+            self.data_version = version;
+        }
+        Ok(())
+    }
 }
 
 impl SqliteStore {
@@ -71,14 +109,18 @@ impl SqliteStore {
         .await
         .context("joining SQLite initialization")??;
         Ok(Self {
-            connection: Arc::new(Mutex::new(connection)),
+            connection: Arc::new(Mutex::new(SqliteConnection {
+                connection,
+                dense_cache: None,
+                data_version: 0,
+            })),
             embedder,
         })
     }
 
     async fn run<T: Send + 'static>(
         &self,
-        operation: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+        operation: impl FnOnce(&mut SqliteConnection) -> Result<T> + Send + 'static,
     ) -> Result<T> {
         let connection = Arc::clone(&self.connection);
         tokio::task::spawn_blocking(move || {
@@ -152,6 +194,7 @@ impl SqliteStore {
             );
             let batch = batch.to_vec();
             self.run(move |connection| {
+                connection.invalidate_dense_cache();
                 let transaction = connection.transaction()?;
                 for (segment, vector) in batch.iter().zip(vectors) {
                     write_segment(&transaction, segment, &vector, None)?;
@@ -184,6 +227,7 @@ impl SqliteStore {
             "embedder returned incorrect vector count"
         );
         self.run(move |connection| {
+            connection.invalidate_dense_cache();
             let transaction = connection.transaction()?;
             for ((segment, role, provenance), vector) in segments.iter().zip(vectors) {
                 write_segment(&transaction, segment, &vector, role.as_deref())?;
@@ -290,6 +334,7 @@ impl SqliteStore {
             let filter = filter.clone();
             let result = self
                 .run(move |connection| {
+                    connection.invalidate_dense_cache();
                     let mut counts = (0, 0);
                     for (segment, vector) in batch.iter().zip(vectors) {
                         ensure!(
@@ -349,6 +394,7 @@ impl SqliteStore {
     ) -> Result<()> {
         let values = (harness.to_owned(), session.to_owned(), source_id.to_owned());
         self.run(move |connection| {
+            connection.invalidate_dense_cache();
             connection.execute("DELETE FROM segments WHERE harness=?1 AND session=?2 AND source_id=?3 AND chunk_index>=?4", params![values.0, values.1, values.2, count])?;
             Ok(())
         }).await
@@ -373,25 +419,28 @@ impl SqliteStore {
         let filter = filter.clone();
         let lexical_query = fts_query(query);
         self.run(move |connection| {
-            let candidates = load_segments(connection, &filter)?;
-            let mut dense: Vec<_> = candidates.iter().collect();
-            dense.sort_by(|a, b| cosine(&vector, &b.vector).total_cmp(&cosine(&vector, &a.vector)).then(a.segment.id.cmp(&b.segment.id)));
+            connection.ensure_dense_cache()?;
+            let candidates = connection.dense_cache.as_deref().unwrap_or_default();
+            let candidates: Vec<_> = candidates.iter().filter(|candidate| matches_filter(&candidate.segment, &filter)).collect();
+            let mut dense: Vec<_> = candidates.iter().map(|candidate| (*candidate, cosine(&vector, &candidate.vector))).collect();
+            dense.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.segment.id.cmp(&b.0.segment.id)));
             let mut scores = HashMap::<Uuid, (Segment, f32)>::new();
-            for (rank, candidate) in dense.into_iter().take(50).enumerate() {
+            for (rank, (candidate, _)) in dense.into_iter().take(50).enumerate() {
                 scores.insert(candidate.segment.id, (candidate.segment.clone(), 1.0 / (rank + 2) as f32));
             }
+            let candidates_by_id: HashMap<_, _> = candidates.iter().map(|candidate| (candidate.segment.id, &candidate.segment)).collect();
             if !lexical_query.is_empty() {
                 let (condition, mut values) = sql_filter(&filter)?;
                 values.insert(0, Value::Text(lexical_query));
-                let sql = format!("SELECT segments.id FROM segments_fts JOIN segments ON segments.rowid=segments_fts.rowid WHERE segments_fts MATCH ? AND {condition} ORDER BY bm25(segments_fts), segments.id LIMIT 50");
-                let mut statement = connection.prepare(&sql)?;
+                let sql = format!("SELECT segments.id FROM segments_fts CROSS JOIN segments ON segments.rowid=segments_fts.rowid WHERE segments_fts MATCH ? AND {condition} ORDER BY bm25(segments_fts), segments.id LIMIT 50");
+                let mut statement = connection.connection.prepare(&sql)?;
                 let ids = statement.query_map(params_from_iter(values), |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
                 for (rank, id) in ids.into_iter().enumerate() {
                     let id = Uuid::parse_str(&id)?;
                     if let Some((_, score)) = scores.get_mut(&id) {
                         *score += 1.0 / (rank + 2) as f32;
                     } else {
-                        let segment = candidates.iter().find(|segment| segment.segment.id == id).context("missing lexical segment")?.segment.clone();
+                        let segment = (*candidates_by_id.get(&id).context("missing lexical segment")?).clone();
                         scores.insert(id, (segment, 1.0 / (rank + 2) as f32));
                     }
                 }
@@ -433,6 +482,7 @@ impl SqliteStore {
     pub async fn delete_segments(&self, filter: &ScopeFilter) -> Result<u64> {
         let filter = filter.clone();
         self.run(move |connection| {
+            connection.invalidate_dense_cache();
             let (condition, values) = sql_filter(&filter)?;
             Ok(connection.execute(
                 &format!("DELETE FROM segments WHERE {condition}"),
@@ -689,6 +739,37 @@ fn sql_filter(filter: &ScopeFilter) -> Result<(String, Vec<Value>)> {
     Ok((clauses.join(" AND "), values))
 }
 
+fn matches_filter(segment: &Segment, filter: &ScopeFilter) -> bool {
+    filter
+        .harness
+        .as_ref()
+        .is_none_or(|value| value == &segment.harness)
+        && filter
+            .project
+            .as_ref()
+            .is_none_or(|value| value == &segment.project)
+        && filter
+            .session
+            .as_ref()
+            .is_none_or(|value| value == &segment.session)
+        && filter.sessions.as_ref().is_none_or(|sessions| {
+            sessions.iter().any(|session| {
+                session.harness == segment.harness && session.session == segment.session
+            })
+        })
+        && filter.lineage.as_ref().is_none_or(|lineage| {
+            lineage.iter().any(|ancestor| {
+                ancestor.key.harness == segment.harness
+                    && ancestor.key.session == segment.session
+                    && ancestor.cutoff.is_none_or(|cutoff| segment.ts <= cutoff)
+            })
+        })
+        && filter
+            .kinds
+            .as_ref()
+            .is_none_or(|kinds| kinds.contains(&segment.kind))
+}
+
 struct StoredSegment {
     segment: Segment,
     vector: Vec<f32>,
@@ -885,5 +966,185 @@ mod tests {
             store.scroll_segments(&filter).await.unwrap(),
             vec![boundary]
         );
+    }
+
+    async fn assert_cached_search_matches_reload(store: &SqliteStore, filters: &[ScopeFilter]) {
+        for filter in filters {
+            for query in ["alpha", "beta file", "*"] {
+                let cached = store.hybrid_candidates(query, filter, 50).await.unwrap();
+                store
+                    .run(|connection| {
+                        connection.invalidate_dense_cache();
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                let reloaded = store.hybrid_candidates(query, filter, 50).await.unwrap();
+                assert_eq!(cached, reloaded);
+                let sql_ids: Vec<_> = store
+                    .scroll_segments(filter)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|segment| segment.id)
+                    .collect();
+                let filter = filter.clone();
+                let cached_ids = store
+                    .run(move |connection| {
+                        connection.ensure_dense_cache()?;
+                        Ok(connection
+                            .dense_cache
+                            .as_ref()
+                            .unwrap()
+                            .iter()
+                            .filter(|candidate| matches_filter(&candidate.segment, &filter))
+                            .map(|candidate| candidate.segment.id)
+                            .collect::<Vec<_>>())
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(sql_ids, cached_ids);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dense_cache_matches_reload_after_mixed_mutations() {
+        let store = SqliteStore::open(PathBuf::from(":memory:"), Arc::new(FakeEmbedder))
+            .await
+            .unwrap();
+        store.ensure_schema().await.unwrap();
+        let segment = |source: &str, project: &str, session: &str, chunk: u32| Segment {
+            id: Uuid::new_v5(&Uuid::NAMESPACE_OID, format!("{source}-{chunk}").as_bytes()),
+            harness: "h".into(),
+            project: project.into(),
+            session: session.into(),
+            kind: Kind::FileRef,
+            text: format!("alpha {source} {chunk}"),
+            source_id: source.into(),
+            chunk_index: chunk,
+            ts: format!("2026-01-01T00:00:0{chunk}.500Z").parse().unwrap(),
+            tool: None,
+            path: None,
+            paths: vec![],
+        };
+        let first = segment("one", "p", "parent", 0);
+        let second = segment("one", "p", "parent", 1);
+        let other = segment("two", "other", "child", 0);
+        let filters = vec![
+            ScopeFilter::default(),
+            ScopeFilter {
+                project: Some("p".into()),
+                kinds: Some(vec![Kind::FileRef]),
+                ..Default::default()
+            },
+            ScopeFilter {
+                sessions: Some(vec![SessionKey {
+                    harness: "h".into(),
+                    session: "parent".into(),
+                }]),
+                lineage: Some(vec![Ancestor {
+                    key: SessionKey {
+                        harness: "h".into(),
+                        session: "parent".into(),
+                    },
+                    cutoff: Some("2026-01-01T00:00:00.500Z".parse().unwrap()),
+                }]),
+                ..Default::default()
+            },
+        ];
+        store
+            .upsert_segments(&[first.clone(), second.clone(), other.clone()])
+            .await
+            .unwrap();
+        assert_cached_search_matches_reload(&store, &filters).await;
+        let mut updated = first.clone();
+        updated.text = "beta replacement".into();
+        store.upsert_segments(&[updated]).await.unwrap();
+        assert_cached_search_matches_reload(&store, &filters).await;
+        store
+            .delete_stale_chunks("h", "parent", "one", 1)
+            .await
+            .unwrap();
+        assert_cached_search_matches_reload(&store, &filters).await;
+        store
+            .migrate_segments(vec![(second.clone(), None, None)])
+            .await
+            .unwrap();
+        assert_cached_search_matches_reload(&store, &filters).await;
+        let lineage = vec![Ancestor {
+            key: SessionKey {
+                harness: "h".into(),
+                session: "parent".into(),
+            },
+            cutoff: None,
+        }];
+        store
+            .ingest_segments(&[first], &HashMap::new(), &lineage, 0.95, 0.8)
+            .await
+            .unwrap();
+        assert_cached_search_matches_reload(&store, &filters).await;
+        store
+            .delete_segments(&ScopeFilter {
+                project: Some("other".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_cached_search_matches_reload(&store, &filters).await;
+    }
+
+    #[tokio::test]
+    async fn dense_cache_refreshes_after_external_commit() {
+        let path = std::env::temp_dir().join(format!(
+            "memento-cache-{}.db",
+            Uuid::new_v5(
+                &Uuid::NAMESPACE_OID,
+                format!("{:?}", std::time::SystemTime::now()).as_bytes()
+            )
+        ));
+        let first = SqliteStore::open(path.clone(), Arc::new(FakeEmbedder))
+            .await
+            .unwrap();
+        first.ensure_schema().await.unwrap();
+        let second = SqliteStore::open(path.clone(), Arc::new(FakeEmbedder))
+            .await
+            .unwrap();
+        let segment = Segment {
+            id: Uuid::new_v5(&Uuid::NAMESPACE_OID, b"external"),
+            harness: "h".into(),
+            project: "p".into(),
+            session: "s".into(),
+            kind: Kind::FileRef,
+            text: "external alpha".into(),
+            source_id: "external".into(),
+            chunk_index: 0,
+            ts: "2026-01-01T00:00:00Z".parse().unwrap(),
+            tool: None,
+            path: None,
+            paths: vec![],
+        };
+        assert!(
+            first
+                .hybrid_candidates("alpha", &ScopeFilter::default(), 50)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        second
+            .upsert_segments(std::slice::from_ref(&segment))
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .hybrid_candidates("alpha", &ScopeFilter::default(), 50)
+                .await
+                .unwrap()[0]
+                .0,
+            segment
+        );
+        drop(first);
+        drop(second);
+        std::fs::remove_file(path).unwrap();
     }
 }
