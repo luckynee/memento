@@ -70,6 +70,8 @@ pub struct SetupArgs {
     yes: bool,
     #[arg(long, help = "Start the managed daemon if it is unavailable")]
     start_daemon: bool,
+    #[arg(long, value_enum, help = "Daemon mode")]
+    daemon: Option<crate::daemon::DaemonMode>,
     #[arg(long, help = "Preview without writing")]
     dry_run: bool,
 }
@@ -197,6 +199,7 @@ struct Context {
     install_skills: bool,
     embedded_plugin: bool,
     url: String,
+    daemon_mode: crate::daemon::DaemonMode,
     resume: Option<Toggle>,
     primer: Option<Toggle>,
     compaction: Option<Compaction>,
@@ -369,9 +372,17 @@ fn plugin_entry(context: &Context, memory: bool) -> Result<Value, CliError> {
     let package = plugin
         .to_str()
         .ok_or_else(|| CliError::other("OpenCode plugin directory is not UTF-8"))?;
-    Ok(
-        json!({"package":package,"options":{"url":context.url,"subagentMemory":if memory {"digest"} else {"off"}}}),
-    )
+    let mut entry = json!({"package":package,"options":{"url":context.url,"subagentMemory":if memory {"digest"} else {"off"}}});
+    if context.daemon_mode == crate::daemon::DaemonMode::Native {
+        let executable = context
+            .executable
+            .to_str()
+            .filter(|_| context.executable.is_absolute())
+            .ok_or_else(|| CliError::other("memento executable must be an absolute UTF-8 path"))?;
+        entry["options"]["autostart"] = true.into();
+        entry["options"]["mementoBin"] = executable.into();
+    }
+    Ok(entry)
 }
 
 fn opencode_merge(path: &Path, context: &Context, memory: bool) -> Result<String, CliError> {
@@ -449,6 +460,27 @@ fn opencode_merge(path: &Path, context: &Context, memory: bool) -> Result<String
                 object.append(name, value.into());
             }
         }
+        if context.daemon_mode == crate::daemon::DaemonMode::Native {
+            let executable = new_entry["options"]["mementoBin"]
+                .as_str()
+                .expect("memento executable");
+            if let Some(property) = options.get("autostart") {
+                property.set_value(true.into());
+            } else {
+                options.append("autostart", true.into());
+            }
+            if let Some(property) = options.get("mementoBin") {
+                property.set_value(executable.into());
+            } else {
+                options.append("mementoBin", executable.into());
+            }
+        } else {
+            for name in ["autostart", "mementoBin"] {
+                if let Some(property) = options.get(name) {
+                    property.remove();
+                }
+            }
+        }
         if let Some(resume) = context.resume {
             match resume {
                 Toggle::On => {
@@ -516,6 +548,16 @@ fn opencode_merge(path: &Path, context: &Context, memory: bool) -> Result<String
             ("url".into(), url.into()),
             ("subagentMemory".into(), subagent_memory.into()),
         ];
+        if context.daemon_mode == crate::daemon::DaemonMode::Native {
+            options.push(("autostart".into(), true.into()));
+            options.push((
+                "mementoBin".into(),
+                new_entry["options"]["mementoBin"]
+                    .as_str()
+                    .expect("memento executable")
+                    .into(),
+            ));
+        }
         if context.resume == Some(Toggle::On) {
             options.push(("resume".into(), true.into()));
         }
@@ -657,23 +699,28 @@ pub fn run(cli: &Cli, args: &SetupArgs) -> Result<(), CliError> {
     let daemon_healthy = request
         .send()
         .is_ok_and(|response| response.status().is_success());
-    let mut managed_daemon = false;
-    if !daemon_healthy {
-        let should_start = args.start_daemon
-            || (interactive
-                && crate::daemon::docker_available()
-                && Confirm::new()
-                    .with_prompt("Daemon is unavailable. Start the managed daemon?")
-                    .default(true)
-                    .interact()
-                    .map_err(prompt_error)?);
-        if should_start {
-            crate::daemon::start(cli)?;
-            managed_daemon = true;
-        } else {
-            eprintln!("warning: daemon health check failed; start it with memento daemon up");
-        }
-    }
+    let previous_setup = crate::daemon::current_setup()?;
+    let previous_mode = crate::daemon::saved_mode(Some(&previous_setup))?;
+    let daemon_mode = match args.daemon {
+        Some(mode) => mode,
+        None if interactive => match Select::new()
+            .with_prompt("Daemon mode")
+            .items(["Docker (default)", "Native (Docker-free)", "External"])
+            .default(match previous_mode {
+                crate::daemon::DaemonMode::Docker => 0,
+                crate::daemon::DaemonMode::Native => 1,
+                crate::daemon::DaemonMode::External => 0,
+            })
+            .interact()
+            .map_err(prompt_error)?
+        {
+            0 => crate::daemon::DaemonMode::Docker,
+            1 => crate::daemon::DaemonMode::Native,
+            _ => crate::daemon::DaemonMode::External,
+        },
+        None if previous_setup.is_empty() => crate::daemon::DaemonMode::Docker,
+        None => previous_mode,
+    };
     let scope = match args.scope {
         Some(scope) => scope,
         None if interactive => {
@@ -893,6 +940,7 @@ pub fn run(cli: &Cli, args: &SetupArgs) -> Result<(), CliError> {
         install_skills,
         embedded_plugin,
         url: cli.url.clone(),
+        daemon_mode,
         resume: args.resume,
         primer: args.primer,
         compaction: args.compaction,
@@ -1020,6 +1068,36 @@ pub fn run(cli: &Cli, args: &SetupArgs) -> Result<(), CliError> {
         println!("Setup cancelled.");
         return Ok(());
     }
+    if daemon_mode == crate::daemon::DaemonMode::Native {
+        if previous_mode == crate::daemon::DaemonMode::Docker {
+            eprintln!(
+                "Existing Docker memories are not migrated automatically; see mementod migrate."
+            );
+            if daemon_healthy {
+                return Err(CliError::other(
+                    "stop the Docker daemon before starting native mode at the same URL",
+                ));
+            }
+        }
+        crate::daemon::warmup()?;
+        if !daemon_healthy || previous_mode != crate::daemon::DaemonMode::Native {
+            crate::daemon::start_native(cli, crate::daemon::idle_seconds(&previous_setup))?;
+        }
+    } else if !daemon_healthy && daemon_mode == crate::daemon::DaemonMode::Docker {
+        let should_start = args.start_daemon
+            || (interactive
+                && crate::daemon::docker_available()
+                && Confirm::new()
+                    .with_prompt("Daemon is unavailable. Start the managed daemon?")
+                    .default(true)
+                    .interact()
+                    .map_err(prompt_error)?);
+        if should_start {
+            crate::daemon::start(cli)?;
+        } else {
+            eprintln!("warning: daemon health check failed; start it with memento daemon up");
+        }
+    }
     if context.embedded_plugin {
         crate::assets::write_opencode_plugin(&crate::assets::data_dir()?)?;
     }
@@ -1072,7 +1150,9 @@ pub fn run(cli: &Cli, args: &SetupArgs) -> Result<(), CliError> {
         "opencode_primer": opencode_options.as_ref().map(|options| options.primer),
         "opencode_compaction": opencode_options.as_ref().map(|options| options.compaction),
         "skills": install_skills,
-        "managed_daemon": managed_daemon,
+        "managed_daemon": daemon_mode == crate::daemon::DaemonMode::Docker,
+        "daemon_mode": daemon_mode.name(),
+        "native_idle_exit_secs": crate::daemon::idle_seconds(&previous_setup),
         "opencode_plugin": if context.embedded_plugin {
             None
         } else {
@@ -1146,6 +1226,7 @@ pub(super) fn reapply_saved_setup(cli: &Cli) -> Result<(), CliError> {
         opencode_plugin: plugin,
         yes: true,
         start_daemon: false,
+        daemon: Some(crate::daemon::saved_mode(Some(setup))?),
         dry_run: false,
     };
     run(cli, &args)
@@ -1489,6 +1570,7 @@ pub fn remove(args: &RemoveArgs) -> Result<(), CliError> {
         install_skills: false,
         embedded_plugin: false,
         url: String::new(),
+        daemon_mode: crate::daemon::DaemonMode::External,
         resume: None,
         primer: None,
         compaction: None,
@@ -1681,6 +1763,7 @@ pub fn remove(args: &RemoveArgs) -> Result<(), CliError> {
         remove_directory(&embedded)?;
         if let Some(setup) = receipt.get_mut("setup").and_then(Value::as_object_mut) {
             setup.insert("managed_daemon".into(), Value::Bool(false));
+            setup.insert("daemon_mode".into(), Value::String("external".into()));
             crate::receipt::write(receipt).map_err(|error| {
                 CliError::other(format!("cannot update install receipt: {error}"))
             })?;
@@ -1707,10 +1790,40 @@ mod tests {
             install_skills: true,
             embedded_plugin: false,
             url: "http://127.0.0.1:7377".into(),
+            daemon_mode: crate::daemon::DaemonMode::External,
             resume: None,
             primer: None,
             compaction: None,
         }
+    }
+
+    #[test]
+    fn opencode_native_autostart_preserves_options_and_comments() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut context = context(temp.path());
+        context.daemon_mode = crate::daemon::DaemonMode::Native;
+        fs::create_dir_all(&context.project).unwrap();
+        let path = context.project.join("opencode.jsonc");
+        fs::write(&path, "{\n // keep\n \"plugins\": [{\"package\":\"/x/adapters/opencode\", \"options\":{\"custom\":42}}]\n}").unwrap();
+        let native = opencode_merge(&path, &context, true).unwrap();
+        assert!(native.contains("// keep"));
+        let root = CstRootNode::parse(&native, &ParseOptions::default()).unwrap();
+        let value = root.object_value().unwrap().to_serde_value().unwrap();
+        assert_eq!(value["plugins"][0]["options"]["custom"], 42);
+        assert_eq!(value["plugins"][0]["options"]["autostart"], true);
+        assert_eq!(
+            value["plugins"][0]["options"]["mementoBin"],
+            context.executable.to_str().unwrap()
+        );
+        fs::write(&path, native).unwrap();
+        context.daemon_mode = crate::daemon::DaemonMode::Docker;
+        let docker = opencode_merge(&path, &context, true).unwrap();
+        assert!(docker.contains("// keep"));
+        let root = CstRootNode::parse(&docker, &ParseOptions::default()).unwrap();
+        let value = root.object_value().unwrap().to_serde_value().unwrap();
+        assert_eq!(value["plugins"][0]["options"]["custom"], 42);
+        assert!(value["plugins"][0]["options"].get("autostart").is_none());
+        assert!(value["plugins"][0]["options"].get("mementoBin").is_none());
     }
 
     #[test]

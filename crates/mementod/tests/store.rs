@@ -30,11 +30,11 @@ async fn qdrant_storage_round_trip() {
     let store = Store::new(client.clone(), &prefix, Arc::new(FakeEmbedder));
     let result = run_test(&store).await;
     for collection in [
-        &store.segments_collection,
-        &store.sessions_collection,
-        &store.continuations_collection,
+        format!("{prefix}_segments"),
+        format!("{prefix}_sessions"),
+        format!("{prefix}_continuations"),
     ] {
-        if client.collection_exists(collection).await.unwrap() {
+        if client.collection_exists(&collection).await.unwrap() {
             client
                 .delete_collection(DeleteCollectionBuilder::new(collection))
                 .await
@@ -42,6 +42,32 @@ async fn qdrant_storage_round_trip() {
         }
     }
     result.unwrap();
+}
+
+#[tokio::test]
+async fn sqlite_storage_round_trip() {
+    let path = std::env::temp_dir().join(format!(
+        "memento-store-{}.db",
+        Uuid::new_v5(
+            &Uuid::NAMESPACE_OID,
+            format!("{:?}", std::time::SystemTime::now()).as_bytes()
+        )
+    ));
+    let store = Store::sqlite(path.clone(), Arc::new(FakeEmbedder))
+        .await
+        .unwrap();
+    run_test(&store).await.unwrap();
+    drop(store);
+    let store = Store::sqlite(path.clone(), Arc::new(FakeEmbedder))
+        .await
+        .unwrap();
+    store.ensure_schema().await.unwrap();
+    assert_eq!(
+        store.count_segments(&ScopeFilter::default()).await.unwrap(),
+        1
+    );
+    drop(store);
+    std::fs::remove_file(path).unwrap();
 }
 
 async fn run_test(store: &Store) -> anyhow::Result<()> {

@@ -18,3 +18,10 @@ a reboot until you run `down`.
 The image needs a glibc x86-64-v3 CPU (AVX2) because of the prebuilt ONNX
 Runtime used by fastembed. The local Docker install uses the legacy builder;
 installing buildx is optional.
+
+For opt-in Docker-free operation, install the release binaries and run
+`memento setup --daemon native`. Native mode uses SQLite and the Candle
+embedder, downloads the model during setup, and starts on demand for CLI and
+MCP requests. Its data is separate from the Docker Qdrant volume; use
+`mementod migrate` explicitly to copy it after stopping writes to Qdrant.
+OpenCode plugin autostart is not yet supported.

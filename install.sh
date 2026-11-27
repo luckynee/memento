@@ -61,7 +61,7 @@ download "$base/$asset.sha256" "$temp_dir/$asset.sha256"
 )
 tar -xzf "$temp_dir/$asset" -C "$temp_dir"
 
-for binary in memento memento-mcp; do
+for binary in memento memento-mcp mementod; do
 	if [ ! -f "$temp_dir/$binary" ]; then
 		printf 'Release archive is missing %s\n' "$binary" >&2
 		exit 1
@@ -89,10 +89,10 @@ case ":${PATH:-}:" in
 esac
 
 if ! command -v docker >/dev/null 2>&1; then
-	printf 'Docker is required to run the memento daemon.\n'
+	printf 'Docker is required for the default daemon mode; native mode is available with memento setup --daemon native.\n'
 fi
 
-printf 'Installed memento %s and memento-mcp to %s\n' "$installed_version" "$install_dir"
+printf 'Installed memento %s, memento-mcp and mementod to %s\n' "$installed_version" "$install_dir"
 if [ "${MEMENTO_NO_SETUP:-0}" != 1 ]; then
 	if [ -t 1 ] && (: </dev/tty) 2>/dev/null; then
 		"$install_dir/memento" setup </dev/tty

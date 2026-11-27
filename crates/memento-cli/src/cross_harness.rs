@@ -261,9 +261,7 @@ fn http<T: Serialize>(
     if let Some(body) = body {
         request = request.json(body);
     }
-    let response = request
-        .send()
-        .map_err(|error| CliError::request(error, &cli.url))?;
+    let response = crate::send_daemon_builder(client, cli, request)?;
     let status = response.status();
     let body = response
         .text()
@@ -3385,6 +3383,33 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
                         let input: GenericInput = serde_json::from_str(&raw).map_err(|error| {
                             CliError::other(format!("invalid generic hook JSON: {error}"))
                         })?;
+                        if input.event == "session_start" {
+                            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+                            let hook_cli = Cli {
+                                url: cli.url.clone(),
+                                token: cli.token.clone(),
+                                json: cli.json,
+                                timeout_secs: cli.timeout_secs,
+                                command: crate::Command::Hook(HookArgs {
+                                    kind: args.kind,
+                                    harness: args.harness.clone(),
+                                    subagent_memory: args.subagent_memory,
+                                }),
+                            };
+                            let harness = args.harness.clone().unwrap_or_default();
+                            std::thread::spawn(move || {
+                                let _ =
+                                    sender.send(generic_hook(&hook_cli, &harness, &input, true));
+                            });
+                            return receiver
+                                .recv_timeout(
+                                    Duration::from_secs(8).saturating_sub(started.elapsed()),
+                                )
+                                .unwrap_or_else(|_| {
+                                    Err(CliError::other("hook timed out after 8 seconds"))
+                                })
+                                .map(Some);
+                        }
                         return generic_hook(
                             cli,
                             args.harness.as_deref().unwrap_or_default(),
@@ -3434,7 +3459,11 @@ pub fn run(cli: &Cli) -> Result<(), CliError> {
                             token: cli.token.clone(),
                             json: cli.json,
                             timeout_secs: cli.timeout_secs,
-                            command: crate::Command::Health,
+                            command: crate::Command::Hook(HookArgs {
+                                kind: args.kind,
+                                harness: args.harness.clone(),
+                                subagent_memory: args.subagent_memory,
+                            }),
                         };
                         std::thread::spawn(move || {
                             let result = client(&cli, true).and_then(|client| {

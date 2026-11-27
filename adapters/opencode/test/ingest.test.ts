@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { ActivityEntry } from "../src/activity-log";
-import { MementoError } from "../src/client";
+import { MementoClient, MementoError } from "../src/client";
 import { createIngestor } from "../src/ingest";
 import { DEFAULT_JEV_MODEL, type DecisionsFn } from "../src/jev";
 import type { IngestItem } from "../src/transcript";
@@ -200,6 +200,141 @@ describe("incremental ingestion", () => {
         await fake.ingestor.handleExecutionSucceeded("s");
         expect(fake.values.get("memento/ingest/s")).toBe("a");
         expect(fake.puts).toHaveLength(1);
+    });
+
+    test("background ingest retries once after autostart becomes healthy", async () => {
+        let ready = false;
+        let starts = 0;
+        let ingestCalls = 0;
+        let successfulIngests = 0;
+        const activity: ActivityEntry[] = [];
+        const values = new Map<string, unknown>([["memento/registered/s", true]]);
+        const client = new MementoClient({
+            autostart: true,
+            mementoBin: "/scratch/memento",
+            startupWaitMs: 1000,
+            startupPollMs: 5,
+            startDaemon() { starts++; },
+            fetch: (async (url: string | URL | Request) => {
+                const path = new URL(String(url)).pathname;
+                if (path === "/v1/ingest") {
+                    ingestCalls++;
+                }
+                if (!ready) {
+                    throw Object.assign(new Error("connection refused"), { code: "ECONNREFUSED" });
+                }
+                if (path === "/health") {
+                    return Response.json({ ok: true });
+                }
+                successfulIngests++;
+                return Response.json({ segments: 1, skipped: 0 });
+            }) as unknown as typeof fetch,
+        });
+        const ingestor = createIngestor({
+            client,
+            storage: {
+                async get(key) { return values.get(key); },
+                async set(key, value) { values.set(key, value); },
+            },
+            async loadContext() { return [user("private-text")]; },
+            async putInstruction() {},
+            jevModel: DEFAULT_JEV_MODEL, harness: "opencode", project: "p",
+            activity: { record(entry) { activity.push(entry); } },
+            log() {},
+        });
+        await ingestor.handleExecutionSucceeded("s");
+        expect(starts).toBe(1);
+        expect(values.has("memento/ingest/s")).toBe(false);
+        ready = true;
+        await Bun.sleep(30);
+        await ingestor.idle();
+        expect(ingestCalls).toBe(2);
+        expect(successfulIngests).toBe(1);
+        expect(values.get("memento/ingest/s")).toBe("private-text");
+        expect(activity.filter((entry) => entry.detail?.reason === "autostart_retry")).toEqual([
+            { level: "info", event: "ingest", session: "s", project: "p", detail: { count: 1, reason: "autostart_retry" } },
+        ]);
+        expect(JSON.stringify(activity)).not.toContain("private-text");
+    });
+
+    test("concurrent failures share one background retry", async () => {
+        let completeStartup!: (ready: boolean) => void;
+        const startup = new Promise<boolean>((resolve) => { completeStartup = resolve; });
+        let ready = false;
+        let attempts = 0;
+        const activity: ActivityEntry[] = [];
+        const values = new Map<string, unknown>([["memento/registered/s", true]]);
+        const ingestor = createIngestor({
+            client: {
+                async claimContinuation() { return { claimed: false }; },
+                async putSession() {},
+                async ingest() {
+                    attempts++;
+                    if (!ready) {
+                        const error = new MementoError("refused", "unavailable", undefined, true);
+                        error.startup = startup;
+                        throw error;
+                    }
+                    return { segments: 1, skipped: 0 };
+                },
+            },
+            storage: {
+                async get(key) { return values.get(key); },
+                async set(key, value) { values.set(key, value); },
+            },
+            async loadContext() { return [user("a")]; },
+            async putInstruction() {},
+            jevModel: DEFAULT_JEV_MODEL, harness: "opencode", project: "p",
+            activity: { record(entry) { activity.push(entry); } },
+            log() {},
+        });
+        await Promise.all([ingestor.handleExecutionSucceeded("s"), ingestor.handleExecutionSucceeded("s")]);
+        expect(attempts).toBe(2);
+        ready = true;
+        completeStartup(true);
+        await Bun.sleep(0);
+        await ingestor.idle();
+        expect(attempts).toBe(3);
+        expect(activity.filter((entry) => entry.detail?.reason === "autostart_retry")).toHaveLength(1);
+    });
+
+    test("startup timeout does not create an ingest retry loop", async () => {
+        let starts = 0;
+        let attempts = 0;
+        const values = new Map<string, unknown>([["memento/registered/s", true]]);
+        const activity: ActivityEntry[] = [];
+        const client = new MementoClient({
+            autostart: true,
+            mementoBin: "/scratch/memento",
+            startupWaitMs: 10,
+            startupPollMs: 2,
+            startDaemon() { starts++; },
+            fetch: (async (url: string | URL | Request) => {
+                if (new URL(String(url)).pathname === "/v1/ingest") {
+                    attempts++;
+                }
+                throw Object.assign(new Error("connection refused"), { code: "ECONNREFUSED" });
+            }) as unknown as typeof fetch,
+        });
+        const ingestor = createIngestor({
+            client,
+            storage: {
+                async get(key) { return values.get(key); },
+                async set(key, value) { values.set(key, value); },
+            },
+            async loadContext() { return [user("a")]; },
+            async putInstruction() {},
+            jevModel: DEFAULT_JEV_MODEL, harness: "opencode", project: "p",
+            activity: { record(entry) { activity.push(entry); } },
+            log() {},
+        });
+        await ingestor.handleExecutionSucceeded("s");
+        await Bun.sleep(30);
+        await ingestor.idle();
+        expect(starts).toBe(1);
+        expect(attempts).toBe(1);
+        expect(values.has("memento/ingest/s")).toBe(false);
+        expect(activity.filter((entry) => entry.detail?.reason === "autostart_retry")).toHaveLength(0);
     });
 
     test("serializes same-session events and advances empty mapped messages", async () => {

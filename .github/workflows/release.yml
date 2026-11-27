@@ -60,7 +60,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools cmake perl
       - name: Build release binaries
-        run: cargo build --locked --release -p memento-cli -p memento-mcp --target "${{ matrix.target }}"
+        run: |
+          cargo build --locked --release -p memento-cli -p memento-mcp --target "${{ matrix.target }}"
+          cargo build --locked --release -p mementod --no-default-features --features embed-candle --target "${{ matrix.target }}"
       - name: Package assets
         shell: bash
         run: |
@@ -68,7 +70,8 @@ jobs:
           staging="$(mktemp -d)"
           cp "target/${{ matrix.target }}/release/memento" "$staging/memento"
           cp "target/${{ matrix.target }}/release/memento-mcp" "$staging/memento-mcp"
-          tar -C "$staging" -czf "$asset" memento memento-mcp
+          cp "target/${{ matrix.target }}/release/mementod" "$staging/mementod"
+          tar -C "$staging" -czf "$asset" memento memento-mcp mementod
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$asset" > "$asset.sha256"
           else

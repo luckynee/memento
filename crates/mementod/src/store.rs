@@ -25,8 +25,9 @@ use uuid::Uuid;
 
 use crate::embed::Embedder;
 
-const SESSION_NAMESPACE: Uuid = Uuid::from_u128(0x2c450e36_854d_5a3c_aab2_743e57e955b8);
-const CONTINUATION_NAMESPACE: Uuid = Uuid::from_u128(0x8bcc899f_a24d_53d6_83e1_80669ad0e156);
+pub(crate) const SESSION_NAMESPACE: Uuid = Uuid::from_u128(0x2c450e36_854d_5a3c_aab2_743e57e955b8);
+pub(crate) const CONTINUATION_NAMESPACE: Uuid =
+    Uuid::from_u128(0x8bcc899f_a24d_53d6_83e1_80669ad0e156);
 
 #[derive(Debug, Clone, Default)]
 pub struct ScopeFilter {
@@ -98,7 +99,158 @@ impl ScopeFilter {
     }
 }
 
-pub struct Store {
+pub enum Store {
+    Qdrant(QdrantStore),
+    Sqlite(crate::sqlite_store::SqliteStore),
+}
+
+macro_rules! dispatch {
+    ($self:expr, $method:ident ( $($arg:expr),* )) => {
+        match $self {
+            Store::Qdrant(store) => store.$method($($arg),*).await,
+            Store::Sqlite(store) => store.$method($($arg),*).await,
+        }
+    };
+}
+
+impl Store {
+    pub fn new(client: Qdrant, prefix: &str, embedder: Arc<dyn Embedder>) -> Self {
+        Self::Qdrant(QdrantStore::new(client, prefix, embedder))
+    }
+
+    pub async fn sqlite(path: std::path::PathBuf, embedder: Arc<dyn Embedder>) -> Result<Self> {
+        Ok(Self::Sqlite(
+            crate::sqlite_store::SqliteStore::open(path, embedder).await?,
+        ))
+    }
+
+    pub async fn health(&self) -> Result<()> {
+        match self {
+            Self::Qdrant(store) => {
+                store
+                    .client
+                    .health_check()
+                    .await
+                    .context("checking Qdrant health")?;
+                Ok(())
+            }
+            Self::Sqlite(store) => store.health().await,
+        }
+    }
+
+    pub async fn ensure_schema(&self) -> Result<()> {
+        dispatch!(self, ensure_schema())
+    }
+
+    pub async fn upsert_segments(&self, segments: &[Segment]) -> Result<()> {
+        dispatch!(self, upsert_segments(segments))
+    }
+
+    pub async fn ingest_segments(
+        &self,
+        segments: &[Segment],
+        roles: &HashMap<String, Role>,
+        lineage: &[Ancestor],
+        cosine: f32,
+        jaccard: f32,
+    ) -> Result<(usize, usize)> {
+        dispatch!(
+            self,
+            ingest_segments(segments, roles, lineage, cosine, jaccard)
+        )
+    }
+
+    pub async fn delete_stale_chunks(
+        &self,
+        harness: &str,
+        session: &str,
+        source_id: &str,
+        count: u32,
+    ) -> Result<()> {
+        dispatch!(
+            self,
+            delete_stale_chunks(harness, session, source_id, count)
+        )
+    }
+
+    pub async fn hybrid_candidates(
+        &self,
+        query: &str,
+        filter: &ScopeFilter,
+        limit: u64,
+    ) -> Result<Vec<(Segment, f32)>> {
+        dispatch!(self, hybrid_candidates(query, filter, limit))
+    }
+
+    pub async fn scroll_segments(&self, filter: &ScopeFilter) -> Result<Vec<Segment>> {
+        dispatch!(self, scroll_segments(filter))
+    }
+
+    pub async fn count_segments(&self, filter: &ScopeFilter) -> Result<u64> {
+        dispatch!(self, count_segments(filter))
+    }
+
+    pub async fn delete_segments(&self, filter: &ScopeFilter) -> Result<u64> {
+        dispatch!(self, delete_segments(filter))
+    }
+
+    pub async fn delete_sessions(&self, filter: &ScopeFilter) -> Result<()> {
+        dispatch!(self, delete_sessions(filter))
+    }
+
+    pub async fn count_by_kind(&self, filter: &ScopeFilter) -> Result<BTreeMap<String, u64>> {
+        dispatch!(self, count_by_kind(filter))
+    }
+
+    pub async fn upsert_session(&self, session: SessionRecord) -> Result<()> {
+        dispatch!(self, upsert_session(session))
+    }
+
+    pub async fn get_session(&self, harness: &str, session: &str) -> Result<Option<SessionRecord>> {
+        dispatch!(self, get_session(harness, session))
+    }
+
+    pub async fn list_sessions(
+        &self,
+        harness: &str,
+        project: Option<&str>,
+    ) -> Result<Vec<SessionRecord>> {
+        dispatch!(self, list_sessions(harness, project))
+    }
+
+    pub async fn session_links(&self) -> Result<Vec<(SessionKey, Option<SessionKey>)>> {
+        dispatch!(self, session_links())
+    }
+
+    pub async fn upsert_continuation(&self, record: ContinuationRecord) -> Result<()> {
+        dispatch!(self, upsert_continuation(record))
+    }
+
+    pub async fn write_continuation(&self, id: PointId, record: ContinuationRecord) -> Result<()> {
+        dispatch!(self, write_continuation(id, record))
+    }
+
+    pub async fn list_continuations(
+        &self,
+        project: &str,
+    ) -> Result<Vec<(PointId, ContinuationRecord)>> {
+        dispatch!(self, list_continuations(project))
+    }
+
+    pub async fn delete_continuation(&self, id: PointId) -> Result<()> {
+        dispatch!(self, delete_continuation(id))
+    }
+
+    pub async fn delete_project_continuations(&self, project: &str) -> Result<()> {
+        dispatch!(self, delete_project_continuations(project))
+    }
+
+    pub async fn list_sessions_filtered(&self, filter: ScopeFilter) -> Result<Vec<SessionRecord>> {
+        dispatch!(self, list_sessions_filtered(filter))
+    }
+}
+
+pub struct QdrantStore {
     pub client: Qdrant,
     pub segments_collection: String,
     pub sessions_collection: String,
@@ -106,7 +258,7 @@ pub struct Store {
     embedder: Arc<dyn Embedder>,
 }
 
-impl Store {
+impl QdrantStore {
     pub fn new(client: Qdrant, prefix: &str, embedder: Arc<dyn Embedder>) -> Self {
         Self {
             client,
@@ -728,14 +880,14 @@ impl Store {
     }
 }
 
-fn prose_kind(kind: Kind) -> bool {
+pub(crate) fn prose_kind(kind: Kind) -> bool {
     matches!(
         kind,
         Kind::UserRequest | Kind::AssistantNote | Kind::Decision | Kind::Constraint | Kind::Task
     )
 }
 
-fn role_name(role: Option<Role>) -> &'static str {
+pub(crate) fn role_name(role: Option<Role>) -> &'static str {
     match role {
         Some(Role::User) => "user",
         Some(Role::Assistant) => "assistant",
@@ -744,7 +896,7 @@ fn role_name(role: Option<Role>) -> &'static str {
     }
 }
 
-fn shingle_jaccard(left: &str, right: &str) -> f32 {
+pub(crate) fn shingle_jaccard(left: &str, right: &str) -> f32 {
     fn shingles(text: &str) -> HashSet<Vec<String>> {
         let words = text
             .split(|character: char| !character.is_alphanumeric())
@@ -777,7 +929,7 @@ fn stale_chunks_filter(harness: &str, session: &str, source_id: &str, count: u32
     ])
 }
 
-fn kind_name(kind: &Kind) -> Result<String> {
+pub(crate) fn kind_name(kind: &Kind) -> Result<String> {
     serde_json::to_value(kind)?
         .as_str()
         .map(str::to_owned)
@@ -829,7 +981,7 @@ fn segment_payload_with_role(segment: &Segment, role: Option<Role>) -> Result<Pa
     Ok(Payload::from(payload))
 }
 
-fn segment_from_payload(
+pub(crate) fn segment_from_payload(
     id: Option<PointId>,
     payload: HashMap<String, qdrant_client::qdrant::Value>,
 ) -> Result<Segment> {

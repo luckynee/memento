@@ -28,7 +28,7 @@ OpenCode plugin (TypeScript, adapters/opencode)      memento (Rust workspace)
 
 - Core (Rust) is harness-agnostic and model-free. Harness adapters map native transcripts to the neutral ingest schema.
 - Jev (System 1) is used only inside the OpenCode adapter through `ctx.experimental.generate.decisions` with model `{ providerID: "opencode", id: "jev-1.13-free" }` (free tier, verified 2026-11-18; paid `jev-1.13` needs OpenCode Models credits). Jev is a decision model: `predicate`, `choice`, and `score` questions; it cannot embed or generate text.
-- Deployment: Docker Compose with `qdrant/qdrant:v1.20.2` and a `mementod` image. The CLI runs on the host.
+- Deployment defaults to Docker Compose with `qdrant/qdrant:v1.20.2` and a `mementod` image. Opt-in native mode runs SQLite and the Candle embedder on the host.
 
 ## Pinned stack
 
@@ -36,7 +36,7 @@ OpenCode plugin (TypeScript, adapters/opencode)      memento (Rust workspace)
 | --- | --- | --- |
 | Qdrant server | `qdrant/qdrant:v1.20.2` | HTTP 6333, gRPC 6334, storage `/qdrant/storage`, health `/healthz` `/readyz`; image has no curl/wget |
 | `qdrant-client` | 1.20.0 | gRPC only, connect to 6334 |
-| `fastembed` | 7.7.1 | `EmbeddingModel::BGESmallENV15`, 384 dims, cosine. Pins `ort 2.0.0-rc.15` (Rust >= 1.92, glibc only, x86-64-v3, needs libc++ at runtime). Cache via `FASTEMBED_CACHE_DIR` |
+| `fastembed` | 7.7.1 | BGE-small-en-v1.5, 384 dims, cosine; ONNX (`ort 2.0.0-rc.15`) and Candle CPU backends |
 | Lexical | Qdrant server-side `qdrant/bm25` | Self-hosted since 1.15.3, via `Document` / `DocumentBuilder`, sparse vector with `Modifier::Idf` |
 | Fusion | Qdrant RRF (`Fusion::Rrf`) | recency rerank done in Rust, see Search |
 | OpenCode | v2.3.2, `@opencode/plugin` 2.x | Promise plugin API |
@@ -117,6 +117,18 @@ Harness scaffolding is not session memory, and stored text is untrusted when it 
 
 ## Qdrant data model
 
+`MEMENTO_STORE=qdrant|sqlite` selects the backend and defaults to `qdrant`. SQLite uses `MEMENTO_SQLITE_PATH`, defaulting to `${XDG_DATA_HOME:-~/.local/share}/memento/memento.db`; it creates parent directories and a new database with mode 0600 on Unix. SQLite needs no Qdrant service. `/health` retains the `qdrant` field for compatibility and reports the active store's health.
+
+SQLite uses a versioned WAL database with segments, sessions and continuations tables, preserving Qdrant's deterministic point IDs. Segment payload fields are columns, with indexes on project, harness/session, kind, source and timestamp; dense vectors are little-endian f32 blobs. An external-content FTS5 index is synchronized by triggers. Each database operation runs on a blocking worker behind one connection mutex. Dense candidates use exact cosine after scope filtering. Lexical candidates use sanitized, quoted OR terms and FTS5 `porter unicode61`: unlike Qdrant's BM25 tokenizer, it does not remove English stopwords and its tokenization, stemming and BM25 scoring can differ. For each filtered top-50 list, fusion sums `1/(2 + rank)` with zero-based rank, matching Qdrant v1.20.2's default RRF; tied SQLite results use point ID order, while Qdrant does not specify tie breaking.
+
+SQLite search lazily caches segment payloads and decoded vectors in memory and applies the same scope filters before exact cosine scoring. Segment writes invalidate the cache while holding the connection mutex; `PRAGMA data_version` also detects commits from other SQLite connections. The cache is rebuilt on the next search. The lexical query uses an FTS-first cross join to avoid a SQLite planner choice that repeatedly evaluates FTS per project row.
+
+`mementod` enables Cargo features `embed-onnx` and `embed-candle` by default. `MEMENTO_EMBEDDER=onnx|candle` selects the backend, defaulting to ONNX when compiled in and Candle otherwise; selecting an unavailable backend fails. Candle-only builds use `cargo build -p mementod --no-default-features --features embed-candle` without ONNX Runtime. Both use CPU and `mementod warmup` downloads the selected model. Fastembed gives `HF_HOME` precedence, then `FASTEMBED_CACHE_DIR`, then `${XDG_CACHE_HOME:-~/.cache}/memento/models`; the image sets `FASTEMBED_CACHE_DIR=/opt/memento/models` explicitly. ONNX and Candle use different model artifacts and can produce different vectors, so do not switch a populated store's embedder without re-embedding it.
+
+For Candle, the daemon sets both `RAYON_NUM_THREADS` and `CANDLE_NUM_THREADS` before starting its async runtime to `MEMENTO_EMBED_THREADS`, or the available CPU count capped at four by default. The value must be a positive integer. This also affects other Rayon users in a Candle daemon; ONNX selection does not change either variable.
+
+`mementod migrate [--qdrant-url URL] [--prefix PREFIX] [--to PATH] [--force]` scrolls all three Qdrant collections without writing to Qdrant, re-embeds segments in batches with the selected backend, and copies sessions and continuations with their IDs and payloads. URL and prefix default to `MEMENTO_QDRANT_URL` and `MEMENTO_COLLECTION_PREFIX`, or `http://127.0.0.1:6334` and `memento`; the destination defaults to `MEMENTO_SQLITE_PATH` or the normal SQLite path. The command warns and counts segment payload keys ignored by the normal segment parser; `source_role` and `provenance` are additionally preserved for deduplication. It verifies copied counts, builds a temporary database in the destination directory, then installs it atomically. An existing destination requires `--force`, no WAL or SHM sidecars, and an exclusive SQLite lock; stop the daemon before migration. The source must remain quiescent for a consistent snapshot: scrolling is not a cross-collection snapshot, and counts verify copied points rather than concurrent source changes.
+
 Collection `memento_segments`:
 
 - named dense vector `dense`: 384, cosine.
@@ -170,6 +182,7 @@ All routes under `http://127.0.0.1:7377`. Optional bearer token via `MEMENTO_TOK
 | Method and path | Body or query | Response |
 | --- | --- | --- |
 | `GET /health` | | `{ "ok": true, "qdrant": true, "version"?: "x.y.z" }` |
+| `POST /admin/shutdown` | loopback peer and bearer token when configured | graceful shutdown accepted |
 | `PUT /v1/sessions` | `{ harness, project, session, parent?, parent_harness?, parent_cutoff?, require_parent?, parent_if_unset?, retention?, title? }`; `parent_cutoff` is an RFC 3339 timestamp; absent fields keep stored values, except an explicit parent link without a cutoff clears it; `parent_if_unset` atomically applies parent fields only when the stored parent is absent or matches, preserving an existing cutoff when none is supplied; `created` is set once | session record |
 | `GET /v1/sessions` | `?harness?&project?&include_deleted?` | `{ sessions: [...] }` |
 | `POST /v1/sessions/release` | `{ harness, project, session, reason? }` | `{ released, removed: [{ harness, session }] }` |
@@ -190,6 +203,10 @@ Errors: `{ "error": { "code": "...", "message": "..." } }` with 4xx/5xx.
 The release binary embeds the OpenCode plugin bundle, harness skills, and daemon Compose definition. `memento setup` installs the plugin under `${XDG_DATA_HOME:-~/.local/share}/memento/opencode-plugin/`, configures OpenCode to load it, installs embedded skills by default, and saves choices in `${XDG_CONFIG_HOME:-~/.config}/memento/install.json`. The receipt also records installer method, binary directory, and version. `--opencode-plugin DIR`, `--skills-source DIR`, `MEMENTO_OPENCODE_PLUGIN`, and `MEMENTO_SKILLS_DIR` override embedded assets for development checkouts. `install-skills --source DIR` accepts an optional source override. Setup can offer to start the managed daemon; `--start-daemon` requests that in non-interactive use.
 
 `memento daemon up|down|status|logs [-f]|pull` manages the embedded Compose definition at `${XDG_DATA_HOME:-~/.local/share}/memento/compose.yaml` through `docker compose -p memento`; `up` waits for health. The daemon image defaults to `ghcr.io/luckynee/mementod:<cli version>` and can be overridden with `MEMENTO_DAEMON_IMAGE`. Qdrant v1.20.2 uses the existing `memento_qdrant_storage` volume. `MEMENTO_TOKEN`, `MEMENTO_STALE_DAYS`, and `MEMENTO_STALE_SWEEP_SECS` pass through to the daemon.
+
+Setup saves `daemon_mode` as `docker`, `native` or `external`; legacy `managed_daemon` true maps to Docker and false to external, and the boolean remains for older clients. Docker is the fresh-setup default. Native setup warms the Candle model, then starts `mementod` with SQLite, a loopback bind, `MEMENTO_LOCK_PATH=${XDG_STATE_HOME:-~/.local/state}/memento/mementod.lock`, and `MEMENTO_IDLE_EXIT_SECS=1800` unless `native_idle_exit_secs` is saved. An exclusive nonblocking OS lock lasts for the serve process; its PID is informational only. Idle shutdown follows the last completed HTTP request and waits for in-flight requests; background sweeps do not count. `MEMENTO_IDLE_EXIT_SECS=0` disables idle shutdown. `daemon down` posts to the loopback-only authenticated shutdown endpoint and waits for the lock to release; it never signals the PID. Logs append to the state directory's `mementod.log`.
+
+CLI and MCP requests that cannot connect invoke native `daemon ensure` and retry once; concurrent starters contend on the same lock. Native startup may wait up to 120 seconds for model loading; synchronous hook context remains bounded by the existing eight-second deadline. Detached imports start independently. Native OpenCode setup enables plugin autostart; Docker and external modes are not automatically started by ensure. Native SQLite data is separate from Docker Qdrant data and requires explicit `mementod migrate`.
 
 `memento update` checks the latest GitHub release, verifies the archive SHA-256, replaces `memento` and `memento-mcp` for installer-managed installs, then runs `update --refresh` to reapply saved setup and pull/restart a managed daemon. `--check`, `--version <x.y.z>`, and `--refresh` control these actions. Binary replacement requires a script-install receipt and execution from its recorded binary directory; Cargo installs should use Cargo or the installer. `memento doctor [--offline]` reports installation receipt, latest release, Docker/Compose, daemon health, plugin and saved setup status, plus per-harness settings read from the installed configuration. Missing or unreadable settings warn without failing the check; `--offline` skips the latest-release check, and failures make it exit 1.
 
@@ -232,6 +249,8 @@ Location: `adapters/opencode/` (Promise plugin, `@opencode/plugin`). Verified co
 - Tool `memory_search({ query, scope? })`: calls `/v1/search` (k = 12). Jev `predicate` relevance runs with concurrency at most 4 only for prose kinds (`user_request`, `assistant_note`, `decision`, `constraint`, `task`); `file_change`, `command` and `file_ref` hits pass through on score because they are short and lexical. Keep hits with probability >= 0.5, return max 6 ordered by score. Hits with a Jev error, missing judgment or timeout (3 s) pass through on score; if no prose judgment succeeds, fall back to the top 6 by score. Results arrive as tool output at the end of the context, which keeps the prefix cacheable.
 - Command `memento-continue <session>`: links current session to parent via `PUT /v1/sessions`, then puts the digest as `ctx.session.instructions.entry.put({ key: "memento-continuation", ... })`.
 - Options (`ctx.options`): `url`, `token`, `harness` (`opencode`), `tailUserTurns` (3), `tailCharBudget` (40000), `digestBudget` (12000), `projectPrimer` (off), `subagentMemory` (`digest`, optionally `off` or `filtered`), `subagentMemoryAgents` (agent ID to mode overrides), `subagentDigestBudget` (12000), `jev` (true), `jevModel` (`opencode/jev-1.13-free`), `enabled` (true), `reconcile` (true), `activityLog` (true, false disables, string sets a custom path). The `filtered` subagent mode uses the `subagent` digest profile, omitting the parent's newest user request and acknowledgement notes shorter than 40 characters.
+
+- Native setup adds `autostart: true` and the absolute CLI path as `mementoBin`; other modes remove both. On a connection failure the client starts detached `memento daemon ensure`, shares one health wait across callers, and retries foreground requests once after health succeeds. The wait is bounded to 15 seconds and respects existing shorter deadlines; failures impose a 60-second cooldown. Background ingest does not wait and retains its cursor on failure. Autostart outcomes are recorded without content in the activity log.
 
 ## Deployment
 

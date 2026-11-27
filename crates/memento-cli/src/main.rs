@@ -11,7 +11,7 @@ use memento_core::protocol::{
     IngestRequest, Kind, Retention, Role, Scope, SearchRequest, SearchResponse, SessionRecord,
 };
 use memento_core::reference::{format_continuation, format_digest, format_search};
-use reqwest::blocking::{Client, Request};
+use reqwest::blocking::{Client, Request, RequestBuilder, Response};
 use reqwest::{Method, Url};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -23,6 +23,36 @@ mod doctor;
 mod receipt;
 mod setup;
 mod update;
+
+fn send_daemon(client: &Client, cli: &Cli, request: Request) -> Result<Response, CliError> {
+    let retry = request.try_clone();
+    match client.execute(request) {
+        Ok(response) => Ok(response),
+        Err(error) if error.is_connect() && retry.is_some() => {
+            let timeout = if matches!(&cli.command, Command::Hook(_)) {
+                Duration::from_secs(6)
+            } else {
+                Duration::from_secs(120)
+            };
+            daemon::ensure(cli, timeout)?;
+            client
+                .execute(retry.unwrap())
+                .map_err(|error| CliError::request(error, &cli.url))
+        }
+        Err(error) => Err(CliError::request(error, &cli.url)),
+    }
+}
+
+fn send_daemon_builder(
+    client: &Client,
+    cli: &Cli,
+    request: RequestBuilder,
+) -> Result<Response, CliError> {
+    let request = request
+        .build()
+        .map_err(|error| CliError::request(error, &cli.url))?;
+    send_daemon(client, cli, request)
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -900,9 +930,7 @@ fn confirm_keep_session(client: &Client, cli: &Cli) -> Result<(), CliError> {
     if let Some(token) = &cli.token {
         request = request.bearer_auth(token);
     }
-    let response = request
-        .send()
-        .map_err(|error| CliError::request(error, &cli.url))?;
+    let response = send_daemon_builder(client, cli, request)?;
     let status = response.status();
     let body = response
         .text()
@@ -942,9 +970,7 @@ fn select_digest_session(client: &Client, cli: &mut Cli) -> Result<(), CliError>
     if let Some(token) = &cli.token {
         request = request.bearer_auth(token);
     }
-    let response = request
-        .send()
-        .map_err(|error| CliError::request(error, &cli.url))?;
+    let response = send_daemon_builder(client, cli, request)?;
     let status = response.status();
     let body = response
         .text()
@@ -1051,9 +1077,7 @@ fn run_note(client: &Client, cli: &Cli, args: &NoteArgs) -> Result<(), CliError>
         registration_request = registration_request.bearer_auth(token);
         ingest_request = ingest_request.bearer_auth(token);
     }
-    let registration_response = registration_request
-        .send()
-        .map_err(|error| CliError::request(error, &cli.url))?;
+    let registration_response = send_daemon_builder(client, cli, registration_request)?;
     let status = registration_response.status();
     let body = registration_response.text().map_err(|error| {
         CliError::other(format!(
@@ -1064,9 +1088,7 @@ fn run_note(client: &Client, cli: &Cli, args: &NoteArgs) -> Result<(), CliError>
         return Err(response_error(status, &body));
     }
     let _: Value = parse_response(&body)?;
-    let response = ingest_request
-        .send()
-        .map_err(|error| CliError::request(error, &cli.url))?;
+    let response = send_daemon_builder(client, cli, ingest_request)?;
     let status = response.status();
     let body = response
         .text()
@@ -1152,9 +1174,7 @@ fn run(mut cli: Cli) -> Result<(), CliError> {
     select_digest_session(&client, &mut cli)?;
     confirm_keep_session(&client, &cli)?;
     let request = build_request(&client, &cli, ingest.as_ref())?;
-    let response = client
-        .execute(request)
-        .map_err(|error| CliError::request(error, &cli.url))?;
+    let response = send_daemon(&client, &cli, request)?;
     let status = response.status();
     let body = response
         .text()
