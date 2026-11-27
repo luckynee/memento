@@ -214,6 +214,7 @@ pub async fn migrate(
                     .migrate_segments(segments)
                     .await
                     .context("writing migrated segments")?;
+                eprintln!("migrated {} segments", counts[index]);
             }
             offset = page.next_page_offset;
             if offset.is_none() {
