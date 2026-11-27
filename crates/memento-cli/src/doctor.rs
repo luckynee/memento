@@ -585,12 +585,26 @@ fn activity_lines(path: &Path, now: i64) -> Vec<String> {
     )];
     if !errors.is_empty() {
         errors.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-        let messages = errors
+        let mut groups = Vec::<(&str, usize)>::new();
+        let mut group_indices = std::collections::HashMap::<&str, usize>::new();
+        for (_, message) in &errors {
+            let message = message.as_str();
+            if let Some(&index) = group_indices.get(message) {
+                groups[index].1 += 1;
+            } else {
+                group_indices.insert(message, groups.len());
+                groups.push((message, 1));
+            }
+        }
+        let mut messages = groups
             .iter()
             .take(3)
-            .map(|(_, message)| message.as_str())
+            .map(|(message, count)| format!("{message} (x{count})"))
             .collect::<Vec<_>>()
             .join("; ");
+        if groups.len() > 3 {
+            messages.push_str(&format!("; +{} more", groups.len() - 3));
+        }
         lines.push(format!(
             "warn: opencode activity errors(24h)={} latest: {messages}",
             errors.len()
@@ -790,9 +804,42 @@ mod tests {
         assert_eq!(
             lines[1],
             format!(
-                "warn: opencode activity errors(24h)=2 latest: {}; first",
+                "warn: opencode activity errors(24h)=2 latest: {} (x1); first (x1)",
                 "x".repeat(300)
             )
+        );
+    }
+
+    #[test]
+    fn activity_groups_warnings_by_message_and_orders_by_latest_occurrence() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("activity.jsonl");
+        let now = 1_700_000_000_000_i64;
+        fs::write(
+            path.with_file_name("activity.jsonl.1"),
+            format!(
+                "{{\"ts\":{},\"level\":\"warn\",\"message\":\"first\"}}\n{{\"ts\":{},\"level\":\"error\",\"message\":\"second\"}}\n{{\"ts\":{},\"level\":\"warn\",\"message\":\"fourth\"}}\n",
+                now - 100,
+                now - 600,
+                now - 400
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &path,
+            format!(
+                "{{\"ts\":{},\"level\":\"error\",\"message\":\"first\"}}\n{{\"ts\":{},\"level\":\"warn\",\"message\":\"third\"}}\n{{\"ts\":{},\"level\":\"warn\",\"message\":\"second\"}}\n{{\"ts\":{},\"level\":\"info\",\"message\":\"first\"}}\n{{\"ts\":{},\"level\":\"warn\",\"message\":\"first\"}}\n",
+                now - 700,
+                now - 300,
+                now - 200,
+                now - 50,
+                now - 24 * 60 * 60 * 1000 - 1
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            activity_lines(&path, now)[1],
+            "warn: opencode activity errors(24h)=6 latest: first (x2); second (x2); third (x1); +1 more"
         );
     }
 
