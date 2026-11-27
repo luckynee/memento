@@ -1,6 +1,6 @@
 # memento
 
-Session-continuation memory for coding-agent harnesses (OpenCode, Claude Code, Codex, agy). A Rust daemon (`mementod`) stores filtered session segments in Qdrant with hybrid search; the `memento` CLI, `memento-mcp`, and per-harness adapters ingest sessions and inject digests.
+Session-continuation memory for coding-agent harnesses (OpenCode, Claude Code, Codex, agy). A Rust daemon (`mementod`) stores filtered session segments with hybrid search, in Qdrant (Docker mode) or SQLite (native mode, started on demand); the `memento` CLI, `memento-mcp`, and per-harness adapters ingest sessions and inject digests.
 
 ## Read first
 
@@ -11,7 +11,7 @@ Session-continuation memory for coding-agent harnesses (OpenCode, Claude Code, C
 ## Layout
 
 - `crates/memento-core`: wire protocol, segmentation, lineage, rerank, digest rendering (shared by everything).
-- `crates/mementod`: HTTP daemon, Qdrant store, embedder.
+- `crates/mementod`: HTTP daemon, Qdrant and SQLite stores, ONNX and Candle embedders (cargo features `embed-onnx`, `embed-candle`), Qdrant-to-SQLite `migrate`.
 - `crates/memento-cli`: `memento` CLI (setup, hooks, importers, daemon management, update, doctor).
 - `crates/memento-mcp`: stdio MCP server exposing memory tools.
 - `adapters/opencode`: OpenCode V2 plugin (Bun, TypeScript).
@@ -26,6 +26,7 @@ Run the relevant checks before committing:
 ```sh
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
+cargo clippy -p mementod --no-default-features --features embed-candle --all-targets -- -D warnings
 cargo test
 cd adapters/opencode && bun test && bun run typecheck
 scripts/sync-adapter-skills.sh --check
