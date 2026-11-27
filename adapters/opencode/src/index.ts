@@ -11,6 +11,7 @@ import { createSessionOwnership, normalizeDirectory } from "./session-ownership"
 import { createSubagentMemoryController } from "./subagent-memory";
 import { cloneMessage, type ConversationMessage, type SystemText } from "./switch";
 import { createSwitchController } from "./switch-controller";
+import { createSystemOneDecisions } from "./systemone";
 import { createMemorySearchTool } from "./tools";
 
 function waitForRetry(signal: AbortSignal): Promise<void> {
@@ -92,9 +93,19 @@ export default Plugin.define({
             directory: ctx.location.directory,
             log,
         });
-        const decide: DecisionsFn | undefined = options.jev
+        if (options.jev && options.jevUrl && !options.jevSystemOneModel) {
+            log("Jev disabled: jevModel is required when jevUrl is configured");
+        }
+        const decide: DecisionsFn | undefined = options.jev && (!options.jevUrl || options.jevSystemOneModel)
             ? createJevGate({
-                decide: (input) => ctx.experimental.generate.decisions(input),
+                decide: options.jevUrl && options.jevSystemOneModel
+                    ? createSystemOneDecisions({
+                        url: options.jevUrl,
+                        model: options.jevSystemOneModel,
+                        apiKeyEnv: options.jevApiKeyEnv,
+                        apiKeyFile: options.jevApiKeyFile,
+                    })
+                    : (input) => ctx.experimental.generate.decisions(input),
                 cooldownMs: options.jevCooldownMs,
                 log,
             })

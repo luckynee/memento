@@ -43,9 +43,27 @@ Alternatively, add the checkout plugin to `opencode.jsonc` manually:
 | `subagentDigestBudget` | `12000` | Positive integer character budget for the subagent digest |
 | `enabled` | `true` | Enable the plugin |
 | `jev` | `true` | Enable Jev classification and relevance judgments |
-| `jevModel` | `opencode/jev-1.13-free` | Jev model as `provider/id` or a model object |
+| `jevModel` | `opencode/jev-1.13-free` | OpenCode model as `provider/id` or a model object; required verbatim model string when `jevUrl` is set |
+| `jevUrl` | unset | Full System One endpoint URL; otherwise use OpenCode's built-in decisions API |
+| `jevApiKeyEnv` | unset | Name of an environment variable holding the endpoint key |
+| `jevApiKeyFile` | unset | File holding the endpoint key, with `~` expanded and whitespace trimmed |
 | `jevCooldownMs` | `600000` | Milliseconds to skip Jev after a failure; non-negative integer |
 | `harness` | `opencode` | Harness identifier |
+
+For a custom System One endpoint, add options to the existing plugin entry:
+
+```jsonc
+{
+    "jevUrl": "https://router.example.com/v1/systemone",
+    "jevModel": "oc/jev-1.13-free",
+    "jevApiKeyFile": "~/.config/router/systemone-key"
+}
+```
+
+Set either `jevApiKeyFile` or `jevApiKeyEnv`, not both. With neither, the
+request is unauthenticated. A missing `jevModel` disables Jev for a custom
+endpoint. The endpoint receives classified session text and search queries
+and candidate memories; use a trusted HTTPS endpoint for remote services.
 
 On each completed step and execution the adapter ingests transcript messages.
 A backlog (new install on an existing session, reset cursor, fork) is sent in batches

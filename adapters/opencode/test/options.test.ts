@@ -36,6 +36,28 @@ test("validates adapter options and model references", () => {
     expect(parseJevModel("bad")).toEqual({ providerID: "opencode", id: "jev-1.13-free" });
 });
 
+test("validates System One options without parsing endpoint model ids", () => {
+    expect(resolveOptions({
+        jevUrl: " https://router.example/v1/systemone ",
+        jevModel: "openrouter/typesafe/jev-1.13",
+        jevApiKeyEnv: " ROUTER_KEY ",
+        jevApiKeyFile: " ~/router-key ",
+    })).toMatchObject({
+        jevUrl: "https://router.example/v1/systemone",
+        jevSystemOneModel: "openrouter/typesafe/jev-1.13",
+        jevApiKeyEnv: "ROUTER_KEY",
+        jevApiKeyFile: "~/router-key",
+    });
+    for (const value of [undefined, "", "  ", null, 42, { providerID: "p", id: "m" }]) {
+        const options = resolveOptions({ jevUrl: "https://router.example", jevModel: value, jevApiKeyEnv: value, jevApiKeyFile: value });
+        expect(options.jevSystemOneModel).toBeUndefined();
+        expect(options.jevApiKeyEnv).toBeUndefined();
+        expect(options.jevApiKeyFile).toBeUndefined();
+    }
+    expect(resolveOptions({ jevModel: "provider/model" }).jevModel).toEqual({ providerID: "provider", id: "model" });
+    expect(resolveOptions({ jevUrl: "", jevModel: "provider/model" }).jevSystemOneModel).toBeUndefined();
+});
+
 test("resume options are opt-in and validate positive finite thresholds", () => {
     expect(resolveOptions({}).resume).toBeUndefined();
     for (const resume of [false, null, [], "true", 1]) {

@@ -89,7 +89,7 @@ export type DecisionsFn = (input: {
     model: JevModel;
     input: { type: "text"; text: string }[];
     questions: Question[];
-}) => Promise<{ answers: ReadonlyArray<Answer> }>;
+}, signal?: AbortSignal) => Promise<{ answers: ReadonlyArray<Answer> }>;
 
 export async function forEachJevItem<T>(items: readonly T[], process: (item: T, index: number) => Promise<void>): Promise<void> {
     let index = 0;
@@ -196,12 +196,16 @@ export function createJevGate(deps: {
             throw new Error("Jev cooldown active");
         }
         const callGeneration = generation;
+        const controller = new AbortController();
         let cancelTimeout: (() => void) | undefined;
         try {
             const result = await Promise.race([
-                deps.decide(input),
+                deps.decide(input, controller.signal),
                 new Promise<never>((_, reject) => {
-                    cancelTimeout = scheduleTimeout(() => reject(new Error("Jev request timed out")), deps.timeoutMs ?? 3000);
+                    cancelTimeout = scheduleTimeout(() => {
+                        reject(new Error("Jev request timed out"));
+                        controller.abort();
+                    }, deps.timeoutMs ?? 3000);
                 }),
             ]);
             const errors = result.answers.filter((answer) => answer.type === "error");

@@ -38,6 +38,7 @@ export function resolveOptions(raw: Record<string, unknown>) {
         ? raw.tailCharBudget : 40000;
     const jevCooldownMs = typeof raw.jevCooldownMs === "number" && Number.isSafeInteger(raw.jevCooldownMs) && raw.jevCooldownMs >= 0
         ? raw.jevCooldownMs : 600000;
+    const jevUrl = typeof raw.jevUrl === "string" && raw.jevUrl.trim() ? raw.jevUrl.trim() : undefined;
     const subagentMemoryAgents: Record<string, SubagentMemoryMode> = Object.fromEntries(
         raw.subagentMemoryAgents && typeof raw.subagentMemoryAgents === "object" && !Array.isArray(raw.subagentMemoryAgents)
             ? Object.entries(raw.subagentMemoryAgents).filter((entry): entry is [string, SubagentMemoryMode] => isSubagentMemoryMode(entry[1]))
@@ -63,6 +64,10 @@ export function resolveOptions(raw: Record<string, unknown>) {
         jev: typeof raw.jev === "boolean" ? raw.jev : true,
         jevCooldownMs,
         jevModel: parseJevModel(raw.jevModel),
+        jevUrl,
+        jevSystemOneModel: jevUrl && typeof raw.jevModel === "string" && raw.jevModel.trim() ? raw.jevModel : undefined,
+        jevApiKeyEnv: typeof raw.jevApiKeyEnv === "string" && raw.jevApiKeyEnv.trim() ? raw.jevApiKeyEnv.trim() : undefined,
+        jevApiKeyFile: typeof raw.jevApiKeyFile === "string" && raw.jevApiKeyFile.trim() ? raw.jevApiKeyFile.trim() : undefined,
         harness: typeof raw.harness === "string" && raw.harness.trim() ? raw.harness : "opencode",
     };
 }
