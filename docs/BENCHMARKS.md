@@ -2,6 +2,14 @@
 
 These measurements describe particular sessions and small experiments, not expected savings or recall guarantees. The underlying recorded observations are in [the code map](MAP.md#verified-runtime-facts). Input-token figures are request totals where recorded, not necessarily uncached tokens; the available notes do not consistently break out cache reads, model versions, or exact sample sizes. They should not be read as cost comparisons.
 
+## Jev on versus off
+
+- **Date and environment:** 2026-11-27; throwaway `mementod` 0.3.2 (SQLite + Candle) on a copy of real memory (about 2,800 segments, six projects), plugin code at `f69d521e` (`judgeRelevance`, `classifyKind`, `createJevGate`, System One backend) through a 9Router `/v1/systemone` with `oc/jev-1.13-free` and `openrouter/typesafe/jev-1.13`.
+- **Sample and setup:** 30 paraphrased questions written by an agent from the copy, each with one known target message, project-scoped search with k = 12. Arms: score-only top 6 (the no-Jev fallback) versus the plugin's Jev filter (drop prose hits with relevance below 0.5, then top 6). Labeling: `classifyKind` on 80 assistant notes stored unlabeled during a Jev rate limit and on 40 notes labeled earlier.
+- **Measured:** Target in the returned 6, hits returned, hits Jev judged irrelevant, added latency, Jev calls and failures, labels assigned.
+- **Results:** Target in the top 12 for 25/30 and in the returned 6 for 24/30 in every arm; Jev neither dropped a target (targets scored 0.72-0.98) nor rescued one (the rank-11 target stayed out). Jev judged 40 of the 180 score-only top-6 hits (22%) irrelevant and removed them, refilling from ranks 7-12, returning 171-172 hits instead of 180. It added about 1.1-1.4 s per search (311 calls per model, 0 failures). Both models gave the same judgments within 0.01. Labeling the 80 unlabeled notes gave 22 `task`, 2 `decision`, 0 `constraint`, 56 none (confidence threshold 0.6); 39/40 earlier labels were reproduced. Of 81 stored assistant `task` labels, sampled ones were mostly progress narration ("Checking ...", "I'll fix that and rebuild"); in 3 of 6 sessions with a task memory, the newest one (which the digest shows as "Current tasks") was such a note rather than a todo list.
+- **Caveats:** One run, 30 single-target queries written by one agent; no human relevance labels, so the 22% irrelevant share is Jev's own judgment. Recall effects on digests after compaction were not measured.
+
 ## Real usage audit
 
 - **Date and environment:** 2026-11-26; OpenCode 2.4.1, real sessions, read-only audit of `opencode.db`. The models and provider versions for the individual observations were not recorded in the map.
