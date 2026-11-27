@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { MementoClient, MementoError } from "../src/client";
 
+function refused(): Error {
+    return Object.assign(new Error("connection refused"), { code: "ECONNREFUSED" });
+}
+
 describe("daemon client", () => {
     test("sets optional bearer authentication and sends JSON", async () => {
         const calls: RequestInit[] = [];
@@ -114,5 +118,76 @@ describe("daemon client", () => {
         })) as typeof fetch;
         const client = new MementoClient({ fetch: fetcher, timeoutMs: 5 });
         await expect(client.health()).rejects.toMatchObject({ code: "timeout" });
+    });
+
+    test("deduplicates concurrent startup and retries after health succeeds", async () => {
+        let running = false;
+        let starts = 0;
+        const events: string[] = [];
+        const client = new MementoClient({
+            autostart: true,
+            mementoBin: "/scratch/memento",
+            startDaemon: (binary, url) => {
+                expect([binary, url]).toEqual(["/scratch/memento", "http://127.0.0.1:7377"]);
+                starts++;
+                running = true;
+            },
+            activity: { record(entry) { events.push(String(entry.detail?.outcome)); } },
+            fetch: (async (url) => {
+                if (!running) {
+                    throw refused();
+                }
+                return Response.json(new URL(String(url)).pathname === "/health" ? { ok: true } : { text: "digest", segments: 1 });
+            }) as typeof fetch,
+        });
+        const payload = { harness: "h", project: "p", session: "s", budget: 10 };
+        const results = await Promise.all([client.digest(payload), client.digest(payload)]);
+        expect(results.map((result) => result.text)).toEqual(["digest", "digest"]);
+        expect(starts).toBe(1);
+        expect(events).toEqual(["attempt", "ready"]);
+    });
+
+    test("startup timeout degrades and cooldown suppresses another spawn", async () => {
+        let starts = 0;
+        const events: string[] = [];
+        const client = new MementoClient({
+            autostart: true,
+            mementoBin: "/scratch/memento",
+            startDaemon: () => { starts++; },
+            startupWaitMs: 10,
+            startupPollMs: 2,
+            activity: { record(entry) { events.push(String(entry.detail?.outcome)); } },
+            fetch: (async () => { throw refused(); }) as unknown as typeof fetch,
+        });
+        const payload = { harness: "h", project: "p", session: "s", budget: 10 };
+        await expect(client.digest(payload)).rejects.toMatchObject({ code: "unavailable" });
+        await expect(client.digest(payload)).rejects.toMatchObject({ code: "unavailable" });
+        expect(starts).toBe(1);
+        expect(events).toEqual(["attempt", "failed"]);
+    });
+
+    test("background ingest does not wait for daemon startup", async () => {
+        let starts = 0;
+        const client = new MementoClient({
+            autostart: true,
+            mementoBin: "/scratch/memento",
+            startDaemon: () => { starts++; },
+            startupWaitMs: 10,
+            startupPollMs: 2,
+            fetch: (async () => { throw refused(); }) as unknown as typeof fetch,
+        });
+        await expect(client.ingest({ harness: "h", project: "p", session: "s", items: [] }, false)).rejects.toMatchObject({ code: "unavailable" });
+        expect(starts).toBe(1);
+    });
+
+    test("disabled autostart, relative binaries, and HTTP errors never spawn", async () => {
+        let starts = 0;
+        const startDaemon = () => { starts++; };
+        const offline = (async () => { throw refused(); }) as unknown as typeof fetch;
+        await expect(new MementoClient({ mementoBin: "/scratch/memento", startDaemon, fetch: offline }).health()).rejects.toMatchObject({ code: "unavailable" });
+        await expect(new MementoClient({ autostart: true, mementoBin: "memento", startDaemon, fetch: offline }).health()).rejects.toMatchObject({ code: "unavailable" });
+        await expect(new MementoClient({ autostart: true, mementoBin: "/scratch/memento", startDaemon, fetch: (async () => { throw new Error("bad JSON"); }) as unknown as typeof fetch }).health()).rejects.toMatchObject({ code: "unavailable" });
+        await expect(new MementoClient({ autostart: true, mementoBin: "/scratch/memento", startDaemon, fetch: (async () => new Response("", { status: 500 })) as unknown as typeof fetch }).health()).rejects.toMatchObject({ code: "http_500" });
+        expect(starts).toBe(0);
     });
 });

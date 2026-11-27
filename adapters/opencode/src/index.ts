@@ -71,8 +71,8 @@ export default Plugin.define({
             return () => {};
         }
         const project = projectKey(ctx.location.project, ctx.location.directory);
-        const client = new MementoClient({ url: options.url, token: options.token });
         const activity = options.activityLog === false ? undefined : createActivityLog(typeof options.activityLog === "string" ? { path: options.activityLog } : {});
+        const client = new MementoClient({ url: options.url, token: options.token, autostart: options.autostart, mementoBin: options.mementoBin, activity, project });
         const log = (message: string, error?: unknown) => {
             console.warn("[memento] " + message, error ?? "");
             if (error === undefined && message.startsWith("resume compaction")) {

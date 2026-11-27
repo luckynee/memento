@@ -31,6 +31,8 @@ Alternatively, add the checkout plugin to `opencode.jsonc` manually:
 | --- | --- | --- |
 | `url` | `MEMENTO_URL` or `http://127.0.0.1:7377` | Daemon URL |
 | `token` | `MEMENTO_TOKEN` | Optional bearer token |
+| `autostart` | `false` | Start a native daemon on connection failure; native `memento setup` enables this |
+| `mementoBin` | unset | Absolute path to the memento executable, written by native setup |
 | `tailUserTurns` | `3` | Recent user turns retained after a model switch |
 | `tailCharBudget` | `40000` | Target character budget for the pre-switch tail |
 | `digestBudget` | `12000` | Digest character budget |
@@ -46,6 +48,10 @@ Alternatively, add the checkout plugin to `opencode.jsonc` manually:
 | `harness` | `opencode` | Harness identifier |
 
 On each completed step and execution the adapter ingests transcript messages.
+Native autostart waits at most 15 seconds for foreground requests, respects shorter
+existing deadlines, and retries once. Background ingest does not wait; its cursor
+remains unchanged on failure and later events retry. Failed starts have a 60-second
+cooldown. Attempts and outcomes are recorded in the activity log without content.
 After a model switch it adds a per-model frozen digest to system instructions
 while preserving a bounded recent tail. The `memory_search` tool retrieves stored memories, and
 `/memento-continue <harness>/<session>` links a session to an earlier session,

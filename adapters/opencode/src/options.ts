@@ -46,6 +46,8 @@ export function resolveOptions(raw: Record<string, unknown>) {
     return {
         url,
         token,
+        autostart: raw.autostart === true,
+        mementoBin: typeof raw.mementoBin === "string" ? raw.mementoBin : undefined,
         tailUserTurns,
         tailCharBudget,
         digestBudget,

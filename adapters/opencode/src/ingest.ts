@@ -47,7 +47,7 @@ export function createIngestor(deps: {
         sessionState(sessionID).registered = true;
     }
 
-    async function registerSession(sessionID: string): Promise<string | undefined> {
+    async function registerSession(sessionID: string, waitForStartup = true): Promise<string | undefined> {
         const state = sessionState(sessionID);
         if (state.registered && !state.retryClaim) {
             return;
@@ -83,7 +83,7 @@ export function createIngestor(deps: {
         let continuation: string | undefined;
         if (await deps.storage.get(claimKey) !== true) {
             try {
-                const claim = await deps.client.claimContinuation({ project: deps.project, harness: deps.harness, session: sessionID });
+                const claim = await deps.client.claimContinuation({ project: deps.project, harness: deps.harness, session: sessionID }, waitForStartup);
                 if (!claim || typeof claim.claimed !== "boolean") {
                     throw new Error("Invalid continuation claim response");
                 }
@@ -120,7 +120,7 @@ export function createIngestor(deps: {
                 await deps.client.putSession({
                     ...identity,
                     ...(fork && !hasClaimedParent ? { parent_harness: deps.harness, parent: fork.sessionID, parent_cutoff: new Date(fork.created).toISOString(), require_parent: true } : {}),
-                });
+                }, waitForStartup);
             } catch (error) {
                 if (!fork || hasClaimedParent || !(error instanceof MementoError) || error.code !== "parent_unavailable") {
                     throw error;
@@ -129,7 +129,7 @@ export function createIngestor(deps: {
                     throw new Error(`Cannot clear fork state for session ${sessionID}`);
                 }
                 await deps.storage.remove(`memento/fork/${sessionID}`);
-                await deps.client.putSession(identity);
+                await deps.client.putSession(identity, waitForStartup);
             }
             recordActivity(deps.activity, { level: "info", event: "register", session: sessionID, project: deps.project });
             if (state.retryClaim) {
@@ -144,8 +144,8 @@ export function createIngestor(deps: {
         return continuation;
     }
 
-    async function ingestSession(sessionID: string): Promise<void> {
-        await registerSession(sessionID);
+    async function ingestSession(sessionID: string, waitForStartup = true): Promise<void> {
+        await registerSession(sessionID, waitForStartup);
         const cursorValue = await deps.storage.get(`memento/ingest/${sessionID}`);
         const cursor = typeof cursorValue === "string" ? cursorValue : undefined;
         const context = await deps.loadContext(sessionID);
@@ -192,7 +192,7 @@ export function createIngestor(deps: {
             const hash = createHash("sha256").update(JSON.stringify(items)).digest("hex");
             if (selection.nextCursor !== cursor || sessionState(sessionID).lastIngestHash !== hash) {
                 const started = Date.now();
-                const result = await deps.client.ingest({ harness: deps.harness, project: deps.project, session: sessionID, items });
+                const result = await deps.client.ingest({ harness: deps.harness, project: deps.project, session: sessionID, items }, waitForStartup);
                 recordActivity(deps.activity, { level: "info", event: "ingest", session: sessionID, project: deps.project, detail: { items: items.length, segments: result.segments, skipped: result.skipped, durationMs: Date.now() - started } });
                 sessionState(sessionID).lastIngestHash = hash;
             }
@@ -224,7 +224,7 @@ export function createIngestor(deps: {
     }
 
     function handleExecutionSucceeded(sessionID: string): Promise<void> {
-        return flush(sessionID).catch((error: unknown) => {
+        return serialize(sessionID, () => ingestSession(sessionID, false)).catch((error: unknown) => {
             deps.log(`Failed to ingest session ${sessionID}`, error);
         });
     }
