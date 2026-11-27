@@ -89,7 +89,7 @@ case ":${PATH:-}:" in
 esac
 
 if ! command -v docker >/dev/null 2>&1; then
-	printf 'Docker is required for the default daemon mode; native mode is available with memento setup --daemon native.\n'
+	printf 'Docker was not found; that is fine for the default native mode. Docker is only needed for memento setup --daemon docker.\n'
 fi
 
 printf 'Installed memento %s, memento-mcp and mementod to %s\n' "$installed_version" "$install_dir"

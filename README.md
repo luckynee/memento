@@ -139,7 +139,14 @@ For OpenCode, setup also accepts:
 
 ## Upgrading from v0.2
 
-Releases before v0.3 stored memory in Docker (Qdrant). After `memento update` installs a new version, memento detects a Docker memory volume (Compose project `memento`, or `MEMENTO_COMPOSE_PROJECT`) and, on a terminal, asks "Move your N memories from Docker to the native daemon? [Y/n]". Without a terminal it prints the hint `memento daemon migrate`, and `memento doctor` warns until you migrate.
+Releases before v0.3 stored memory in Docker (Qdrant). The v0.2 `memento update` cannot unpack v0.3 archives (they add `mementod`), so upgrade from v0.2 by re-running the installer without the setup wizard, then refreshing your saved setup:
+
+```sh
+curl -fsSL https://github.com/luckynee/memento/releases/latest/download/install.sh | MEMENTO_NO_SETUP=1 sh
+memento update --refresh
+```
+
+The installer keeps your saved setup. From v0.3 on, `memento update` works normally. After an update or refresh, memento detects a Docker memory volume (Compose project `memento`, or `MEMENTO_COMPOSE_PROJECT`) and, on a terminal, asks "Move your N memories from Docker to the native daemon? [Y/n]". Without a terminal it prints the hint `memento daemon migrate`, and `memento doctor` warns until you migrate.
 
 ```sh
 memento daemon migrate
