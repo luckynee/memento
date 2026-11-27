@@ -6,3 +6,5 @@ node_modules
 .env
 .env.*
 /adapters/opencode/dist
+/.opencode/AGENTS.local.md
+/.opencode/opencode.jsonc
