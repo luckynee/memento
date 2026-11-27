@@ -43,7 +43,7 @@ async fn request(
         .unwrap()
         .parse()
         .unwrap();
-    (status, serde_json::from_str(body).unwrap())
+    (status, serde_json::from_str(body).unwrap_or(Value::Null))
 }
 
 #[tokio::test]
@@ -79,6 +79,8 @@ async fn route_workflow() {
             duplicate_jaccard_threshold: 0.8,
             stale_secs: 7 * 86_400,
             stale_sweep_secs: 3600,
+            idle_exit_secs: 0,
+            lock_path: None,
         },
         policy: Default::default(),
         rerank: Default::default(),
@@ -131,6 +133,8 @@ async fn sqlite_route_workflow() {
             duplicate_jaccard_threshold: 0.8,
             stale_secs: 7 * 86_400,
             stale_sweep_secs: 3600,
+            idle_exit_secs: 0,
+            lock_path: None,
         },
         policy: Default::default(),
         rerank: Default::default(),
@@ -140,6 +144,81 @@ async fn sqlite_route_workflow() {
     let result = tokio::spawn(async move { run_workflow(&address, &test_store).await }).await;
     server.abort();
     result.unwrap();
+    drop(store);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_endpoint_requires_token_and_loopback() {
+    let path = std::env::temp_dir().join(format!(
+        "memento-shutdown-{}.db",
+        Uuid::new_v5(
+            &Uuid::NAMESPACE_OID,
+            format!("{:?}", std::time::SystemTime::now()).as_bytes()
+        )
+    ));
+    let store = Arc::new(
+        Store::sqlite(path.clone(), Arc::new(FakeEmbedder))
+            .await
+            .unwrap(),
+    );
+    store.ensure_schema().await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let state = mementod::routes::RouterState::new(AppState {
+        store: store.clone(),
+        config: Config {
+            bind: listener.local_addr().unwrap(),
+            store: "sqlite".into(),
+            sqlite_path: path.clone(),
+            qdrant_url: String::new(),
+            token: Some("test-token".into()),
+            collection_prefix: String::new(),
+            cache_dir: None,
+            duplicate_cosine_threshold: 0.95,
+            duplicate_jaccard_threshold: 0.8,
+            stale_secs: 0,
+            stale_sweep_secs: 3600,
+            idle_exit_secs: 0,
+            lock_path: None,
+        },
+        policy: Default::default(),
+        rerank: Default::default(),
+    });
+    let app = mementod::routes::router_with_state(state.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap()
+    });
+    assert_eq!(
+        request(&address, "POST", "/admin/shutdown", None, "")
+            .await
+            .0,
+        401
+    );
+    assert_eq!(
+        request(&address, "POST", "/admin/shutdown", Some("wrong"), "")
+            .await
+            .0,
+        401
+    );
+    assert_eq!(
+        request(&address, "POST", "/admin/shutdown", Some("test-token"), "")
+            .await
+            .0,
+        202
+    );
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        state.shutdown_requested(),
+    )
+    .await
+    .unwrap();
+    server.abort();
     drop(store);
     std::fs::remove_file(path).unwrap();
 }

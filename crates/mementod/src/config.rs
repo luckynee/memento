@@ -15,6 +15,8 @@ pub struct Config {
     pub duplicate_jaccard_threshold: f32,
     pub stale_secs: u64,
     pub stale_sweep_secs: u64,
+    pub idle_exit_secs: u64,
+    pub lock_path: Option<PathBuf>,
 }
 
 impl Config {
@@ -64,6 +66,13 @@ impl Config {
                 .parse::<u64>()
                 .context("invalid MEMENTO_STALE_SWEEP_SECS")?
                 .max(1),
+            idle_exit_secs: env::var("MEMENTO_IDLE_EXIT_SECS")
+                .unwrap_or_else(|_| "0".into())
+                .parse()
+                .context("invalid MEMENTO_IDLE_EXIT_SECS")?,
+            lock_path: env::var_os("MEMENTO_LOCK_PATH")
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from),
         })
     }
 }

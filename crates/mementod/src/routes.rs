@@ -1,12 +1,13 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    net::SocketAddr,
     sync::{Arc, Weak},
 };
 
 use axum::{
     Json, Router,
     extract::{
-        DefaultBodyLimit, Path, Query, Request, State,
+        ConnectInfo, DefaultBodyLimit, Path, Query, Request, State,
         rejection::{JsonRejection, PathRejection, QueryRejection},
     },
     http::{Method, StatusCode, header::AUTHORIZATION},
@@ -49,6 +50,7 @@ pub struct RouterState {
     registry_lock: Arc<Mutex<()>>,
     operation_lock: Arc<RwLock<()>>,
     session_locks: Arc<std::sync::Mutex<HashMap<SessionKey, Weak<Mutex<()>>>>>,
+    shutdown: Arc<tokio::sync::Notify>,
 }
 
 impl RouterState {
@@ -58,7 +60,12 @@ impl RouterState {
             registry_lock: Arc::new(Mutex::new(())),
             operation_lock: Arc::new(RwLock::new(())),
             session_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    pub async fn shutdown_requested(&self) {
+        self.shutdown.notified().await;
     }
 }
 
@@ -126,6 +133,7 @@ pub async fn run_stale_sweep(state: RouterState, mut shutdown: oneshot::Receiver
 pub fn router_with_state(state: RouterState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/admin/shutdown", post(admin_shutdown))
         .route("/v1/sessions", get(list_sessions).put(put_session))
         .route("/v1/sessions/release", post(release_session))
         .route("/v1/maintenance/sweep", post(maintenance_sweep))
@@ -314,6 +322,21 @@ async fn not_found() -> ApiError {
         code: "not_found",
         message: "route not found",
     }
+}
+
+async fn admin_shutdown(
+    State(state): State<RouterState>,
+    peer: Option<axum::Extension<ConnectInfo<SocketAddr>>>,
+) -> StatusCode {
+    if !shutdown_peer_allowed(peer.map(|axum::Extension(ConnectInfo(address))| address)) {
+        return StatusCode::FORBIDDEN;
+    }
+    state.shutdown.notify_one();
+    StatusCode::ACCEPTED
+}
+
+fn shutdown_peer_allowed(peer: Option<SocketAddr>) -> bool {
+    peer.is_some_and(|address| address.ip().is_loopback())
 }
 
 async fn health(State(state): State<RouterState>) -> Json<Health> {
@@ -1587,6 +1610,8 @@ mod tests {
                 duplicate_jaccard_threshold: 0.8,
                 stale_secs: 1,
                 stale_sweep_secs: 3600,
+                idle_exit_secs: 0,
+                lock_path: None,
             },
             policy: Default::default(),
             rerank: Default::default(),
@@ -1608,6 +1633,18 @@ mod tests {
         assert!(!authorized(Some("token"), Some("Bearer wrong")));
         assert!(!authorized(Some("token"), Some("Basic token")));
         assert!(authorized(Some("token"), Some("Bearer token")));
+    }
+
+    #[test]
+    fn shutdown_requires_loopback_peer() {
+        assert!(shutdown_peer_allowed(Some(
+            "127.0.0.1:1234".parse().unwrap()
+        )));
+        assert!(shutdown_peer_allowed(Some("[::1]:1234".parse().unwrap())));
+        assert!(!shutdown_peer_allowed(Some(
+            "192.0.2.1:1234".parse().unwrap()
+        )));
+        assert!(!shutdown_peer_allowed(None));
     }
 
     #[test]
