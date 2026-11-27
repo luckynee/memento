@@ -1898,7 +1898,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "memento-cli"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "clap",
@@ -1917,7 +1917,7 @@ dependencies = [
 
 [[package]]
 name = "memento-core"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "serde",
@@ -1927,7 +1927,7 @@ dependencies = [
 
 [[package]]
 name = "memento-mcp"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1945,7 +1945,7 @@ dependencies = [
 
 [[package]]
 name = "mementod"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
