@@ -62,7 +62,7 @@ jobs:
       - name: Build release binaries
         run: |
           cargo build --locked --release -p memento-cli -p memento-mcp --target "${{ matrix.target }}"
-          cargo build --locked --release -p mementod --no-default-features --features embed-candle --target "${{ matrix.target }}"
+          cargo build --locked --release -p mementod --target "${{ matrix.target }}"
       - name: Package assets
         shell: bash
         run: |

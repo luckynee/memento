@@ -17,7 +17,7 @@ services:
             MEMENTO_STALE_DAYS: ${MEMENTO_STALE_DAYS:-7}
             MEMENTO_STALE_SWEEP_SECS: ${MEMENTO_STALE_SWEEP_SECS:-3600}
         ports:
-            - "127.0.0.1:7377:7377"
+            - "127.0.0.1:${MEMENTO_DAEMON_PORT:-7377}:7377"
         depends_on:
             qdrant:
                 condition: service_healthy

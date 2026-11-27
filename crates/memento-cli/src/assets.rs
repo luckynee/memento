@@ -58,13 +58,17 @@ pub(super) fn write_opencode_plugin(data_dir: &Path) -> Result<PathBuf, CliError
     Ok(directory)
 }
 
-pub(super) fn render_compose(image_override: Option<&str>) -> String {
-    let image = image_override
+pub(super) fn daemon_image(image_override: Option<&str>) -> &str {
+    image_override
         .filter(|image| !image.trim().is_empty())
         .unwrap_or(concat!(
             "ghcr.io/luckynee/mementod:",
             env!("CARGO_PKG_VERSION")
-        ));
+        ))
+}
+
+pub(super) fn render_compose(image_override: Option<&str>) -> String {
+    let image = daemon_image(image_override);
     include_str!("../assets/compose.yaml")
         .replace("__MEMENTO_IMAGE__", &serde_json::to_string(image).unwrap())
 }

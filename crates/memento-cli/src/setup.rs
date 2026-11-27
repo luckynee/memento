@@ -678,6 +678,17 @@ fn resolve_path(
     }
 }
 
+fn default_daemon_mode(
+    no_previous_setup: bool,
+    previous_mode: crate::daemon::DaemonMode,
+) -> crate::daemon::DaemonMode {
+    if no_previous_setup {
+        crate::daemon::DaemonMode::Native
+    } else {
+        previous_mode
+    }
+}
+
 pub fn run(cli: &Cli, args: &SetupArgs) -> Result<(), CliError> {
     let terminal = io::stdin().is_terminal() && io::stderr().is_terminal();
     if !terminal && !args.yes {
@@ -705,21 +716,22 @@ pub fn run(cli: &Cli, args: &SetupArgs) -> Result<(), CliError> {
         Some(mode) => mode,
         None if interactive => match Select::new()
             .with_prompt("Daemon mode")
-            .items(["Docker (default)", "Native (Docker-free)", "External"])
-            .default(match previous_mode {
-                crate::daemon::DaemonMode::Docker => 0,
-                crate::daemon::DaemonMode::Native => 1,
-                crate::daemon::DaemonMode::External => 0,
-            })
+            .items(["Native (default, Docker-free)", "Docker", "External"])
+            .default(
+                match default_daemon_mode(previous_setup.is_empty(), previous_mode) {
+                    crate::daemon::DaemonMode::Native => 0,
+                    crate::daemon::DaemonMode::Docker => 1,
+                    crate::daemon::DaemonMode::External => 2,
+                },
+            )
             .interact()
             .map_err(prompt_error)?
         {
-            0 => crate::daemon::DaemonMode::Docker,
-            1 => crate::daemon::DaemonMode::Native,
+            0 => crate::daemon::DaemonMode::Native,
+            1 => crate::daemon::DaemonMode::Docker,
             _ => crate::daemon::DaemonMode::External,
         },
-        None if previous_setup.is_empty() => crate::daemon::DaemonMode::Docker,
-        None => previous_mode,
+        None => default_daemon_mode(previous_setup.is_empty(), previous_mode),
     };
     let scope = match args.scope {
         Some(scope) => scope,
@@ -1069,15 +1081,15 @@ pub fn run(cli: &Cli, args: &SetupArgs) -> Result<(), CliError> {
         return Ok(());
     }
     if daemon_mode == crate::daemon::DaemonMode::Native {
-        if previous_mode == crate::daemon::DaemonMode::Docker {
-            eprintln!(
-                "Existing Docker memories are not migrated automatically; see mementod migrate."
-            );
-            if daemon_healthy {
-                return Err(CliError::other(
-                    "stop the Docker daemon before starting native mode at the same URL",
-                ));
+        if previous_mode != crate::daemon::DaemonMode::Native
+            && crate::daemon::docker_memory_exists()?
+        {
+            if crate::daemon::offer_migration(cli)? {
+                return run(cli, args);
             }
+            return Err(CliError::other(
+                "Docker memory exists; migrate it with memento daemon migrate before selecting native mode",
+            ));
         }
         crate::daemon::warmup()?;
         if !daemon_healthy || previous_mode != crate::daemon::DaemonMode::Native {
@@ -1230,6 +1242,70 @@ pub(super) fn reapply_saved_setup(cli: &Cli) -> Result<(), CliError> {
         dry_run: false,
     };
     run(cli, &args)
+}
+
+pub(super) fn reapply_native_opencode(
+    cli: &Cli,
+    setup: &serde_json::Map<String, Value>,
+) -> Result<(), CliError> {
+    if !setup
+        .get("harnesses")
+        .and_then(Value::as_array)
+        .is_some_and(|harnesses| {
+            harnesses
+                .iter()
+                .any(|item| item.as_str() == Some("opencode"))
+        })
+    {
+        return Ok(());
+    }
+    let scope = match setup.get("scope").and_then(Value::as_str) {
+        Some("project") => Scope::Project,
+        Some("user") => Scope::User,
+        _ => return Err(CliError::other("saved setup has invalid scope")),
+    };
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| CliError::other("HOME is required"))?;
+    let xdg = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    let project = setup
+        .get("project")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let plugin = setup
+        .get("opencode_plugin")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .unwrap_or(crate::assets::data_dir()?.join("opencode-plugin"));
+    let context = Context {
+        scope,
+        project,
+        home,
+        xdg,
+        executable: env::current_exe()
+            .map_err(|error| CliError::other(format!("cannot determine executable: {error}")))?,
+        plugin: Some(plugin),
+        skills_source: None,
+        install_skills: false,
+        embedded_plugin: false,
+        url: cli.url.clone(),
+        daemon_mode: crate::daemon::DaemonMode::Native,
+        resume: None,
+        primer: None,
+        compaction: None,
+    };
+    let memory = setup
+        .get("subagent_memory")
+        .and_then(Value::as_object)
+        .and_then(|modes| modes.get("opencode"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let path = opencode_config_path(scope == Scope::User, &context.project, &context.xdg);
+    let output = opencode_merge(&path, &context, memory)?;
+    cross_harness::save_atomic(&path, output.as_bytes())
 }
 
 fn saved_opencode_options(setup: &Value) -> (Option<Toggle>, Option<Toggle>, Option<Compaction>) {
@@ -1502,7 +1578,7 @@ fn skill_removal_blocker(
     None
 }
 
-pub fn remove(args: &RemoveArgs) -> Result<(), CliError> {
+pub fn remove(cli: &Cli, args: &RemoveArgs) -> Result<(), CliError> {
     let terminal = io::stdin().is_terminal() && io::stderr().is_terminal();
     if !terminal && !args.yes && !args.dry_run {
         return Err(CliError::other("non-interactive removal requires --yes"));
@@ -1511,11 +1587,12 @@ pub fn remove(args: &RemoveArgs) -> Result<(), CliError> {
     let mut receipt = crate::receipt::read()
         .map_err(|error| CliError::other(format!("cannot read install receipt: {error}")))?;
     let setup = receipt.get("setup").and_then(Value::as_object).cloned();
-    let managed = setup
-        .as_ref()
-        .and_then(|setup| setup.get("managed_daemon"))
-        .and_then(Value::as_bool)
-        == Some(true);
+    let managed = setup.as_ref().is_some_and(|setup| {
+        matches!(
+            crate::daemon::saved_mode(Some(setup)),
+            Ok(crate::daemon::DaemonMode::Docker | crate::daemon::DaemonMode::Native)
+        )
+    });
     if args.purge && !managed {
         return Err(CliError::other(
             "cannot purge a non-managed daemon or without saved setup",
@@ -1699,10 +1776,15 @@ pub fn remove(args: &RemoveArgs) -> Result<(), CliError> {
     let embedded = data.join("opencode-plugin");
     if args.purge {
         println!(
-            "WARNING: purge will destroy compose project memento, volume memento_qdrant_storage, {}, and {}",
+            "WARNING: purge will destroy compose project {}, volume {}_qdrant_storage, {}, {}, native database, state, and model cache:",
+            crate::daemon::compose_project()?,
+            crate::daemon::compose_project()?,
             data.join("compose.yaml").display(),
             embedded.display()
         );
+        for path in crate::daemon::native_purge_paths()? {
+            println!("  {}", path.display());
+        }
     } else {
         println!(
             "  {} - retained: other projects may use this plugin",
@@ -1759,7 +1841,7 @@ pub fn remove(args: &RemoveArgs) -> Result<(), CliError> {
             .map_err(|error| CliError::other(format!("cannot update install receipt: {error}")))?;
     }
     if args.purge {
-        crate::daemon::purge()?;
+        crate::daemon::purge(cli)?;
         remove_directory(&embedded)?;
         if let Some(setup) = receipt.get_mut("setup").and_then(Value::as_object_mut) {
             setup.insert("managed_daemon".into(), Value::Bool(false));
@@ -1777,6 +1859,14 @@ pub fn remove(args: &RemoveArgs) -> Result<(), CliError> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn new_setups_default_to_native_and_saved_setups_keep_their_mode() {
+        use crate::daemon::DaemonMode::*;
+        assert_eq!(default_daemon_mode(true, Docker), Native);
+        assert_eq!(default_daemon_mode(false, Docker), Docker);
+        assert_eq!(default_daemon_mode(false, External), External);
+    }
 
     fn context(root: &Path) -> Context {
         Context {

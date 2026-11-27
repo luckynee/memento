@@ -15,7 +15,7 @@ use axum::{
 use clap::{Parser, Subcommand};
 use mementod::{
     config::{Config, cache_dir, sqlite_path},
-    embed::{create_embedder, default_embedder},
+    embed::CandleEmbedder,
     migrate::migrate,
     routes::{AppState, RouterState, backfill_activity, router_with_state, run_stale_sweep},
     store::Store,
@@ -45,30 +45,41 @@ enum Command {
 }
 
 fn main() -> Result<()> {
+    validate_embedder_selection(std::env::var("MEMENTO_EMBEDDER"))?;
     let cache = cache_dir()?;
     unsafe { std::env::set_var("FASTEMBED_CACHE_DIR", &cache) };
-    if std::env::var("MEMENTO_EMBEDDER").unwrap_or_else(|_| default_embedder().into()) == "candle" {
-        let threads = match std::env::var("MEMENTO_EMBED_THREADS") {
-            Ok(value) => {
-                let threads = value
-                    .parse::<usize>()
-                    .context("invalid MEMENTO_EMBED_THREADS")?;
-                anyhow::ensure!(threads > 0, "MEMENTO_EMBED_THREADS must be positive");
-                threads
-            }
-            Err(std::env::VarError::NotPresent) => std::thread::available_parallelism()
-                .map(|threads| threads.get().min(4))
-                .unwrap_or(1),
-            Err(error) => return Err(error).context("reading MEMENTO_EMBED_THREADS"),
-        };
-        unsafe {
-            std::env::set_var("RAYON_NUM_THREADS", threads.to_string());
-            std::env::set_var("CANDLE_NUM_THREADS", threads.to_string());
+    let threads = match std::env::var("MEMENTO_EMBED_THREADS") {
+        Ok(value) => {
+            let threads = value
+                .parse::<usize>()
+                .context("invalid MEMENTO_EMBED_THREADS")?;
+            anyhow::ensure!(threads > 0, "MEMENTO_EMBED_THREADS must be positive");
+            threads
         }
+        Err(std::env::VarError::NotPresent) => std::thread::available_parallelism()
+            .map(|threads| threads.get().min(4))
+            .unwrap_or(1),
+        Err(error) => return Err(error).context("reading MEMENTO_EMBED_THREADS"),
+    };
+    unsafe {
+        std::env::set_var("RAYON_NUM_THREADS", threads.to_string());
+        std::env::set_var("CANDLE_NUM_THREADS", threads.to_string());
     }
     tokio::runtime::Runtime::new()
         .context("creating async runtime")?
         .block_on(run())
+}
+
+fn validate_embedder_selection(selection: Result<String, std::env::VarError>) -> Result<()> {
+    match selection {
+        Ok(value) if value == "candle" => Ok(()),
+        Ok(value) if value == "onnx" => {
+            anyhow::bail!("ONNX embedder was removed; unset MEMENTO_EMBEDDER or set it to candle")
+        }
+        Ok(value) => anyhow::bail!("invalid MEMENTO_EMBEDDER: {value}"),
+        Err(std::env::VarError::NotPresent) => Ok(()),
+        Err(error) => Err(error).context("reading MEMENTO_EMBEDDER"),
+    }
 }
 
 async fn run() -> Result<()> {
@@ -91,8 +102,7 @@ async fn run() -> Result<()> {
     } else {
         None
     };
-    let selection = std::env::var("MEMENTO_EMBEDDER").unwrap_or_else(|_| default_embedder().into());
-    let embedder = create_embedder(&selection, config.cache_dir.clone()).await?;
+    let embedder = Arc::new(CandleEmbedder::new().await?);
     match cli.command {
         Command::Warmup => return Ok(()),
         Command::Migrate {
@@ -283,6 +293,15 @@ async fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedder_selection_accepts_candle_and_rejects_onnx() {
+        assert!(validate_embedder_selection(Err(std::env::VarError::NotPresent)).is_ok());
+        assert!(validate_embedder_selection(Ok("candle".into())).is_ok());
+        let error = validate_embedder_selection(Ok("onnx".into())).unwrap_err();
+        assert!(error.to_string().contains("ONNX embedder was removed"));
+        assert!(validate_embedder_selection(Ok("other".into())).is_err());
+    }
 
     #[test]
     fn lock_contention_does_not_overwrite_owner() {

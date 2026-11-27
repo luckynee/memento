@@ -61,8 +61,8 @@ Add validation tests.
 Requirements:
 
 - A published GitHub release for the installer, with x86_64 or aarch64 Linux (musl) or macOS.
-- Default Docker mode: Docker with Compose; the x86_64 image requires an x86-64-v3 CPU with AVX2.
-- Opt-in native mode: no Docker; the approximately 133 MB model downloads on first use.
+- Native mode (default): no Docker; the approximately 133 MB model downloads on first use.
+- Docker mode (for servers and shared daemons): Docker with Compose.
 
 ```sh
 curl -fsSL https://github.com/luckynee/memento/releases/latest/download/install.sh | sh
@@ -73,7 +73,7 @@ Alternatively, install the packages with Rust and Cargo:
 ```sh
 cargo install --locked --git https://github.com/luckynee/memento memento-cli
 cargo install --locked --git https://github.com/luckynee/memento memento-mcp
-cargo install --locked --git https://github.com/luckynee/memento mementod --no-default-features --features embed-candle
+cargo install --locked --git https://github.com/luckynee/memento mementod
 ```
 
 Add `--tag vX.Y.Z` to pin a release.
@@ -90,7 +90,7 @@ The installer may run setup automatically on a terminal. Setup can start the man
 ## How it works
 
 1. A harness adapter ingests session activity and filters it into searchable segments.
-2. `mementod` stores segments in Qdrant with ONNX embeddings in Docker mode, or SQLite with Candle embeddings in native mode. Both use fastembed BGE-small dense vectors and lexical search, fuse results with RRF, and rerank for recency.
+2. `mementod` stores segments in Qdrant in Docker mode, or SQLite in native mode. Both use fastembed BGE-small dense vectors on the Candle CPU backend and lexical search, fuse results with RRF, and rerank for recency.
 3. The adapter supplies a digest and recent context when continuing work; the agent can search memory for details it needs.
 
 The main components are:
@@ -120,13 +120,15 @@ For non-interactive setup, specify `--yes`, `--harness`, and `--scope`; add `--s
 memento setup --yes --harness opencode --scope project --start-daemon
 ```
 
-Docker remains the default. To opt into the Docker-free native SQLite daemon, choose **Native** in the wizard or run:
+Native SQLite is the default for new setups. Existing saved setups keep their mode. To select a mode explicitly, choose it in the wizard or pass `--daemon native|docker|external`:
 
 ```sh
 memento setup --yes --harness opencode --scope project --daemon native
 ```
 
-Native setup warms the embedding model and enables OpenCode plugin autostart. The daemon starts on demand for CLI, MCP, and configured OpenCode plugin requests and exits after 30 minutes without requests by default. Existing Docker memories are not copied automatically; see `mementod migrate` and [deployment notes](deploy/README.md).
+Use `--daemon docker` for a server or shared daemon that runs Qdrant in Docker.
+
+Native setup warms the embedding model and enables OpenCode plugin autostart. The daemon starts on demand for CLI, MCP, and configured OpenCode plugin requests and exits after 30 minutes without requests by default. To bring Docker memories over, see [Upgrading from v0.2](#upgrading-from-v02) and [deployment notes](deploy/README.md).
 
 For OpenCode, setup also accepts:
 
@@ -134,6 +136,16 @@ For OpenCode, setup also accepts:
 - `--compaction memento|native`: choose memento's digest-based same-model compaction to avoid a model summarisation request, or use native compaction.
 
 `memento doctor` reports the installed per-harness settings.
+
+## Upgrading from v0.2
+
+Releases before v0.3 stored memory in Docker (Qdrant). After `memento update` installs a new version, memento detects a Docker memory volume (Compose project `memento`, or `MEMENTO_COMPOSE_PROJECT`) and, on a terminal, asks "Move your N memories from Docker to the native daemon? [Y/n]". Without a terminal it prints the hint `memento daemon migrate`, and `memento doctor` warns until you migrate.
+
+```sh
+memento daemon migrate
+```
+
+Migration stops only the Docker `mementod`, re-embeds every memory in a one-off container on the Compose network (no ports opened), switches to native mode, verifies the segment count, then stops the Docker stack. The Qdrant volume is kept as a backup; delete it with `docker volume rm memento_qdrant_storage` or `memento remove --purge`. Any failure restarts Docker and leaves your saved mode unchanged. `--yes` skips the prompt, `--keep-docker-running` leaves Qdrant running, and `--force` first moves an existing native database to `memento.db.bak-<timestamp>` (restored on failure).
 
 ## Everyday use
 
@@ -176,13 +188,13 @@ memento daemon up|down|status|logs [-f]|pull|ensure
 - `memento update --check` checks for an update; `--version <x.y.z>` selects a release; `--refresh` reapplies saved setup without replacing binaries. Refresh also pulls and starts Docker mode or restarts native mode.
 - Binary replacement is for installer-managed installs. For Cargo installs, use `cargo install --path crates/memento-cli` or the installer.
 - `memento doctor --offline` skips the latest-release check.
-- `memento daemon` manages Docker or native mode; `logs -f` follows its logs, `pull` is Docker-only, and `ensure` starts native mode if needed. External mode supports health status but is not managed.
+- `memento daemon` manages Docker or native mode; `logs -f` follows its logs, `pull` is Docker-only, and `ensure` starts native mode if needed. External mode supports health status but is not managed. `memento daemon migrate [--yes] [--keep-docker-running] [--force]` moves Docker memories to native storage.
 
 ## Removing memento
 
 `memento remove` previews removal and lets you choose harness integrations from a checklist, or select them with `--harness`. Use `--dry-run` to preview without changes. Normal removal keeps memory data, binaries, and shared assets that other integrations may need.
 
-`memento remove --purge` additionally destroys the managed Docker daemon's Qdrant data, Compose project and files, and embedded plugin. It requires a saved Docker-managed daemon and typing `purge` in a terminal; non-interactive purge requires `--yes`. Native SQLite data is not purged by this command.
+`memento remove --purge` additionally destroys the managed daemon's data: the Docker Qdrant volume, Compose project and files, the native SQLite database with its backups, the native lock and log, the cached embedding model, and the embedded plugin. The preview lists every path. It requires a saved managed (Docker or native) daemon and typing `purge` in a terminal; non-interactive purge requires `--yes`.
 
 ## Cleaning up memory
 

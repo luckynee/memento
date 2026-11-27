@@ -14,7 +14,7 @@ COPY crates/memento-mcp crates/memento-mcp
 RUN touch crates/memento-core/src/lib.rs crates/mementod/src/lib.rs crates/mementod/src/main.rs && cargo build --locked --release -p mementod
 
 FROM debian:trixie-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libc++1 && rm -rf /var/lib/apt/lists/* && useradd --create-home --uid 10001 memento && mkdir -p /opt/memento/models && chown -R memento:memento /opt/memento
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/* && useradd --create-home --uid 10001 memento && mkdir -p /opt/memento/models && chown -R memento:memento /opt/memento
 COPY --from=builder /build/target/release/mementod /usr/local/bin/mementod
 ENV FASTEMBED_CACHE_DIR=/opt/memento/models
 ENV MEMENTO_BIND=0.0.0.0:7377

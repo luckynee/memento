@@ -1,5 +1,7 @@
 use serde_json::{Map, Value};
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -34,6 +36,15 @@ enum DaemonCommand {
     Pull,
     #[command(about = "Start a native daemon if needed")]
     Ensure,
+    #[command(about = "Migrate Docker memories to native storage")]
+    Migrate {
+        #[arg(long, help = "Migrate without prompting")]
+        yes: bool,
+        #[arg(long, help = "Keep Qdrant running after migration")]
+        keep_docker_running: bool,
+        #[arg(long, help = "Back up and replace existing native data")]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -386,8 +397,9 @@ fn native_down(cli: &Cli) -> Result<(), CliError> {
     let response = match request.send() {
         Ok(response) => response,
         Err(error) if error.is_connect() => {
-            println!("mementod is not running");
-            return Ok(());
+            return Err(CliError::other(
+                "native daemon lock is held but the shutdown endpoint is unavailable",
+            ));
         }
         Err(error) => return Err(CliError::request(error, &cli.url)),
     };
@@ -442,7 +454,7 @@ fn docker(compose: &std::path::Path, args: &[&str], inherit: bool) -> Result<(),
     let output = Command::new("docker")
         .arg("compose")
         .arg("-p")
-        .arg("memento")
+        .arg(compose_project()?)
         .arg("-f")
         .arg(compose)
         .args(args)
@@ -484,18 +496,39 @@ fn docker(compose: &std::path::Path, args: &[&str], inherit: bool) -> Result<(),
     Ok(())
 }
 
-pub(super) fn purge() -> Result<(), CliError> {
-    let compose = assets::data_dir()?.join("compose.yaml");
-    if !compose.is_file() {
-        return Err(CliError::other(format!(
-            "cannot purge managed daemon: compose file {} is missing",
-            compose.display()
-        )));
+pub(super) fn purge(cli: &Cli) -> Result<(), CliError> {
+    native_down(cli)?;
+    if running_pid(&state_dir()?.join("mementod.lock"))?.is_some() {
+        return Err(CliError::other("native daemon is still running"));
     }
-    docker(&compose, &["down", "-v"], true)?;
-    fs::remove_file(&compose).map_err(|error| {
-        CliError::other(format!("cannot remove {}: {error}", compose.display()))
-    })?;
+    let compose = assets::data_dir()?.join("compose.yaml");
+    if compose.is_file() {
+        docker(&compose, &["down", "-v"], true)?;
+        fs::remove_file(&compose).map_err(|error| {
+            CliError::other(format!("cannot remove {}: {error}", compose.display()))
+        })?;
+    } else if docker_memory_exists()? {
+        return Err(CliError::other(
+            "Docker volume exists but compose file is missing",
+        ));
+    }
+    for path in native_purge_paths()? {
+        let result = if path.is_dir() {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        match result {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(CliError::other(format!(
+                    "cannot remove {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -557,6 +590,14 @@ pub(super) fn pull() -> Result<(), CliError> {
 }
 
 pub(super) fn run(cli: &Cli, args: &DaemonArgs) -> Result<(), CliError> {
+    if let DaemonCommand::Migrate {
+        yes,
+        keep_docker_running,
+        force,
+    } = &args.command
+    {
+        return migrate(cli, *yes, *keep_docker_running, *force);
+    }
     let setup = current_setup()?;
     let mode = saved_mode(Some(&setup))?;
     if let DaemonCommand::Ensure = &args.command {
@@ -602,6 +643,7 @@ pub(super) fn run(cli: &Cli, args: &DaemonArgs) -> Result<(), CliError> {
                 "native daemon binaries are updated with memento update",
             )),
             DaemonCommand::Ensure => unreachable!(),
+            DaemonCommand::Migrate { .. } => unreachable!(),
         };
     }
     if mode == DaemonMode::External {
@@ -647,12 +689,549 @@ pub(super) fn run(cli: &Cli, args: &DaemonArgs) -> Result<(), CliError> {
         }
         DaemonCommand::Pull => pull(),
         DaemonCommand::Ensure => unreachable!(),
+        DaemonCommand::Migrate { .. } => unreachable!(),
     }
+}
+
+pub(super) fn compose_project() -> Result<String, CliError> {
+    validated_project(std::env::var("MEMENTO_COMPOSE_PROJECT").unwrap_or_else(|_| "memento".into()))
+}
+
+fn validated_project(project: String) -> Result<String, CliError> {
+    if project.is_empty()
+        || !project
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-".contains(&byte))
+        || !project.as_bytes()[0].is_ascii_alphanumeric()
+    {
+        return Err(CliError::other("invalid MEMENTO_COMPOSE_PROJECT"));
+    }
+    Ok(project)
+}
+
+pub(super) fn docker_memory_exists() -> Result<bool, CliError> {
+    let project = compose_project()?;
+    let output = match Command::new("docker")
+        .args(["volume", "ls", "--filter"])
+        .arg(format!("label=com.docker.compose.project={project}"))
+        .args([
+            "--filter",
+            "label=com.docker.compose.volume=qdrant_storage",
+            "--format",
+            "{{.Name}}",
+        ])
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(CliError::other(format!(
+                "cannot inspect Docker volumes: {error}"
+            )));
+        }
+    };
+    if !output.status.success() {
+        return Err(CliError::other(format!(
+            "cannot inspect Docker volumes: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(!output.stdout.iter().all(u8::is_ascii_whitespace))
+}
+
+fn model_cache_dir() -> Result<PathBuf, CliError> {
+    let root = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .ok_or_else(|| CliError::other("HOME is required for model cache"))?;
+    Ok(root.join("memento/models"))
+}
+
+fn database_paths(database: &Path) -> Vec<PathBuf> {
+    ["", "-wal", "-shm"]
+        .iter()
+        .map(|suffix| {
+            let mut path = database.as_os_str().to_os_string();
+            path.push(suffix);
+            PathBuf::from(path)
+        })
+        .collect()
+}
+
+pub(super) fn native_purge_paths() -> Result<Vec<PathBuf>, CliError> {
+    Ok(purge_paths_in(
+        &assets::data_dir()?,
+        &state_dir()?,
+        &model_cache_dir()?,
+    ))
+}
+
+fn purge_paths_in(data: &Path, state: &Path, model_cache: &Path) -> Vec<PathBuf> {
+    let mut paths = database_paths(&data.join("memento.db"));
+    if let Ok(entries) = fs::read_dir(data) {
+        let mut backups = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("memento.db.bak-"))
+            })
+            .collect::<Vec<_>>();
+        backups.sort();
+        paths.extend(backups);
+    }
+    paths.extend([
+        state.join("mementod.lock"),
+        state.join("mementod.log"),
+        model_cache.to_path_buf(),
+    ]);
+    paths
+}
+
+fn migration_command(project: &str, user: &str, cache: &Path, data: &Path, image: &str) -> Command {
+    let mut command = Command::new("docker");
+    command
+        .args(["run", "--rm", "--network"])
+        .arg(format!("{project}_default"))
+        .args([
+            "--user",
+            user,
+            "-e",
+            "HOME=/tmp",
+            "-e",
+            "MEMENTO_EMBEDDER=candle",
+            "-e",
+            "FASTEMBED_CACHE_DIR=/models",
+            "-v",
+        ])
+        .arg(format!("{}:/models", cache.display()))
+        .arg("-v")
+        .arg(format!("{}:/out", data.display()))
+        .arg(image)
+        .args([
+            "migrate",
+            "--qdrant-url",
+            "http://qdrant:6334",
+            "--to",
+            "/out/memento.db",
+        ]);
+    command
+}
+
+fn identity() -> Result<String, CliError> {
+    let get = |flag| -> Result<String, CliError> {
+        let output = Command::new("id")
+            .arg(flag)
+            .output()
+            .map_err(|error| CliError::other(format!("cannot determine user identity: {error}")))?;
+        if !output.status.success() {
+            return Err(CliError::other("cannot determine user identity"));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    };
+    Ok(format!("{}:{}", get("-u")?, get("-g")?))
+}
+
+fn stats(cli: &Cli) -> Result<u64, CliError> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .no_proxy()
+        .build()
+        .map_err(|error| CliError::other(format!("cannot create stats client: {error}")))?;
+    let mut request = client.get(crate::endpoint(&cli.url, &["v1", "stats"])?);
+    if let Some(token) = &cli.token {
+        request = request.bearer_auth(token);
+    }
+    let response = request
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(|error| CliError::request(error, &cli.url))?;
+    let value: Value = response
+        .json()
+        .map_err(|error| CliError::other(format!("cannot parse daemon stats: {error}")))?;
+    value
+        .get("total")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| CliError::other("daemon stats has no total"))
+}
+
+fn backup_database(database: &Path, force: bool) -> Result<Vec<(PathBuf, PathBuf)>, CliError> {
+    let paths = database_paths(database);
+    if paths.iter().any(|path| path.exists()) && !force {
+        return Err(CliError::other(
+            "native database or sidecars already exist; use --force to back them up",
+        ));
+    }
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.fZ");
+    let mut backup = Vec::new();
+    for (index, original) in paths.iter().enumerate() {
+        if !original.exists() {
+            continue;
+        }
+        let mut name = OsString::from(database.as_os_str());
+        name.push(format!(".bak-{stamp}"));
+        name.push(["", "-wal", "-shm"][index]);
+        let destination = PathBuf::from(name);
+        if destination.exists() {
+            restore_database(&backup)?;
+            return Err(CliError::other(format!(
+                "backup already exists: {}",
+                destination.display()
+            )));
+        }
+        if let Err(error) = fs::rename(original, &destination) {
+            restore_database(&backup)?;
+            return Err(CliError::other(format!(
+                "cannot back up {}: {error}",
+                original.display()
+            )));
+        }
+        backup.push((original.clone(), destination));
+    }
+    Ok(backup)
+}
+
+fn restore_database(backup: &[(PathBuf, PathBuf)]) -> Result<(), CliError> {
+    for (original, saved) in backup.iter().rev() {
+        fs::rename(saved, original).map_err(|error| {
+            CliError::other(format!(
+                "cannot restore {} from {}: {error}",
+                original.display(),
+                saved.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn remove_database(database: &Path) -> Result<(), CliError> {
+    for path in database_paths(database) {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(CliError::other(format!(
+                    "cannot remove {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn offer_migration(cli: &Cli) -> Result<bool, CliError> {
+    let setup = current_setup()?;
+    if saved_mode(Some(&setup))? == DaemonMode::Native || !docker_memory_exists()? {
+        return Ok(false);
+    }
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        eprintln!("Docker memory found; run memento daemon migrate");
+        return Ok(false);
+    }
+    let count = stats(cli)
+        .ok()
+        .map(|count| format!("{count} "))
+        .unwrap_or_default();
+    if dialoguer::Confirm::new()
+        .with_prompt(format!(
+            "Move your {count}memories from Docker to the native daemon?"
+        ))
+        .default(true)
+        .interact()
+        .map_err(|error| CliError::other(format!("migration prompt failed: {error}")))?
+    {
+        migrate(cli, true, false, false)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn migrate(cli: &Cli, yes: bool, keep_docker_running: bool, force: bool) -> Result<(), CliError> {
+    if !docker_memory_exists()? {
+        return Err(CliError::other("no Docker Qdrant volume found"));
+    }
+    let project = compose_project()?;
+    let setup = current_setup()?;
+    if setup.is_empty() {
+        return Err(CliError::other("migration requires a saved setup"));
+    }
+    let compose = assets::data_dir()?.join("compose.yaml");
+    if !compose.is_file() {
+        return Err(CliError::other(format!(
+            "compose file missing: {}",
+            compose.display()
+        )));
+    }
+    let database = assets::data_dir()?.join("memento.db");
+    if std::env::var_os("MEMENTO_SQLITE_PATH").is_some() {
+        return Err(CliError::other(
+            "unset MEMENTO_SQLITE_PATH before migration; custom native paths are not supported",
+        ));
+    }
+    if database_paths(&database).iter().any(|path| path.exists()) && !force {
+        return Err(CliError::other(
+            "native database or sidecars already exist; use --force to back them up",
+        ));
+    }
+    println!("Qdrant volume found in Docker project {project}");
+    println!(
+        "Migration re-embeds all memories and may take several minutes; the first model download is about 133 MB."
+    );
+    if !yes {
+        if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+            return Err(CliError::other("migration requires confirmation or --yes"));
+        }
+        if !dialoguer::Confirm::new()
+            .with_prompt("Stop the daemons and migrate?")
+            .default(true)
+            .interact()
+            .map_err(|error| CliError::other(format!("migration prompt failed: {error}")))?
+        {
+            return Err(CliError::other("migration cancelled"));
+        }
+    }
+    let cache = model_cache_dir()?;
+    fs::create_dir_all(&cache)
+        .map_err(|error| CliError::other(format!("cannot create {}: {error}", cache.display())))?;
+    fs::create_dir_all(database.parent().unwrap())
+        .map_err(|error| CliError::other(format!("cannot create data directory: {error}")))?;
+    let old_receipt = crate::receipt::read().map_err(CliError::other)?;
+    let running_native = running_pid(&state_dir()?.join("mementod.lock"))?.is_some();
+    if running_native {
+        native_down(cli)?;
+    }
+    let source_count = if running_native {
+        None
+    } else {
+        stats(cli).ok()
+    };
+    docker(&compose, &["up", "-d", "qdrant"], true)?;
+    docker(&compose, &["stop", "mementod"], true)?;
+    let backup = match backup_database(&database, force) {
+        Ok(backup) => backup,
+        Err(error) => {
+            let _ = docker(&compose, &["up", "-d", "mementod"], true);
+            return Err(error);
+        }
+    };
+    let result = (|| {
+        let image_override = std::env::var("MEMENTO_DAEMON_IMAGE").ok();
+        let mut command = migration_command(
+            &project,
+            &identity()?,
+            &cache,
+            database.parent().unwrap(),
+            assets::daemon_image(image_override.as_deref()),
+        );
+        command.stdout(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|error| CliError::other(format!("cannot run migration container: {error}")))?;
+        let mut report = String::new();
+        use std::io::Read;
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| CliError::other("migration output unavailable"))?
+            .read_to_string(&mut report)
+            .map_err(|error| CliError::other(format!("cannot read migration report: {error}")))?;
+        print!("{report}");
+        let status = child
+            .wait()
+            .map_err(|error| CliError::other(format!("cannot wait for migration: {error}")))?;
+        if !status.success() {
+            return Err(CliError::other(format!(
+                "migration container failed: {status}"
+            )));
+        }
+        let reported_count = migration_report_count(&report)?;
+        let mut native_setup = setup.clone();
+        native_setup.insert("daemon_mode".into(), Value::String("native".into()));
+        native_setup.insert("managed_daemon".into(), Value::Bool(false));
+        native_start(cli, &native_setup, false, Duration::from_secs(120))?;
+        let migrated_count = stats(cli)?;
+        if reported_count != migrated_count {
+            return Err(CliError::other(format!(
+                "segment count mismatch: migrated {reported_count} native {migrated_count}"
+            )));
+        }
+        if source_count.is_some_and(|count| count != migrated_count) {
+            return Err(CliError::other(format!(
+                "segment count mismatch: source {} native {migrated_count}",
+                source_count.unwrap()
+            )));
+        }
+        if !keep_docker_running {
+            docker(&compose, &["stop"], true)?;
+        }
+        crate::receipt::merge_setup(Value::Object(native_setup.clone()))
+            .map_err(CliError::other)?;
+        crate::setup::reapply_native_opencode(cli, &native_setup)?;
+        println!(
+            "Migrated {migrated_count} memories. Qdrant volume {project}_qdrant_storage remains as a backup."
+        );
+        println!(
+            "Delete it later with memento remove --purge or docker volume rm {project}_qdrant_storage."
+        );
+        if let Some((_, path)) = backup.first() {
+            println!("Previous native database backup: {}", path.display());
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let mut rollback_errors = Vec::new();
+        if let Err(failure) = native_down(cli) {
+            rollback_errors.push(failure.message);
+        }
+        if running_pid(&state_dir()?.join("mementod.lock"))?.is_none() {
+            if let Err(failure) = remove_database(&database) {
+                rollback_errors.push(failure.message);
+            }
+            if let Err(failure) = restore_database(&backup) {
+                rollback_errors.push(failure.message);
+            }
+        } else {
+            rollback_errors.push("native lock still held; database backup was not restored".into());
+        }
+        if let Err(failure) = crate::receipt::write(old_receipt) {
+            rollback_errors.push(failure);
+        }
+        if let Err(failure) = docker(&compose, &["up", "-d", "mementod"], true) {
+            rollback_errors.push(failure.message);
+        }
+        return Err(CliError::other(format!(
+            "migration failed: {}; rollback: {}",
+            error.message,
+            if rollback_errors.is_empty() {
+                "Docker restarted and native data restored".into()
+            } else {
+                rollback_errors.join("; ")
+            }
+        )));
+    }
+    Ok(())
+}
+
+fn migration_report_count(report: &str) -> Result<u64, CliError> {
+    report
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("segments:")?.trim().parse().ok())
+        .ok_or_else(|| CliError::other("migration report does not contain a segment count"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migration_container_arguments_are_exact() {
+        let command = migration_command(
+            "memento-migtest",
+            "123:456",
+            Path::new("/cache"),
+            Path::new("/data"),
+            "image:test",
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "run",
+                "--rm",
+                "--network",
+                "memento-migtest_default",
+                "--user",
+                "123:456",
+                "-e",
+                "HOME=/tmp",
+                "-e",
+                "MEMENTO_EMBEDDER=candle",
+                "-e",
+                "FASTEMBED_CACHE_DIR=/models",
+                "-v",
+                "/cache:/models",
+                "-v",
+                "/data:/out",
+                "image:test",
+                "migrate",
+                "--qdrant-url",
+                "http://qdrant:6334",
+                "--to",
+                "/out/memento.db"
+            ]
+        );
+    }
+
+    #[test]
+    fn forced_backup_and_failed_migration_restore_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("memento.db");
+        let paths = database_paths(&database);
+        for (index, path) in paths.iter().enumerate() {
+            fs::write(path, index.to_string()).unwrap();
+        }
+        assert!(backup_database(&database, false).is_err());
+        let backup = backup_database(&database, true).unwrap();
+        assert_eq!(backup.len(), 3);
+        fs::write(&database, "partial").unwrap();
+        remove_database(&database).unwrap();
+        restore_database(&backup).unwrap();
+        for (index, path) in paths.iter().enumerate() {
+            assert_eq!(fs::read_to_string(path).unwrap(), index.to_string());
+        }
+    }
+
+    #[test]
+    fn compose_project_validation_accepts_override_and_rejects_bad_names() {
+        assert_eq!(
+            validated_project("memento-migtest".into()).unwrap(),
+            "memento-migtest"
+        );
+        assert!(validated_project("".into()).is_err());
+        assert!(validated_project("Bad Name".into()).is_err());
+        assert!(validated_project("-lead".into()).is_err());
+    }
+
+    #[test]
+    fn purge_paths_include_database_sidecars_backups_state_and_model_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("memento.db.bak-20260101T000000Z"), "x").unwrap();
+        fs::write(data.join("unrelated.txt"), "x").unwrap();
+        let paths = purge_paths_in(&data, &dir.path().join("state"), &dir.path().join("models"));
+        let names = paths
+            .iter()
+            .map(|path| path.strip_prefix(dir.path()).unwrap().display().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "data/memento.db",
+                "data/memento.db-wal",
+                "data/memento.db-shm",
+                "data/memento.db.bak-20260101T000000Z",
+                "state/mementod.lock",
+                "state/mementod.log",
+                "models"
+            ]
+        );
+    }
+
+    #[test]
+    fn migration_report_requires_count() {
+        assert_eq!(
+            migration_report_count("segments: 20\nsessions: 1\n").unwrap(),
+            20
+        );
+        assert!(migration_report_count("sessions: 1").is_err());
+    }
 
     #[test]
     fn refresh_steps_depend_only_on_saved_managed_daemon_choice() {
