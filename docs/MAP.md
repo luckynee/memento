@@ -12,9 +12,11 @@
 | `crates/memento-core/src/absence.rs` | `is_absence_statement`: shared by digest (skip) and rerank (penalty); phrase heuristics, not semantic |
 | `crates/memento-core/src/digest.rs` | `render_digest`, `merge_chunks`; byte-stable output |
 | `crates/mementod/src/routes.rs` | All HTTP routes, bearer auth, error mapping; `RouterState` (shared locks) and `run_stale_sweep`, started and joined by `main.rs` (`router()` spawns nothing) |
-| `crates/mementod/src/store.rs` | Qdrant schema, segment upsert (dense + bm25 Document), hybrid RRF candidates, session registry, continuation slots per `(project, target_harness)` (`list_continuations` keeps legacy project-only ids) |
+| `crates/mementod/src/store.rs` | `Store` backend dispatch and `QdrantStore`: schema, hybrid RRF, session registry and continuation slots (`list_continuations` keeps legacy project-only ids) |
+| `crates/mementod/src/sqlite_store.rs` | `SqliteStore`: versioned WAL schema, FTS5, exact cosine and RRF, scope filters, session and continuation storage |
+| `crates/mementod/src/config.rs` | Environment configuration including `MEMENTO_STORE` and `MEMENTO_SQLITE_PATH` |
 | `crates/mementod/src/embed.rs` | `Embedder` trait, `FastEmbedder` (spawn_blocking), `FakeEmbedder` for tests |
-| `crates/mementod/tests/` | Live Qdrant tests, gated on `MEMENTO_TEST_QDRANT_URL` |
+| `crates/mementod/tests/` | Shared SQLite tests and live Qdrant tests gated on `MEMENTO_TEST_QDRANT_URL` |
 | `crates/memento-cli/src/main.rs` | `memento` CLI, HTTP client of mementod |
 | `adapters/opencode/src/` | OpenCode V2 plugin: `client`, `transcript`, `ingest`, `session-ownership` (`normalizeDirectory` for `global` projects), `jev` (`stripScaffolding`, `forEachJevItem` 4-way concurrency for ingest and search), `switch` (pure rewrite), `switch-controller`, `subagent-memory` (parent digest for child sessions), `project-primer` (opt-in recent project digest), `activity-log`, `tools`, `commands`, `options`, `index` |
 | `adapters/opencode/test/` | `bun test` suites (mocked daemon and Jev) |

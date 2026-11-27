@@ -35,14 +35,18 @@ async fn main() -> Result<()> {
     if matches!(cli.command, Command::Warmup) {
         return Ok(());
     }
-    let client = Qdrant::from_url(&config.qdrant_url)
-        .build()
-        .context("configuring Qdrant client")?;
-    let store = Store::new(client.clone(), &config.collection_prefix, embedder);
+    let store = if config.store == "sqlite" {
+        Store::sqlite(config.sqlite_path.clone(), embedder).await?
+    } else {
+        let client = Qdrant::from_url(&config.qdrant_url)
+            .build()
+            .context("configuring Qdrant client")?;
+        Store::new(client, &config.collection_prefix, embedder)
+    };
     store
         .ensure_schema()
         .await
-        .context("ensuring Qdrant schema")?;
+        .context("ensuring store schema")?;
     backfill_activity(&store, chrono::Utc::now())
         .await
         .context("backfilling session activity")?;

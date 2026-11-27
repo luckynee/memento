@@ -117,6 +117,10 @@ Harness scaffolding is not session memory, and stored text is untrusted when it 
 
 ## Qdrant data model
 
+`MEMENTO_STORE=qdrant|sqlite` selects the backend and defaults to `qdrant`. SQLite uses `MEMENTO_SQLITE_PATH`, defaulting to `${XDG_DATA_HOME:-~/.local/share}/memento/memento.db`; it creates parent directories and a new database with mode 0600 on Unix. SQLite needs no Qdrant service. `/health` retains the `qdrant` field for compatibility and reports the active store's health.
+
+SQLite uses a versioned WAL database with segments, sessions and continuations tables, preserving Qdrant's deterministic point IDs. Segment payload fields are columns, with indexes on project, harness/session, kind, source and timestamp; dense vectors are little-endian f32 blobs. An external-content FTS5 index is synchronized by triggers. Each database operation runs on a blocking worker behind one connection mutex. Dense candidates use exact cosine after SQL scope filtering. Lexical candidates use sanitized, quoted OR terms and FTS5 `porter unicode61`: unlike Qdrant's BM25 tokenizer, it does not remove English stopwords and its tokenization, stemming and BM25 scoring can differ. For each filtered top-50 list, fusion sums `1/(2 + rank)` with zero-based rank, matching Qdrant v1.20.2's default RRF; tied SQLite results use point ID order, while Qdrant does not specify tie breaking.
+
 Collection `memento_segments`:
 
 - named dense vector `dense`: 384, cosine.

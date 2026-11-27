@@ -69,9 +69,11 @@ async fn route_workflow() {
         store: Arc::clone(&store),
         config: Config {
             bind: listener.local_addr().unwrap(),
+            store: "qdrant".into(),
+            sqlite_path: Default::default(),
             qdrant_url: url,
             token: Some("test-token".into()),
-            collection_prefix: prefix,
+            collection_prefix: prefix.clone(),
             cache_dir: None,
             duplicate_cosine_threshold: 0.95,
             duplicate_jaccard_threshold: 0.8,
@@ -86,9 +88,9 @@ async fn route_workflow() {
     let result = tokio::spawn(async move { run_workflow(&address, &test_store).await }).await;
     server.abort();
     for collection in [
-        &store.segments_collection,
-        &store.sessions_collection,
-        &store.continuations_collection,
+        format!("{prefix}_segments"),
+        format!("{prefix}_sessions"),
+        format!("{prefix}_continuations"),
     ] {
         client
             .delete_collection(DeleteCollectionBuilder::new(collection))
@@ -96,6 +98,50 @@ async fn route_workflow() {
             .unwrap();
     }
     result.unwrap();
+}
+
+#[tokio::test]
+async fn sqlite_route_workflow() {
+    let path = std::env::temp_dir().join(format!(
+        "memento-routes-{}.db",
+        Uuid::new_v5(
+            &Uuid::NAMESPACE_OID,
+            format!("{:?}", std::time::SystemTime::now()).as_bytes()
+        )
+    ));
+    let store = Arc::new(
+        Store::sqlite(path.clone(), Arc::new(FakeEmbedder))
+            .await
+            .unwrap(),
+    );
+    store.ensure_schema().await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let app = router(AppState {
+        store: Arc::clone(&store),
+        config: Config {
+            bind: listener.local_addr().unwrap(),
+            store: "sqlite".into(),
+            sqlite_path: path.clone(),
+            qdrant_url: String::new(),
+            token: Some("test-token".into()),
+            collection_prefix: String::new(),
+            cache_dir: None,
+            duplicate_cosine_threshold: 0.95,
+            duplicate_jaccard_threshold: 0.8,
+            stale_secs: 7 * 86_400,
+            stale_sweep_secs: 3600,
+        },
+        policy: Default::default(),
+        rerank: Default::default(),
+    });
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let test_store = Arc::clone(&store);
+    let result = tokio::spawn(async move { run_workflow(&address, &test_store).await }).await;
+    server.abort();
+    result.unwrap();
+    drop(store);
+    std::fs::remove_file(path).unwrap();
 }
 
 async fn run_workflow(address: &str, store: &Store) {
@@ -1433,14 +1479,8 @@ async fn cross_harness_workflow(address: &str, store: &Store) {
 }
 
 async fn continuation_slots_workflow(address: &str, store: &Store) {
-    use std::collections::HashMap;
-
     use chrono::{Duration, Utc};
     use memento_core::protocol::ContinuationRecord;
-    use qdrant_client::{
-        Payload,
-        qdrant::{PointStruct, UpsertPointsBuilder, Vector},
-    };
 
     let call = |method: &'static str, path: &'static str, body: Value| async move {
         request(address, method, path, Some("test-token"), &body.to_string()).await
@@ -1593,20 +1633,8 @@ async fn continuation_slots_workflow(address: &str, store: &Store) {
         &Uuid::from_u128(0x8bcc899f_a24d_53d6_83e1_80669ad0e156),
         b"slots",
     );
-    let payload = Payload::try_from(serde_json::to_value(legacy).unwrap()).unwrap();
     store
-        .client
-        .upsert_points(
-            UpsertPointsBuilder::new(
-                &store.continuations_collection,
-                vec![PointStruct {
-                    id: Some(legacy_id.to_string().into()),
-                    payload: payload.into(),
-                    vectors: Some(HashMap::<String, Vector>::new().into()),
-                }],
-            )
-            .wait(true),
-        )
+        .write_continuation(legacy_id.to_string().into(), legacy)
         .await
         .unwrap();
     let legacy_claim = call("POST", "/v1/continuations/claim", claim("legacy", "first")).await;

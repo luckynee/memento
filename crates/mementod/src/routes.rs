@@ -198,17 +198,23 @@ impl ApiError {
 
     async fn store(store: &Store, error: anyhow::Error) -> Self {
         tracing::error!(error = ?error, "store request failure");
-        let qdrant_available = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            store.client.health_check(),
-        )
-        .await
-        .is_ok_and(|result| result.is_ok());
-        if !qdrant_available {
+        let store_available =
+            tokio::time::timeout(std::time::Duration::from_secs(2), store.health())
+                .await
+                .is_ok_and(|result| result.is_ok());
+        if !store_available {
             Self {
                 status: StatusCode::SERVICE_UNAVAILABLE,
-                code: "qdrant_unavailable",
-                message: "Qdrant request failed",
+                code: if matches!(store, Store::Qdrant(_)) {
+                    "qdrant_unavailable"
+                } else {
+                    "store_unavailable"
+                },
+                message: if matches!(store, Store::Qdrant(_)) {
+                    "Qdrant request failed"
+                } else {
+                    "SQLite request failed"
+                },
             }
         } else {
             Self {
@@ -313,7 +319,7 @@ async fn not_found() -> ApiError {
 async fn health(State(state): State<RouterState>) -> Json<Health> {
     Json(Health {
         ok: true,
-        qdrant: state.app.store.client.health_check().await.is_ok(),
+        qdrant: state.app.store.health().await.is_ok(),
         version: Some(env!("CARGO_PKG_VERSION").to_string()),
     })
 }
@@ -1571,6 +1577,8 @@ mod tests {
             )),
             config: Config {
                 bind: "127.0.0.1:0".parse().unwrap(),
+                store: "qdrant".into(),
+                sqlite_path: Default::default(),
                 qdrant_url: "http://127.0.0.1:6334".into(),
                 token: None,
                 collection_prefix: "sweep_test".into(),
