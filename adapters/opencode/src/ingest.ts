@@ -25,6 +25,7 @@ export function createIngestor(deps: {
     log(message: string, error?: unknown): void;
 }) {
     const chains = new Map<string, Promise<void>>();
+    const retries = new Map<string, Promise<void>>();
     const sessions = new Map<string, {
         registered: boolean;
         retryClaim: boolean;
@@ -226,6 +227,25 @@ export function createIngestor(deps: {
     function handleExecutionSucceeded(sessionID: string): Promise<void> {
         return serialize(sessionID, () => ingestSession(sessionID, false)).catch((error: unknown) => {
             deps.log(`Failed to ingest session ${sessionID}`, error);
+            if (!(error instanceof MementoError) || !error.connectionFailure || !error.startup || retries.has(sessionID)) {
+                return;
+            }
+            const retry = error.startup.then(async (ready) => {
+                if (!ready || retries.get(sessionID) !== retry) {
+                    return;
+                }
+                recordActivity(deps.activity, { level: "info", event: "ingest", session: sessionID, project: deps.project, detail: { count: 1, reason: "autostart_retry" } });
+                try {
+                    await serialize(sessionID, () => ingestSession(sessionID, false));
+                } catch (retryError) {
+                    deps.log(`Failed to retry ingest for session ${sessionID}`, retryError);
+                }
+            }).finally(() => {
+                if (retries.get(sessionID) === retry) {
+                    retries.delete(sessionID);
+                }
+            });
+            retries.set(sessionID, retry);
         });
     }
 
@@ -236,6 +256,7 @@ export function createIngestor(deps: {
     }
 
     async function forget(sessionID: string): Promise<void> {
+        retries.delete(sessionID);
         while (chains.has(sessionID)) {
             await chains.get(sessionID);
         }

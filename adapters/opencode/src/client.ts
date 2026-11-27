@@ -54,6 +54,8 @@ export type SearchHit = {
 };
 
 export class MementoError extends Error {
+    startup?: Promise<boolean>;
+
     constructor(message: string, public code: string, public status?: number, public connectionFailure = false) {
         super(message);
         this.name = "MementoError";
@@ -214,7 +216,7 @@ export class MementoClient {
             }
             const startup = this.ensureStarted();
             if (!waitForStartup) {
-                void startup;
+                error.startup = startup;
                 throw error;
             }
             const ready = signal
