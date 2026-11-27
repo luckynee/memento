@@ -152,7 +152,7 @@ The installer keeps your saved setup. From v0.3 on, `memento update` works norma
 memento daemon migrate
 ```
 
-Migration stops only the Docker `mementod`, re-embeds every memory in a one-off container on the Compose network (no ports opened), switches to native mode, verifies the segment count, then stops the Docker stack. The Qdrant volume is kept as a backup; delete it with `docker volume rm memento_qdrant_storage` or `memento remove --purge`. Any failure restarts Docker and leaves your saved mode unchanged. `--yes` skips the prompt, `--keep-docker-running` leaves Qdrant running, and `--force` first moves an existing native database to `memento.db.bak-<timestamp>` (restored on failure).
+Migration stops only the Docker `mementod`, re-embeds every memory in a one-off container on the Compose network (no ports opened), switches to native mode, verifies the segment count, then stops the Docker stack. The Qdrant volume is kept as a backup; delete it with `memento daemon prune-docker`, which refuses while the saved mode is `docker` (the volume would be your live memory) and never touches native data. Do not use `memento remove --purge` for this: it deletes your native memories too. Any failure restarts Docker and leaves your saved mode unchanged. `--yes` skips the prompt, `--keep-docker-running` leaves Qdrant running, and `--force` first moves an existing native database to `memento.db.bak-<timestamp>` (restored on failure).
 
 ## Everyday use
 
@@ -195,13 +195,13 @@ memento daemon up|down|status|logs [-f]|pull|ensure
 - `memento update --check` checks for an update; `--version <x.y.z>` selects a release; `--refresh` reapplies saved setup without replacing binaries. Refresh also pulls and starts Docker mode or restarts native mode.
 - Binary replacement is for installer-managed installs. For Cargo installs, use `cargo install --path crates/memento-cli` or the installer.
 - `memento doctor --offline` skips the latest-release check.
-- `memento daemon` manages Docker or native mode; `logs -f` follows its logs, `pull` is Docker-only, and `ensure` starts native mode if needed. External mode supports health status but is not managed. `memento daemon migrate [--yes] [--keep-docker-running] [--force]` moves Docker memories to native storage.
+- `memento daemon` manages Docker or native mode; `logs -f` follows its logs, `pull` is Docker-only, and `ensure` starts native mode if needed. External mode supports health status but is not managed. `memento daemon migrate [--yes] [--keep-docker-running] [--force]` moves Docker memories to native storage. `memento daemon prune-docker [--yes] [--force]` deletes only the old Docker containers, network, `<project>_qdrant_storage` volume and rendered compose file; it refuses in `docker` mode and, in `external` mode with a Docker volume present, without `--force`.
 
 ## Removing memento
 
 `memento remove` previews removal and lets you choose harness integrations from a checklist, or select them with `--harness`. Use `--dry-run` to preview without changes. Normal removal keeps memory data, binaries, and shared assets that other integrations may need.
 
-`memento remove --purge` additionally destroys the managed daemon's data: the Docker Qdrant volume, Compose project and files, the native SQLite database with its backups, the native lock and log, the cached embedding model, and the embedded plugin. The preview lists every path. It requires a saved managed (Docker or native) daemon and typing `purge` in a terminal; non-interactive purge requires `--yes`.
+`memento remove --purge` additionally destroys the managed daemon's data, including every memory in the native database (the preview states how many); to delete only the old Docker backup use `memento daemon prune-docker`. It removes: the Docker Qdrant volume, Compose project and files, the native SQLite database with its backups, the native lock and log, the cached embedding model, and the embedded plugin. The preview lists every path. It requires a saved managed (Docker or native) daemon and typing `purge` in a terminal; non-interactive purge requires `--yes`.
 
 ## Cleaning up memory
 

@@ -48,6 +48,12 @@ Alternatively, add the checkout plugin to `opencode.jsonc` manually:
 | `harness` | `opencode` | Harness identifier |
 
 On each completed step and execution the adapter ingests transcript messages.
+A backlog (new install on an existing session, reset cursor, fork) is sent in batches
+of at most 64 items or 2 MB per `/v1/ingest` request, whichever comes first; the
+cursor is saved after each successful batch, so a timeout or restart resumes from
+the failed batch. Ingest requests use a 60-second timeout (other requests keep 10
+seconds), the per-session serializer allows one drain at a time, and each batch is
+recorded in the activity log with counts only.
 Native autostart waits at most 15 seconds for foreground requests, respects shorter
 existing deadlines, and retries once. Background ingest does not wait; its cursor
 remains unchanged on failure and it retries once after successful startup. Failed

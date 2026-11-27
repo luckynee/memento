@@ -45,6 +45,13 @@ enum DaemonCommand {
         #[arg(long, help = "Back up and replace existing native data")]
         force: bool,
     },
+    #[command(about = "Delete the old Docker stack and volume after migration")]
+    PruneDocker {
+        #[arg(long, help = "Delete without prompting")]
+        yes: bool,
+        #[arg(long, help = "Allow pruning when the saved daemon mode is external")]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -598,6 +605,9 @@ pub(super) fn run(cli: &Cli, args: &DaemonArgs) -> Result<(), CliError> {
     {
         return migrate(cli, *yes, *keep_docker_running, *force);
     }
+    if let DaemonCommand::PruneDocker { yes, force } = &args.command {
+        return prune_docker(*yes, *force);
+    }
     let setup = current_setup()?;
     let mode = saved_mode(Some(&setup))?;
     if let DaemonCommand::Ensure = &args.command {
@@ -643,7 +653,7 @@ pub(super) fn run(cli: &Cli, args: &DaemonArgs) -> Result<(), CliError> {
                 "native daemon binaries are updated with memento update",
             )),
             DaemonCommand::Ensure => unreachable!(),
-            DaemonCommand::Migrate { .. } => unreachable!(),
+            DaemonCommand::Migrate { .. } | DaemonCommand::PruneDocker { .. } => unreachable!(),
         };
     }
     if mode == DaemonMode::External {
@@ -689,7 +699,7 @@ pub(super) fn run(cli: &Cli, args: &DaemonArgs) -> Result<(), CliError> {
         }
         DaemonCommand::Pull => pull(),
         DaemonCommand::Ensure => unreachable!(),
-        DaemonCommand::Migrate { .. } => unreachable!(),
+        DaemonCommand::Migrate { .. } | DaemonCommand::PruneDocker { .. } => unreachable!(),
     }
 }
 
@@ -818,6 +828,197 @@ fn migration_command(project: &str, user: &str, cache: &Path, data: &Path, image
             "/out/memento.db",
         ]);
     command
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DockerStack {
+    containers: Vec<String>,
+    networks: Vec<String>,
+    volumes: Vec<String>,
+    compose_file: bool,
+}
+
+impl DockerStack {
+    fn is_empty(&self) -> bool {
+        self.containers.is_empty()
+            && self.networks.is_empty()
+            && self.volumes.is_empty()
+            && !self.compose_file
+    }
+}
+
+fn prune_refusal(mode: DaemonMode, stack: &DockerStack, force: bool) -> Option<String> {
+    match mode {
+        DaemonMode::Docker => Some(
+            "the saved daemon mode is docker, so the Docker volume is your live memory; run memento daemon migrate first".into(),
+        ),
+        DaemonMode::External if !stack.volumes.is_empty() && !force => Some(
+            "the saved daemon mode is external and the Docker memory volume may be live; use --force only if it is not".into(),
+        ),
+        _ => None,
+    }
+}
+
+fn prune_commands(stack: &DockerStack) -> Vec<Vec<String>> {
+    let mut commands = Vec::new();
+    for (prefix, names) in [
+        (vec!["rm", "-f"], &stack.containers),
+        (vec!["network", "rm"], &stack.networks),
+        (vec!["volume", "rm"], &stack.volumes),
+    ] {
+        if !names.is_empty() {
+            let mut command: Vec<String> = prefix.into_iter().map(String::from).collect();
+            command.extend(names.iter().cloned());
+            commands.push(command);
+        }
+    }
+    commands
+}
+
+fn docker_labeled(args: &[&str], project: &str, format: &str) -> Result<Vec<String>, CliError> {
+    let output = Command::new("docker")
+        .args(args)
+        .arg("--filter")
+        .arg(format!("label=com.docker.compose.project={project}"))
+        .args(["--format", format])
+        .output()
+        .map_err(|error| CliError::other(format!("cannot run docker: {error}")))?;
+    if !output.status.success() {
+        return Err(CliError::other(format!(
+            "docker {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(String::from)
+        .collect())
+}
+
+fn docker_stack(project: &str, compose: &Path) -> Result<DockerStack, CliError> {
+    Ok(DockerStack {
+        containers: docker_labeled(&["ps", "-a"], project, "{{.Names}}")?,
+        networks: docker_labeled(&["network", "ls"], project, "{{.Name}}")?,
+        volumes: docker_labeled(&["volume", "ls"], project, "{{.Name}}")?,
+        compose_file: compose.is_file(),
+    })
+}
+
+fn volume_size_from_json(output: &str, volume: &str) -> Option<String> {
+    let report: Value = serde_json::from_str(output.trim()).ok()?;
+    report
+        .get("Volumes")?
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("Name").and_then(Value::as_str) == Some(volume))?
+        .get("Size")?
+        .as_str()
+        .filter(|size| !size.is_empty() && *size != "N/A")
+        .map(String::from)
+}
+
+fn volume_size(volume: &str) -> Option<String> {
+    let output = Command::new("docker")
+        .args(["system", "df", "-v", "--format", "{{json .}}"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    volume_size_from_json(&String::from_utf8_lossy(&output.stdout), volume)
+}
+
+fn prune_preview(stack: &DockerStack, compose: &Path) -> Vec<String> {
+    let mut lines = Vec::new();
+    for container in &stack.containers {
+        lines.push(format!("container {container}"));
+    }
+    for network in &stack.networks {
+        lines.push(format!("network {network}"));
+    }
+    for volume in &stack.volumes {
+        let size = volume_size(volume).unwrap_or_else(|| "unknown size".into());
+        lines.push(format!("volume {volume} ({size})"));
+    }
+    if stack.compose_file {
+        lines.push(format!("file {}", compose.display()));
+    }
+    lines
+}
+
+fn prune_docker(yes: bool, force: bool) -> Result<(), CliError> {
+    let setup = current_setup()?;
+    let mode = saved_mode(Some(&setup))?;
+    let project = compose_project()?;
+    let compose = assets::data_dir()?.join("compose.yaml");
+    let stack = docker_stack(&project, &compose)?;
+    if let Some(reason) = prune_refusal(mode, &stack, force) {
+        return Err(CliError::other(format!("refusing to prune: {reason}")));
+    }
+    if stack.is_empty() {
+        println!("Nothing to prune for Docker project {project}.");
+        return Ok(());
+    }
+    println!(
+        "Docker project {project}: the following will be deleted (native data is not touched):"
+    );
+    for line in prune_preview(&stack, &compose) {
+        println!("  {line}");
+    }
+    if !yes {
+        if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+            return Err(CliError::other(
+                "prune-docker requires confirmation or --yes",
+            ));
+        }
+        if !dialoguer::Confirm::new()
+            .with_prompt("Delete the Docker backup?")
+            .default(false)
+            .interact()
+            .map_err(|error| CliError::other(format!("prune prompt failed: {error}")))?
+        {
+            return Err(CliError::other("prune cancelled"));
+        }
+    }
+    for arguments in prune_commands(&stack) {
+        let output = Command::new("docker")
+            .args(&arguments)
+            .output()
+            .map_err(|error| CliError::other(format!("cannot run docker: {error}")))?;
+        if !output.status.success() {
+            return Err(CliError::other(format!(
+                "docker {} failed: {}",
+                arguments.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+    }
+    if stack.compose_file {
+        fs::remove_file(&compose).map_err(|error| {
+            CliError::other(format!("cannot remove {}: {error}", compose.display()))
+        })?;
+    }
+    println!("Docker backup deleted.");
+    Ok(())
+}
+
+pub(super) fn native_database_path() -> Result<PathBuf, CliError> {
+    Ok(assets::data_dir()?.join("memento.db"))
+}
+
+pub(super) fn native_memory_count(cli: &Cli, mode: DaemonMode) -> Option<u64> {
+    if mode != DaemonMode::Native || !native_database_path().ok()?.is_file() {
+        return None;
+    }
+    ensure(cli, Duration::from_secs(120)).ok()?;
+    stats(cli).ok()
+}
+
+fn migration_prune_hint() -> &'static str {
+    "Delete the Docker backup later with: memento daemon prune-docker"
 }
 
 fn identity() -> Result<String, CliError> {
@@ -1073,9 +1274,7 @@ fn migrate(cli: &Cli, yes: bool, keep_docker_running: bool, force: bool) -> Resu
         println!(
             "Migrated {migrated_count} memories. Qdrant volume {project}_qdrant_storage remains as a backup."
         );
-        println!(
-            "Delete it later with memento remove --purge or docker volume rm {project}_qdrant_storage."
-        );
+        println!("{}", migration_prune_hint());
         if let Some((_, path)) = backup.first() {
             println!("Previous native database backup: {}", path.display());
         }
@@ -1222,6 +1421,70 @@ mod tests {
                 "models"
             ]
         );
+    }
+
+    #[test]
+    fn prune_refuses_docker_mode_and_unforced_external_with_volume() {
+        let stack = DockerStack {
+            volumes: vec!["memento_qdrant_storage".into()],
+            ..DockerStack::default()
+        };
+        assert!(prune_refusal(DaemonMode::Docker, &DockerStack::default(), true).is_some());
+        assert!(prune_refusal(DaemonMode::Docker, &stack, true).is_some());
+        assert!(prune_refusal(DaemonMode::External, &stack, false).is_some());
+        assert!(prune_refusal(DaemonMode::External, &stack, true).is_none());
+        assert!(prune_refusal(DaemonMode::External, &DockerStack::default(), false).is_none());
+        assert!(prune_refusal(DaemonMode::Native, &stack, false).is_none());
+    }
+
+    #[test]
+    fn empty_stack_has_nothing_to_prune() {
+        let stack = DockerStack::default();
+        assert!(stack.is_empty());
+        assert!(prune_commands(&stack).is_empty());
+        assert!(
+            !DockerStack {
+                compose_file: true,
+                ..DockerStack::default()
+            }
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn prune_plan_has_exact_docker_arguments() {
+        let stack = DockerStack {
+            containers: vec!["memento-mementod-1".into(), "memento-qdrant-1".into()],
+            networks: vec!["memento_default".into()],
+            volumes: vec!["memento_qdrant_storage".into()],
+            compose_file: true,
+        };
+        assert_eq!(
+            prune_commands(&stack),
+            vec![
+                vec!["rm", "-f", "memento-mementod-1", "memento-qdrant-1"],
+                vec!["network", "rm", "memento_default"],
+                vec!["volume", "rm", "memento_qdrant_storage"],
+            ]
+        );
+    }
+
+    #[test]
+    fn volume_size_matches_exact_name_in_captured_docker_output() {
+        let output = r#"{"Volumes":[{"Availability":"N/A","Driver":"local","Group":"N/A","Labels":"com.docker.compose.project=opensuse-build-service,com.docker.compose.volume=obs-build-root","Links":"1","Mountpoint":"/var/lib/docker/volumes/opensuse-build-service_obs-build-root/_data","Name":"opensuse-build-service_obs-build-root","Scope":"local","Size":"12.7GB","Status":"N/A"},{"Availability":"N/A","Driver":"local","Group":"N/A","Labels":"com.docker.compose.project=memento-prunetest,com.docker.compose.volume=qdrant_storage","Links":"1","Mountpoint":"/var/lib/docker/volumes/memento-prunetest_qdrant_storage/_data","Name":"memento-prunetest_qdrant_storage","Scope":"local","Size":"2.472GB","Status":"N/A"}]}"#;
+        assert_eq!(
+            volume_size_from_json(output, "memento-prunetest_qdrant_storage").as_deref(),
+            Some("2.472GB")
+        );
+        assert_eq!(volume_size_from_json(output, "memento-prunetest"), None);
+        assert_eq!(volume_size_from_json("not json", "x"), None);
+    }
+
+    #[test]
+    fn migration_hint_points_at_prune_docker_not_purge() {
+        let hint = migration_prune_hint();
+        assert!(hint.ends_with("memento daemon prune-docker"));
+        assert!(!hint.contains("purge"));
     }
 
     #[test]

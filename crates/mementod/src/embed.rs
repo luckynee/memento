@@ -6,6 +6,7 @@ use candle_core::{DType, Device};
 use fastembed::BertTextEmbedding;
 
 pub const DIMENSIONS: usize = 384;
+const INFERENCE_CHUNK: usize = 8;
 
 #[async_trait]
 pub trait Embedder: Send + Sync {
@@ -45,16 +46,22 @@ impl Embedder for CandleEmbedder {
     }
 
     async fn embed_documents(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
-        let model = Arc::clone(&self.model);
-        tokio::task::spawn_blocking(move || {
-            model
-                .lock()
-                .map_err(|_| anyhow!("embedding model lock poisoned"))?
-                .embed(&texts)
-                .context("embedding documents with Candle")
-        })
-        .await
-        .context("joining Candle embedding inference")?
+        let mut vectors = Vec::with_capacity(texts.len());
+        for chunk in texts.chunks(INFERENCE_CHUNK) {
+            let model = Arc::clone(&self.model);
+            let chunk = chunk.to_vec();
+            let embedded = tokio::task::spawn_blocking(move || {
+                model
+                    .lock()
+                    .map_err(|_| anyhow!("embedding model lock poisoned"))?
+                    .embed(&chunk)
+                    .context("embedding documents with Candle")
+            })
+            .await
+            .context("joining Candle embedding inference")??;
+            vectors.extend(embedded);
+        }
+        Ok(vectors)
     }
 }
 
