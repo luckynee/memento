@@ -3,13 +3,40 @@ import { recordActivity, type ActivitySink } from "./activity-log";
 import { MementoError, type MementoClient } from "./client";
 import { frameContinuation } from "./commands";
 import { classifyKind, forEachJevItem, type DecisionsFn, type JevModel } from "./jev";
-import { mapMessage, selectNewMessages } from "./transcript";
+import { mapMessage, selectNewMessages, type IngestItem } from "./transcript";
 
 type Storage = {
     get(key: string): Promise<unknown>;
     set(key: string, value: string | boolean): Promise<unknown>;
     remove?(key: string): Promise<unknown>;
 };
+
+export const INGEST_BATCH_MAX_ITEMS = 64;
+export const INGEST_BATCH_MAX_BYTES = 2 * 1024 * 1024;
+
+export function batchMessages(messages: unknown[], maxItems = INGEST_BATCH_MAX_ITEMS, maxBytes = INGEST_BATCH_MAX_BYTES): { items: IngestItem[]; cursor?: string }[] {
+    const batches: { items: IngestItem[]; cursor?: string }[] = [];
+    let current: { items: IngestItem[]; cursor?: string; bytes: number } | undefined;
+    for (const message of messages) {
+        const items = mapMessage(message);
+        const bytes = items.reduce((sum, item) => sum + JSON.stringify(item).length, 0);
+        if (current && current.items.length && (current.items.length + items.length > maxItems || current.bytes + bytes > maxBytes)) {
+            batches.push({ items: current.items, cursor: current.cursor });
+            current = undefined;
+        }
+        current ??= { items: [], bytes: 0 };
+        current.items.push(...items);
+        current.bytes += bytes;
+        const id = message && typeof message === "object" ? (message as { id?: unknown }).id : undefined;
+        if (typeof id === "string") {
+            current.cursor = id;
+        }
+    }
+    if (current) {
+        batches.push({ items: current.items, cursor: current.cursor });
+    }
+    return batches;
+}
 
 export function createIngestor(deps: {
     client: Pick<MementoClient, "putSession" | "ingest" | "claimContinuation">;
@@ -169,34 +196,44 @@ export function createIngestor(deps: {
             return time.created >= forkCreated;
         });
         const selection = selectNewMessages(forkContext, cursor);
-        const items = selection.messages.flatMap(mapMessage);
-        if (deps.decide) {
-            const decide = deps.decide;
-            const textItems = items.filter((item) => item.role === "assistant" || item.role === "user");
-            const cache = sessionState(sessionID).classifications;
-            await forEachJevItem(textItems, async (item) => {
-                const hash = createHash("sha256").update(item.role).update("\0").update(item.text).digest("hex");
-                const cached = cache.get(item.source_id);
-                if (cached?.hash === hash) {
-                    item.kind_hint = cached.kind;
-                } else {
-                    item.kind_hint = await classifyKind(decide, deps.jevModel, item.text, item.role as "user" | "assistant");
-                }
-                cache.delete(item.source_id);
-                cache.set(item.source_id, { hash, kind: item.kind_hint });
-                if (cache.size > 500) {
-                    cache.delete(cache.keys().next().value!);
-                }
-            });
-        }
-        if (items.length) {
-            const hash = createHash("sha256").update(JSON.stringify(items)).digest("hex");
-            if (selection.nextCursor !== cursor || sessionState(sessionID).lastIngestHash !== hash) {
-                const started = Date.now();
-                const result = await deps.client.ingest({ harness: deps.harness, project: deps.project, session: sessionID, items }, waitForStartup);
-                recordActivity(deps.activity, { level: "info", event: "ingest", session: sessionID, project: deps.project, detail: { items: items.length, segments: result.segments, skipped: result.skipped, durationMs: Date.now() - started } });
-                sessionState(sessionID).lastIngestHash = hash;
+        const batches = batchMessages(selection.messages);
+        const totalItems = batches.reduce((sum, batch) => sum + batch.items.length, 0);
+        if (totalItems) {
+            const hash = createHash("sha256").update(JSON.stringify(batches.flatMap((batch) => batch.items))).digest("hex");
+            if (selection.nextCursor === cursor && sessionState(sessionID).lastIngestHash === hash) {
+                return;
             }
+            for (const [index, batch] of batches.entries()) {
+                const items = batch.items;
+                if (deps.decide) {
+                    const decide = deps.decide;
+                    const textItems = items.filter((item) => item.role === "assistant" || item.role === "user");
+                    const cache = sessionState(sessionID).classifications;
+                    await forEachJevItem(textItems, async (item) => {
+                        const itemHash = createHash("sha256").update(item.role).update("\0").update(item.text).digest("hex");
+                        const cached = cache.get(item.source_id);
+                        if (cached?.hash === itemHash) {
+                            item.kind_hint = cached.kind;
+                        } else {
+                            item.kind_hint = await classifyKind(decide, deps.jevModel, item.text, item.role as "user" | "assistant");
+                        }
+                        cache.delete(item.source_id);
+                        cache.set(item.source_id, { hash: itemHash, kind: item.kind_hint });
+                        if (cache.size > 500) {
+                            cache.delete(cache.keys().next().value!);
+                        }
+                    });
+                }
+                if (items.length) {
+                    const started = Date.now();
+                    const result = await deps.client.ingest({ harness: deps.harness, project: deps.project, session: sessionID, items }, waitForStartup);
+                    recordActivity(deps.activity, { level: "info", event: "ingest", session: sessionID, project: deps.project, detail: { items: items.length, segments: result.segments, skipped: result.skipped, durationMs: Date.now() - started, ...(batches.length > 1 ? { batch: index + 1, batches: batches.length } : {}) } });
+                }
+                if (index < batches.length - 1 && batch.cursor !== undefined) {
+                    await deps.storage.set(`memento/ingest/${sessionID}`, batch.cursor);
+                }
+            }
+            sessionState(sessionID).lastIngestHash = hash;
         }
         if (selection.nextCursor !== undefined) {
             await deps.storage.set(`memento/ingest/${sessionID}`, selection.nextCursor);

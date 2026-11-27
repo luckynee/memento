@@ -191,3 +191,17 @@ describe("daemon client", () => {
         expect(starts).toBe(0);
     });
 });
+
+test("ingest requests use the longer ingest timeout while other requests keep the default", async () => {
+    const seen: number[] = [];
+    const realTimeout = AbortSignal.timeout;
+    AbortSignal.timeout = ((ms: number) => { seen.push(ms); return realTimeout.call(AbortSignal, ms); }) as typeof AbortSignal.timeout;
+    try {
+        const client = new MementoClient({ fetch: (async () => Response.json({ segments: 0, skipped: 0, ok: true })) as unknown as typeof fetch });
+        await client.ingest({ harness: "h", project: "p", session: "s", items: [] });
+        await client.health();
+    } finally {
+        AbortSignal.timeout = realTimeout;
+    }
+    expect(seen).toEqual([60000, 10000]);
+});

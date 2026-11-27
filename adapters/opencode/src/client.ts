@@ -74,6 +74,8 @@ function isConnectionFailure(error: unknown): boolean {
     return false;
 }
 
+export const INGEST_TIMEOUT_MS = 60000;
+
 export class MementoClient {
     private readonly url: string;
     private readonly token?: string;
@@ -120,8 +122,8 @@ export class MementoClient {
         this.startupCooldownMs = options.startupCooldownMs ?? 60000;
     }
 
-    private async requestOnce<T>(path: string, method: string, body?: unknown, signal?: AbortSignal): Promise<T> {
-        const timeout = AbortSignal.timeout(this.timeoutMs);
+    private async requestOnce<T>(path: string, method: string, body?: unknown, signal?: AbortSignal, timeoutMs = this.timeoutMs): Promise<T> {
+        const timeout = AbortSignal.timeout(timeoutMs);
         const combined = signal ? AbortSignal.any([timeout, signal]) : timeout;
         const headers: Record<string, string> = { "Content-Type": "application/json" };
         if (this.token) {
@@ -207,9 +209,9 @@ export class MementoClient {
         return startup;
     }
 
-    private async request<T>(path: string, method: string, body?: unknown, signal?: AbortSignal, waitForStartup = true): Promise<T> {
+    private async request<T>(path: string, method: string, body?: unknown, signal?: AbortSignal, waitForStartup = true, timeoutMs?: number): Promise<T> {
         try {
-            return await this.requestOnce<T>(path, method, body, signal);
+            return await this.requestOnce<T>(path, method, body, signal, timeoutMs);
         } catch (error) {
             if (!(error instanceof MementoError) || !error.connectionFailure || signal?.aborted || !this.mementoBin) {
                 throw error;
@@ -238,7 +240,7 @@ export class MementoClient {
             if (!ready || signal?.aborted) {
                 throw error;
             }
-            return this.requestOnce<T>(path, method, body, signal);
+            return this.requestOnce<T>(path, method, body, signal, timeoutMs);
         }
     }
 
@@ -281,7 +283,7 @@ export class MementoClient {
     }
 
     ingest(payload: SessionIdentity & { items: IngestItem[] }, waitForStartup = true): Promise<{ segments: number; skipped: number; duplicates?: number }> {
-        return this.request("/v1/ingest", "POST", payload, undefined, waitForStartup);
+        return this.request("/v1/ingest", "POST", payload, undefined, waitForStartup, Math.max(this.timeoutMs, INGEST_TIMEOUT_MS));
     }
 
     search(payload: SessionIdentity & { query: string; scope?: SearchScope; k?: number; kinds?: string[] }, signal?: AbortSignal): Promise<{ hits: SearchHit[] }> {

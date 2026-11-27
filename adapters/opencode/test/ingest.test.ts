@@ -824,3 +824,50 @@ test("repeated successful claims replace the fixed continuation instruction", as
     expect(attempts).toBe(3);
     expect(instructions.size).toBe(1);
 });
+
+describe("batched backlog ingestion", () => {
+    const backlog = (count: number) => Array.from({ length: count }, (_, index) => user(`m${index}`));
+
+    test("splits a backlog into bounded batches and advances the cursor per batch", async () => {
+        const fake = setup();
+        fake.contexts.set("s", backlog(150));
+        await fake.ingestor.flush("s");
+        expect(fake.ingests.map((value) => value.items.length)).toEqual([64, 64, 22]);
+        expect(fake.values.get("memento/ingest/s")).toBe("m149");
+        const batchDetails = fake.activity.filter((entry) => entry.event === "ingest").map((entry) => [entry.detail?.batch, entry.detail?.batches]);
+        expect(batchDetails).toEqual([[1, 3], [2, 3], [3, 3]]);
+    });
+
+    test("a failure on batch N keeps the cursor of batch N-1 and resumes from N", async () => {
+        const fake = setup();
+        fake.contexts.set("s", backlog(150));
+        let calls = 0;
+        const original = fake.ingests.push.bind(fake.ingests);
+        fake.ingests.push = ((value: { session: string; items: IngestItem[] }) => {
+            calls += 1;
+            if (calls === 3) { throw new Error("timeout"); }
+            return original(value);
+        }) as typeof fake.ingests.push;
+        await expect(fake.ingestor.flush("s")).rejects.toThrow("timeout");
+        expect(fake.values.get("memento/ingest/s")).toBe("m127");
+        fake.ingests.push = original;
+        await fake.ingestor.flush("s");
+        expect(fake.ingests.map((value) => value.items.length)).toEqual([64, 64, 22]);
+        expect(fake.ingests[2].items[0].source_id).toBe("m128");
+    });
+
+    test("overlapping flushes drain a session once", async () => {
+        const fake = setup();
+        fake.contexts.set("s", backlog(130));
+        await Promise.all([fake.ingestor.flush("s"), fake.ingestor.flush("s"), fake.ingestor.flush("s")]);
+        const sent = fake.ingests.flatMap((value) => value.items.map((item) => item.source_id));
+        expect(sent).toHaveLength(130);
+        expect(new Set(sent).size).toBe(130);
+    });
+
+    test("byte limit starts a new batch", async () => {
+        const { batchMessages } = await import("../src/ingest");
+        const batches = batchMessages([user("a"), user("b"), user("c")], 64, 1);
+        expect(batches.map((batch) => batch.items.length)).toEqual([1, 1, 1]);
+    });
+});
