@@ -2,6 +2,16 @@ name: Build check
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/build-check.yml"
+      - ".github/workflows/release.yml"
+      - "scripts/native-smoke.sh"
   pull_request:
     paths:
       - "crates/**"
@@ -9,6 +19,7 @@ on:
       - "Cargo.lock"
       - ".github/workflows/build-check.yml"
       - ".github/workflows/release.yml"
+      - "scripts/native-smoke.sh"
 
 permissions:
   contents: read
@@ -29,7 +40,7 @@ jobs:
             runner: macos-15
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -40,34 +51,11 @@ jobs:
         if: contains(matrix.target, 'linux-musl')
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools cmake perl
+          sudo apt-get install -y musl-tools
       - name: Build release binaries
         run: |
           cargo build --locked --release -p memento-cli -p memento-mcp --target "${{ matrix.target }}"
           cargo build --locked --release -p mementod --target "${{ matrix.target }}"
       - name: Native daemon smoke test
         shell: bash
-        env:
-          MEMENTO_STORE: sqlite
-          MEMENTO_BIND: 127.0.0.1:17377
-        run: |
-          set -euo pipefail
-          bin="target/${{ matrix.target }}/release"
-          ls -l "$bin/memento" "$bin/memento-mcp" "$bin/mementod"
-          "$bin/memento" --version
-          export MEMENTO_SQLITE_PATH="$RUNNER_TEMP/memento.db"
-          export FASTEMBED_CACHE_DIR="$RUNNER_TEMP/models"
-          "$bin/mementod" warmup
-          "$bin/mementod" serve > "$RUNNER_TEMP/mementod.log" 2>&1 &
-          daemon_pid=$!
-          for attempt in $(seq 1 90); do
-              if curl -fsS http://127.0.0.1:17377/health; then
-                  break
-              fi
-              sleep 1
-          done
-          curl -fsS http://127.0.0.1:17377/health
-          "$bin/memento" --url http://127.0.0.1:17377 search "native smoke test"
-          kill "$daemon_pid"
-          wait "$daemon_pid" || true
-          cat "$RUNNER_TEMP/mementod.log"
+        run: scripts/native-smoke.sh "target/${{ matrix.target }}/release"
