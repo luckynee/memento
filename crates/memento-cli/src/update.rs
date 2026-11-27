@@ -164,6 +164,7 @@ fn refresh(cli: &Cli) -> Result<(), CliError> {
     } else {
         println!("nothing to refresh");
     }
+    crate::daemon::offer_migration(cli)?;
     Ok(())
 }
 

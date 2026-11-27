@@ -651,6 +651,13 @@ pub(super) fn run(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
     let setup = receipt.get("setup").and_then(Value::as_object);
     let mode = crate::daemon::saved_mode(setup)?;
     println!("ok: daemon mode {}", mode.name());
+    if mode != crate::daemon::DaemonMode::Native {
+        match crate::daemon::docker_memory_exists() {
+            Ok(true) => println!("warn: Docker memory found; run memento daemon migrate"),
+            Ok(false) => {}
+            Err(error) => println!("warn: Docker memory detection: {}", error.message),
+        }
+    }
     if mode == crate::daemon::DaemonMode::Native {
         match crate::daemon::native_binary() {
             Ok(path) => println!("ok: native binary {}", path.display()),

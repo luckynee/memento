@@ -1133,7 +1133,7 @@ fn run(mut cli: Cli) -> Result<(), CliError> {
         return setup::run(&cli, args);
     }
     if let Command::Remove(args) = &cli.command {
-        return setup::remove(args);
+        return setup::remove(&cli, args);
     }
     if matches!(&cli.command, Command::ReapplySetup) {
         return setup::reapply_saved_setup(&cli);
