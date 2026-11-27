@@ -46,7 +46,7 @@ impl Config {
                 .filter(|value| !value.is_empty()),
             collection_prefix: env::var("MEMENTO_COLLECTION_PREFIX")
                 .unwrap_or_else(|_| "memento".into()),
-            cache_dir: env::var_os("FASTEMBED_CACHE_DIR").map(PathBuf::from),
+            cache_dir: Some(cache_dir()?),
             duplicate_cosine_threshold: env::var("MEMENTO_DUPLICATE_COSINE_THRESHOLD")
                 .unwrap_or_else(|_| "0.95".into())
                 .parse()
@@ -68,7 +68,7 @@ impl Config {
     }
 }
 
-fn sqlite_path() -> Result<PathBuf> {
+pub fn sqlite_path() -> Result<PathBuf> {
     if let Some(path) = env::var_os("MEMENTO_SQLITE_PATH") {
         return Ok(path.into());
     }
@@ -80,6 +80,20 @@ fn sqlite_path() -> Result<PathBuf> {
         }
     };
     Ok(data.join("memento/memento.db"))
+}
+
+pub fn cache_dir() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("FASTEMBED_CACHE_DIR") {
+        return Ok(path.into());
+    }
+    let cache = match env::var_os("XDG_CACHE_HOME").filter(|value| !value.is_empty()) {
+        Some(path) => PathBuf::from(path),
+        None => {
+            PathBuf::from(env::var_os("HOME").context("HOME is required for default model cache")?)
+                .join(".cache")
+        }
+    };
+    Ok(cache.join("memento/models"))
 }
 
 fn stale_seconds(seconds: Option<&str>, days: Option<&str>) -> Result<u64> {

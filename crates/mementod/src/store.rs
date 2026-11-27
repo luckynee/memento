@@ -981,7 +981,7 @@ fn segment_payload_with_role(segment: &Segment, role: Option<Role>) -> Result<Pa
     Ok(Payload::from(payload))
 }
 
-fn segment_from_payload(
+pub(crate) fn segment_from_payload(
     id: Option<PointId>,
     payload: HashMap<String, qdrant_client::qdrant::Value>,
 ) -> Result<Segment> {

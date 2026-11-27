@@ -165,6 +165,102 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub(crate) async fn migrate_segments(
+        &self,
+        segments: Vec<(Segment, Option<String>, Option<String>)>,
+    ) -> Result<()> {
+        let vectors = self
+            .embedder
+            .embed_documents(
+                segments
+                    .iter()
+                    .map(|(segment, _, _)| segment.text.clone())
+                    .collect(),
+            )
+            .await
+            .context("embedding migration batch")?;
+        ensure!(
+            vectors.len() == segments.len(),
+            "embedder returned incorrect vector count"
+        );
+        self.run(move |connection| {
+            let transaction = connection.transaction()?;
+            for ((segment, role, provenance), vector) in segments.iter().zip(vectors) {
+                write_segment(&transaction, segment, &vector, role.as_deref())?;
+                transaction.execute(
+                    "UPDATE segments SET provenance = ?1 WHERE id = ?2",
+                    params![provenance, segment.id.to_string()],
+                )?;
+            }
+            transaction
+                .commit()
+                .context("committing migrated segment batch")
+        })
+        .await
+    }
+
+    pub(crate) async fn migrate_payload(
+        &self,
+        collection: &'static str,
+        id: String,
+        payload: serde_json::Value,
+    ) -> Result<()> {
+        self.run(move |connection| {
+            let project = payload.get("project").and_then(|value| value.as_str()).context("missing project")?;
+            let encoded = serde_json::to_string(&payload)?;
+            match collection {
+                "sessions" => {
+                    let harness = payload.get("harness").and_then(|value| value.as_str()).context("missing session harness")?;
+                    let session = payload.get("session").and_then(|value| value.as_str()).context("missing session id")?;
+                    connection.execute(
+                        "INSERT INTO sessions(id,harness,project,session,payload) VALUES (?1,?2,?3,?4,?5)",
+                        params![id, harness, project, session, encoded],
+                    )?;
+                }
+                "continuations" => {
+                    connection.execute(
+                        "INSERT INTO continuations(id,project,payload) VALUES (?1,?2,?3)",
+                        params![id, project, encoded],
+                    )?;
+                }
+                _ => anyhow::bail!("invalid migration collection {collection}"),
+            }
+            Ok(())
+        }).await
+    }
+
+    pub(crate) async fn migration_counts(&self) -> Result<[u64; 3]> {
+        self.run(|connection| {
+            Ok([
+                connection
+                    .query_row("SELECT count(*) FROM segments", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?
+                    .try_into()?,
+                connection
+                    .query_row("SELECT count(*) FROM sessions", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?
+                    .try_into()?,
+                connection
+                    .query_row("SELECT count(*) FROM continuations", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?
+                    .try_into()?,
+            ])
+        })
+        .await
+    }
+
+    pub(crate) async fn finish_migration(&self) -> Result<()> {
+        self.run(|connection| {
+            connection
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
+                .context("checkpointing migrated SQLite database")
+        })
+        .await
+    }
+
     pub async fn ingest_segments(
         &self,
         segments: &[Segment],
