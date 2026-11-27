@@ -659,6 +659,11 @@ pub(super) fn run(cli: &Cli, args: &DoctorArgs) -> Result<(), CliError> {
         }
     }
     if mode == crate::daemon::DaemonMode::Native {
+        if let Ok(true) = crate::daemon::docker_memory_exists() {
+            println!(
+                "warn: old Docker memory volume still exists; delete it with memento daemon prune-docker"
+            );
+        }
         match crate::daemon::native_binary() {
             Ok(path) => println!("ok: native binary {}", path.display()),
             Err(error) => println!("warn: native binary: {}", error.message),

@@ -23,4 +23,4 @@ Native mode is the default for new setups. For Docker-free operation, install th
 embedder, downloads the model during setup, and starts on demand for CLI, MCP,
 and OpenCode plugin requests. It exits after 30 minutes without requests by
 default. Its data is separate from the Docker Qdrant volume; run
-`memento daemon migrate` to copy Docker memories into it.
+`memento daemon migrate` to copy Docker memories into it, then `memento daemon prune-docker` to delete the old Docker backup (not `memento remove --purge`, which also deletes native memories).

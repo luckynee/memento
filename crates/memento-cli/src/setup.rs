@@ -1775,13 +1775,26 @@ pub fn remove(cli: &Cli, args: &RemoveArgs) -> Result<(), CliError> {
     let data = crate::assets::data_dir()?;
     let embedded = data.join("opencode-plugin");
     if args.purge {
-        println!(
-            "WARNING: purge will destroy compose project {}, volume {}_qdrant_storage, {}, {}, native database, state, and model cache:",
-            crate::daemon::compose_project()?,
-            crate::daemon::compose_project()?,
-            data.join("compose.yaml").display(),
-            embedded.display()
-        );
+        if crate::daemon::saved_mode(setup.as_ref())? == crate::daemon::DaemonMode::Native
+            && crate::daemon::docker_memory_exists()?
+        {
+            println!("{PRUNE_DOCKER_TIP}");
+        }
+        let mode = crate::daemon::saved_mode(setup.as_ref())?;
+        let database = crate::daemon::native_database_path()?;
+        let docker_volume = crate::daemon::docker_memory_exists()?;
+        let count = crate::daemon::native_memory_count(cli, mode);
+        for line in purge_warning_lines(
+            &crate::daemon::compose_project()?,
+            &database,
+            database.is_file(),
+            count,
+            docker_volume,
+            &data.join("compose.yaml"),
+            &embedded,
+        ) {
+            println!("{line}");
+        }
         for path in crate::daemon::native_purge_paths()? {
             println!("  {}", path.display());
         }
@@ -1855,9 +1868,92 @@ pub fn remove(cli: &Cli, args: &RemoveArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+const PRUNE_DOCKER_TIP: &str =
+    "To delete only the old Docker backup, use memento daemon prune-docker.";
+
+fn purge_warning_lines(
+    project: &str,
+    database: &Path,
+    database_exists: bool,
+    memory_count: Option<u64>,
+    docker_volume: bool,
+    compose_file: &Path,
+    embedded_plugin: &Path,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if database_exists {
+        lines.push(match memory_count {
+            Some(count) => format!(
+                "This permanently deletes {count} memories in the native database ({}).",
+                database.display()
+            ),
+            None => format!(
+                "This permanently deletes the native database ({}); its memory count could not be read.",
+                database.display()
+            ),
+        });
+    }
+    if docker_volume {
+        lines.push(format!(
+            "This also permanently deletes the Docker memory volume {project}_qdrant_storage."
+        ));
+    }
+    lines.push(format!(
+        "WARNING: purge will destroy compose project {project}, volume {project}_qdrant_storage, {}, {}, native database, state, and model cache:",
+        compose_file.display(),
+        embedded_plugin.display()
+    ));
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn purge_warning_states_memory_count_and_docker_volume() {
+        let lines = purge_warning_lines(
+            "memento",
+            Path::new("/data/memento.db"),
+            true,
+            Some(10),
+            true,
+            Path::new("/data/compose.yaml"),
+            Path::new("/data/opencode-plugin"),
+        );
+        assert_eq!(
+            lines[0],
+            "This permanently deletes 10 memories in the native database (/data/memento.db)."
+        );
+        assert!(lines[1].contains("memento_qdrant_storage"));
+        assert!(lines[2].starts_with("WARNING: purge will destroy"));
+        let bare = purge_warning_lines(
+            "memento",
+            Path::new("/data/memento.db"),
+            false,
+            None,
+            false,
+            Path::new("/c"),
+            Path::new("/p"),
+        );
+        assert_eq!(bare.len(), 1);
+        let unknown = purge_warning_lines(
+            "memento",
+            Path::new("/data/memento.db"),
+            true,
+            None,
+            false,
+            Path::new("/c"),
+            Path::new("/p"),
+        );
+        assert!(unknown[0].contains("could not be read"));
+    }
+
+    #[test]
+    fn prune_tip_names_the_safe_command() {
+        assert!(PRUNE_DOCKER_TIP.contains("memento daemon prune-docker"));
+    }
+
     use clap::Parser;
 
     #[test]
