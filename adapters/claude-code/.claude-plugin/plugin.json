@@ -3,7 +3,7 @@
     "version": "0.2.2",
     "description": "Cross-session and cross-harness memory for Claude Code.",
     "author": {
-        "name": "memento-pool"
+        "name": "luckynee"
     },
     "userConfig": {
         "subagent_memory": {

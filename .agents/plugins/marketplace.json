@@ -1,7 +1,7 @@
 {
-    "name": "memento-pool",
+    "name": "memento",
     "interface": {
-        "displayName": "Memento Pool"
+        "displayName": "Memento"
     },
     "plugins": [
         {

@@ -2,7 +2,7 @@
 name: memento-connect-harness
 description: Connect a coding harness to memento using native hooks, the OpenCode plugin, optional MCP tools, or the generic lifecycle contract. Verify registration, continuation context, and turn import without exposing credentials.
 metadata:
-    source: memento-pool
+    source: memento
 ---
 
 # Connect a harness
@@ -28,7 +28,7 @@ Use when setting up memento for a harness or verifying an existing integration.
 
    ```json
    {
-       "package": "/absolute/path/to/memento-pool/adapters/opencode",
+        "package": "/absolute/path/to/memento/adapters/opencode",
        "options": { "url": "http://127.0.0.1:7377" }
    }
    ```

@@ -2,7 +2,7 @@
 name: memento-cleanup
 description: Inspect and safely remove unwanted memento memories or collect deleted sessions. Review project and lineage boundaries, preview garbage collection or stale sweeping, and obtain confirmation before any destructive forgetting.
 metadata:
-    source: memento-pool
+    source: memento
 ---
 
 # Clean up memory

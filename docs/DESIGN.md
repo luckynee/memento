@@ -1,4 +1,4 @@
-# memento-pool design
+# memento design
 
 Status: v1 design, 2026-11-18. Facts below were verified against official docs on that date; versions are pinned.
 
@@ -6,7 +6,7 @@ Status: v1 design, 2026-11-18. Facts below were verified against official docs o
 
 Switching models inside a long harness session (for example Opus at 500k tokens to an OpenAI model) replays the whole transcript to the new model. Provider prompt caches are keyed per model, so the first request after a switch is a full uncached prefill, every later turn pays cached-read cost on the whole prefix, and models reason worse over long, mostly stale context.
 
-memento-pool stores a filtered, segmented copy of each session in Qdrant and lets the new model work from:
+memento stores a filtered, segmented copy of each session in Qdrant and lets the new model work from:
 
 1. a small, frozen working-state digest (always injected),
 2. a verbatim recent tail of the transcript,

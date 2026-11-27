@@ -1,8 +1,8 @@
 {
-    "name": "memento-pool",
+    "name": "memento",
     "description": "Memento memory integration plugins.",
     "owner": {
-        "name": "memento-pool"
+        "name": "luckynee"
     },
     "plugins": [
         {

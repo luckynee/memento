@@ -9,13 +9,13 @@ memento setup
 ```
 
 For development checkouts, run `bun install` in this directory and use
-`memento setup --opencode-plugin /path/to/memento-pool/adapters/opencode`.
+`memento setup --opencode-plugin /path/to/memento/adapters/opencode`.
 Alternatively, add the checkout plugin to `opencode.jsonc` manually:
 
 ```jsonc
 {
     "plugins": [{
-        "package": "/absolute/path/to/memento-pool/adapters/opencode",
+        "package": "/absolute/path/to/memento/adapters/opencode",
         "options": {
             "url": "http://127.0.0.1:7377",
             "tailUserTurns": 3,

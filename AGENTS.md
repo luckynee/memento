@@ -1,4 +1,4 @@
-# memento-pool
+# memento
 
 Session-continuation memory for coding-agent harnesses. Rust daemon + CLI backed by Qdrant, with a thin OpenCode plugin adapter.
 

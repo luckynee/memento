@@ -2,7 +2,7 @@
 name: memento-recall
 description: Retrieve earlier decisions, facts, errors, and working context from memento memory. Use focused searches, inspect a session digest and counts, and verify retrieved code details against the current workspace before relying on them.
 metadata:
-    source: memento-pool
+    source: memento
 ---
 
 # Recall memory

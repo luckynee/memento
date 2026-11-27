@@ -2,7 +2,7 @@
 name: memento-handoff
 description: Continue work from a stored session in another session or harness while preserving its lineage. Find the source session, prepare a targeted or general handoff, and verify that the next session receives the framed digest.
 metadata:
-    source: memento-pool
+    source: memento
 ---
 
 # Continue a session
