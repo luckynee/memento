@@ -10,7 +10,7 @@ These measurements describe particular sessions and small experiments, not expec
 - **Results:** The two switch requests went from 301k to 57k and 76k to 32k tokens. Two manual compactions went from 376k to 80k tokens. All nine sessions registered and ingested; 32/32 subagents received a parent digest.
 - **Caveats:** These are observations, not randomized comparisons. Resume compaction never qualified. Models never called `memory_search` on their own in this audit. One compaction duplicated content retained after the cut; a later fix addressed it.
 
-## Manual compaction summary size (v0.2.2 fix)
+## Manual compaction summary size
 
 - **Date and environment:** 2026-11-26; OpenCode 2.4.2 private server and throwaway daemon. Model and provider version were not recorded in the map.
 - **Sample and setup:** A 349k-token history tested with the fixed adapter and the pre-fix control (`537e0176`); three idle manual-compaction checks. The exact number of token-comparison runs was not recorded.

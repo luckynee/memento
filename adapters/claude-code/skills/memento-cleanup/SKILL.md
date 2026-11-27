@@ -34,7 +34,7 @@ Use when the user wants to forget memories, review deleted sessions, or inspect 
        -d '{"project":"PROJECT","dry_run":true}'
    ```
 
-3. Explain the exact scope and preview findings to the user. `memento forget` has no dry-run flag; inspect sessions, lineage, and stats as its non-destructive preview. Obtain explicit confirmation before running one of:
+3. Preview the intended forget operation with `--dry-run`, then explain the exact scope and findings to the user. Obtain explicit confirmation before running one of:
 
    ```sh
    memento forget --harness H --project PROJECT --session S

@@ -36,7 +36,7 @@ Alternatively, add the checkout plugin to `opencode.jsonc` manually:
 | `tailUserTurns` | `3` | Recent user turns retained after a model switch |
 | `tailCharBudget` | `40000` | Target character budget for the pre-switch tail |
 | `digestBudget` | `12000` | Digest character budget |
-| `compaction` | `"native"` | `"memento"` replaces same-model compaction with the memento digest plus a verbatim recent tail at zero model cost; OpenCode's observed `keepID` retains the latest user turn verbatim, so the tail covers earlier turns; falls back to native on errors |
+| `compaction` | `"native"` | `"memento"` replaces same-model compaction with the memento digest plus a recent tail and current-turn context at zero model cost; falls back to native on errors |
 | `resume` | disabled | `true` or `{ idleMinutes, minContextTokens }` compacts before a resumed prompt after more than 60 idle minutes and at least 100000 estimated context tokens by default; enable with `memento setup --harness opencode --resume on --compaction memento`; `compaction: "memento"` avoids model summarisation cost |
 | `subagentMemory` | `"digest"` | Default subagent mode: `"off"`, `"digest"`, or `"filtered"`; enabled modes inject frozen root memory, and `"filtered"` omits the parent's newest user request and acknowledgement notes shorter than 40 characters |
 | `subagentMemoryAgents` | `{}` | Map agent IDs to `"off"`, `"digest"`, or `"filtered"` to override the default mode; invalid entries are ignored |
@@ -50,16 +50,17 @@ Alternatively, add the checkout plugin to `opencode.jsonc` manually:
 On each completed step and execution the adapter ingests transcript messages.
 Native autostart waits at most 15 seconds for foreground requests, respects shorter
 existing deadlines, and retries once. Background ingest does not wait; its cursor
-remains unchanged on failure and later events retry. Failed starts have a 60-second
-cooldown. Attempts and outcomes are recorded in the activity log without content.
-After a model switch it adds a per-model frozen digest to system instructions
+remains unchanged on failure and it retries once after successful startup. Failed
+starts have a 60-second cooldown. Attempts and outcomes are recorded in the
+activity log without content.
+After a model switch it adds a per-model frozen digest to the outgoing context
 while preserving a bounded recent tail. The `memory_search` tool retrieves stored memories, and
 `/memento-continue <harness>/<session>` links a session to an earlier session,
 including one from another harness. A bare session ID means `opencode`.
 `/memento-handoff [<harness>]` flushes the current session and prepares the
 next session in the project to continue it. When a harness is specified, only
-that harness can claim the handoff. The latest handoff replaces any previous
-pending handoff and expires after 24 hours.
+that harness can claim the handoff. A handoff replaces the pending handoff in
+the same target slot and expires after 24 hours.
 
 Cross-harness project identity uses OpenCode's canonical checkout path
 (`ctx.location.project.canonical`), falling back to the project ID when the

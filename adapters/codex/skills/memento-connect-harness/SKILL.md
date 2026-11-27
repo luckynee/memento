@@ -24,16 +24,7 @@ Use when setting up memento for a harness or verifying an existing integration.
    ```
 
    Use `--user` instead of `--project DIR` for user-wide installation. Install only the chosen harness and follow its trust prompts.
-3. For OpenCode, add this plugin entry to the existing `plugins` array in `~/.config/opencode/opencode.jsonc` or project `.opencode/opencode.jsonc`:
-
-   ```json
-   {
-        "package": "/absolute/path/to/memento/adapters/opencode",
-       "options": { "url": "http://127.0.0.1:7377" }
-   }
-   ```
-
-   Preserve unrelated configuration. Prefer the native `memory_search` tool when present.
+3. For OpenCode, use `memento setup` to install and configure the bundled plugin, selecting the intended scope and daemon mode. For a development checkout, use `memento setup --opencode-plugin /absolute/path/to/memento/adapters/opencode`. Preserve unrelated configuration. Prefer the native `memory_search` tool when present.
 4. For an MCP-capable harness, optionally configure its stdio MCP server to run `memento-mcp --harness NAME`. For agy:
 
    ```sh

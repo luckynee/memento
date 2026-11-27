@@ -10,7 +10,7 @@ Switching models in a long session replays the transcript to a model with a cold
 
 - **Model switch (OpenCode):** first requests fell from 301k to 57k and 76k to 32k tokens in two real sessions.
 - **Compaction (OpenCode):** two manual memento compactions reduced context from 376k to 80k tokens.
-- **Leaner compaction summaries (OpenCode, v0.2.2):** on a 349k-token history, the next request was 26.0k vs 44.4k tokens for the pre-fix control; recall was correct in both.
+- **Leaner compaction summaries (OpenCode):** on a 349k-token history, the next request was 26.0k vs 44.4k tokens for the pre-fix control; recall was correct in both.
 - **Project primer (OpenCode, opt-in):** 0 vs 10 tool steps, with 452 extra first-request tokens and equal recall in a small A/B test.
 - **Subagents (OpenCode):** 32/32 observed subagents received a parent digest in the usage audit.
 
@@ -58,18 +58,25 @@ Add validation tests.
 
 ## Quickstart
 
-Requirements: Linux or macOS on x86_64 or aarch64. Docker with Compose is required for the default mode, not the opt-in native mode.
+Requirements:
+
+- A published GitHub release for the installer, with x86_64 or aarch64 Linux (musl) or macOS.
+- Default Docker mode: Docker with Compose; the x86_64 image requires an x86-64-v3 CPU with AVX2.
+- Opt-in native mode: no Docker; the approximately 133 MB model downloads on first use.
 
 ```sh
 curl -fsSL https://github.com/luckynee/memento/releases/latest/download/install.sh | sh
 ```
 
-Alternatively, install the two packages with Rust and Cargo:
+Alternatively, install the packages with Rust and Cargo:
 
 ```sh
-cargo install --git https://github.com/luckynee/memento --tag v0.2.2 memento-cli
-cargo install --git https://github.com/luckynee/memento --tag v0.2.2 memento-mcp
+cargo install --locked --git https://github.com/luckynee/memento memento-cli
+cargo install --locked --git https://github.com/luckynee/memento memento-mcp
+cargo install --locked --git https://github.com/luckynee/memento mementod --no-default-features --features embed-candle
 ```
+
+Add `--tag vX.Y.Z` to pin a release.
 
 A Git-based Cargo install does not build the OpenCode plugin bundle; for OpenCode, use the release installer or configure a [development checkout](adapters/opencode/README.md).
 
@@ -83,7 +90,7 @@ The installer may run setup automatically on a terminal. Setup can start the man
 ## How it works
 
 1. A harness adapter ingests session activity and filters it into searchable segments.
-2. `mementod` stores segments in Qdrant by default or SQLite in native mode. Hybrid search combines fastembed BGE-small dense vectors and lexical search using RRF, then reranks for recency.
+2. `mementod` stores segments in Qdrant with ONNX embeddings in Docker mode, or SQLite with Candle embeddings in native mode. Both use fastembed BGE-small dense vectors and lexical search, fuse results with RRF, and rerank for recency.
 3. The adapter supplies a digest and recent context when continuing work; the agent can search memory for details it needs.
 
 The main components are:
@@ -93,12 +100,6 @@ The main components are:
 - `memento-mcp`: an optional MCP server exposing memory tools.
 - Adapters: the OpenCode V2 plugin and native Claude Code, Codex, and agy integrations.
 
-## Requirements
-
-- Docker with Compose for the default daemon mode; native mode does not require Docker.
-- A published GitHub release for the installer.
-- A supported CLI target: x86_64 or aarch64 Linux (musl), or x86_64 or aarch64 macOS.
-
 ## Install
 
 ```sh
@@ -107,7 +108,7 @@ curl -fsSL https://github.com/luckynee/memento/releases/latest/download/install.
 
 The installer downloads `memento`, `memento-mcp` and `mementod`, verifies their archive's SHA-256 checksum, and runs `memento setup` when a terminal is available.
 
-Set `MEMENTO_VERSION` to select a release (for example `0.2.0` or `v0.2.0`), `MEMENTO_INSTALL_DIR` to change the binary directory (default `~/.local/bin`), or `MEMENTO_NO_SETUP=1` to skip setup.
+Set `MEMENTO_VERSION` to select a release (for example `0.3.0` or `v0.3.0`), `MEMENTO_INSTALL_DIR` to change the binary directory (default `~/.local/bin`), or `MEMENTO_NO_SETUP=1` to skip setup.
 
 ## Setup
 
@@ -125,7 +126,7 @@ Docker remains the default. To opt into the Docker-free native SQLite daemon, ch
 memento setup --yes --harness opencode --scope project --daemon native
 ```
 
-Native setup downloads an approximately 133 MB embedding model on first use and loads it in memory. The daemon starts on demand for CLI and MCP requests and exits after 30 minutes without requests. OpenCode plugin requests do not yet start it automatically; start it with `memento daemon up` before using the plugin. Existing Docker memories are not copied automatically; see `mementod migrate` and [deployment notes](deploy/README.md).
+Native setup warms the embedding model and enables OpenCode plugin autostart. The daemon starts on demand for CLI, MCP, and configured OpenCode plugin requests and exits after 30 minutes without requests by default. Existing Docker memories are not copied automatically; see `mementod migrate` and [deployment notes](deploy/README.md).
 
 For OpenCode, setup also accepts:
 
@@ -169,19 +170,19 @@ agy mcp add memento -- /path/to/memento-mcp --harness agy
 ```sh
 memento update
 memento doctor
-memento daemon up|down|status|logs [-f]|pull
+memento daemon up|down|status|logs [-f]|pull|ensure
 ```
 
-- `memento update --check` checks for an update; `--version <x.y.z>` selects a release; `--refresh` reapplies saved setup without replacing binaries. Refresh also pulls and restarts a managed daemon.
+- `memento update --check` checks for an update; `--version <x.y.z>` selects a release; `--refresh` reapplies saved setup without replacing binaries. Refresh also pulls and starts Docker mode or restarts native mode.
 - Binary replacement is for installer-managed installs. For Cargo installs, use `cargo install --path crates/memento-cli` or the installer.
 - `memento doctor --offline` skips the latest-release check.
-- `memento daemon` manages the daemon through Docker Compose; `logs -f` follows its logs.
+- `memento daemon` manages Docker or native mode; `logs -f` follows its logs, `pull` is Docker-only, and `ensure` starts native mode if needed. External mode supports health status but is not managed.
 
 ## Removing memento
 
 `memento remove` previews removal and lets you choose harness integrations from a checklist, or select them with `--harness`. Use `--dry-run` to preview without changes. Normal removal keeps memory data, binaries, and shared assets that other integrations may need.
 
-`memento remove --purge` additionally destroys the managed daemon's Qdrant data, Compose project and files, and embedded plugin. It requires a saved managed daemon and typing `purge` in a terminal; non-interactive purge requires `--yes`.
+`memento remove --purge` additionally destroys the managed Docker daemon's Qdrant data, Compose project and files, and embedded plugin. It requires a saved Docker-managed daemon and typing `purge` in a terminal; non-interactive purge requires `--yes`. Native SQLite data is not purged by this command.
 
 ## Cleaning up memory
 
@@ -231,9 +232,10 @@ Checks:
 
 ```sh
 cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings && cargo test
-MEMENTO_TEST_QDRANT_URL=http://127.0.0.1:16334 cargo test -p mementod
 cd adapters/opencode && bun test && bunx tsc --noEmit
 ```
+
+Live Qdrant tests require a throwaway Qdrant instance; see [test instructions](AGENTS.md#checks).
 
 ### Releasing
 
