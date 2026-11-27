@@ -907,19 +907,28 @@ fn docker_stack(project: &str, compose: &Path) -> Result<DockerStack, CliError> 
     })
 }
 
+fn volume_size_from_json(output: &str, volume: &str) -> Option<String> {
+    let report: Value = serde_json::from_str(output.trim()).ok()?;
+    report
+        .get("Volumes")?
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("Name").and_then(Value::as_str) == Some(volume))?
+        .get("Size")?
+        .as_str()
+        .filter(|size| !size.is_empty() && *size != "N/A")
+        .map(String::from)
+}
+
 fn volume_size(volume: &str) -> Option<String> {
     let output = Command::new("docker")
-        .args(["system", "df", "-v"])
+        .args(["system", "df", "-v", "--format", "{{json .}}"])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(|line| line.split_whitespace().collect::<Vec<_>>())
-        .find(|fields| fields.len() >= 3 && fields[0] == volume)
-        .map(|fields| fields[fields.len() - 1].to_string())
+    volume_size_from_json(&String::from_utf8_lossy(&output.stdout), volume)
 }
 
 fn prune_preview(stack: &DockerStack, compose: &Path) -> Vec<String> {
@@ -1458,6 +1467,17 @@ mod tests {
                 vec!["volume", "rm", "memento_qdrant_storage"],
             ]
         );
+    }
+
+    #[test]
+    fn volume_size_matches_exact_name_in_captured_docker_output() {
+        let output = r#"{"Volumes":[{"Availability":"N/A","Driver":"local","Group":"N/A","Labels":"com.docker.compose.project=opensuse-build-service,com.docker.compose.volume=obs-build-root","Links":"1","Mountpoint":"/var/lib/docker/volumes/opensuse-build-service_obs-build-root/_data","Name":"opensuse-build-service_obs-build-root","Scope":"local","Size":"12.7GB","Status":"N/A"},{"Availability":"N/A","Driver":"local","Group":"N/A","Labels":"com.docker.compose.project=memento-prunetest,com.docker.compose.volume=qdrant_storage","Links":"1","Mountpoint":"/var/lib/docker/volumes/memento-prunetest_qdrant_storage/_data","Name":"memento-prunetest_qdrant_storage","Scope":"local","Size":"2.472GB","Status":"N/A"}]}"#;
+        assert_eq!(
+            volume_size_from_json(output, "memento-prunetest_qdrant_storage").as_deref(),
+            Some("2.472GB")
+        );
+        assert_eq!(volume_size_from_json(output, "memento-prunetest"), None);
+        assert_eq!(volume_size_from_json("not json", "x"), None);
     }
 
     #[test]
