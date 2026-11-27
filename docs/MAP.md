@@ -25,7 +25,7 @@
 | Path | Purpose |
 | --- | --- |
 | `Cargo.toml` `[workspace.package] version` | Single version for all crates; release tag must be `v<version>` |
-| `crates/memento-cli/build.rs` | Embeds `adapters/opencode/dist/index.js` (or `MEMENTO_OPENCODE_BUNDLE`) when present; sets `MEMENTO_TARGET` |
+| `crates/memento-cli/build.rs` | Embeds `adapters/opencode/dist/index.js` (or `MEMENTO_OPENCODE_BUNDLE`) when present; sets `MEMENTO_TARGET`. A plain `cargo install --git` build has no bundle, so it cannot install the OpenCode plugin |
 | `crates/memento-cli/src/assets.rs` | Embedded skills, plugin bundle writer (`<data>/memento/opencode-plugin/`), compose renderer |
 | `crates/memento-cli/assets/compose.yaml` | Managed daemon template; image `ghcr.io/luckynee/mementod:<version>` or `MEMENTO_DAEMON_IMAGE`; project `memento` |
 | `crates/memento-cli/src/daemon.rs` | `memento daemon up/down/status/logs/pull`; `managed_refresh_steps` |
@@ -56,7 +56,7 @@
 | `adapters/claude-code/`, `adapters/codex/`, `adapters/agy/` | Native plugin bundles (hooks/MCP/skills copies); contract in `docs/DESIGN.md` "Native plugin adapters" |
 | `adapters/claude-code/hooks/register.ts` | Claude Code Mod: registers `memory_search`/`memory_digest`/`memory_continue`/`memory_note` (no MCP) backed by `memento search --framed`, `digest --framed/--continuation`, `note`; tests in `register.test.ts` (`claude plugin test adapters/claude-code`) |
 | `crates/memento-core/src/reference.rs` | Shared reference-data framing and `neutralize` used by `memento-mcp` and CLI `--framed` |
-| `.claude-plugin/marketplace.json`, `.agents/plugins/marketplace.json` | Repo-root marketplaces for Claude Code and Codex (`memento@memento-pool`) |
+| `.claude-plugin/marketplace.json`, `.agents/plugins/marketplace.json` | Repo-root marketplaces for Claude Code and Codex (`memento@memento` since `fe579a9c`, previously `memento@memento-pool`). Installing from GitHub (`claude|codex plugin marketplace add luckynee/memento`) verified 2026-11-27 |
 | `scripts/sync-adapter-skills.sh` | Copies `skills/` into adapters; `--check` (CI) fails on drift or manifest version mismatch |
 | CLI state | `${XDG_STATE_HOME:-~/.local/state}/memento/cursors.json` (+ `cursors.lock`) |
 | Session cleanup | `POST /v1/sessions/release` and `memento gc` collect deleted sessions while preserving dependent lineage |
