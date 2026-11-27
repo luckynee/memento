@@ -147,3 +147,100 @@ async fn run_test(store: &Store) -> anyhow::Result<()> {
     assert_eq!(store.scroll_segments(&all).await?, vec![semantic]);
     Ok(())
 }
+
+struct BatchSlowEmbedder;
+
+#[async_trait::async_trait]
+impl mementod::embed::Embedder for BatchSlowEmbedder {
+    fn dimensions(&self) -> usize {
+        mementod::embed::DIMENSIONS
+    }
+
+    async fn embed_documents(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+        if texts.len() > 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        }
+        FakeEmbedder.embed_documents(texts).await
+    }
+}
+
+#[tokio::test]
+async fn sqlite_search_completes_while_a_large_ingest_is_embedding() {
+    use memento_core::{lineage::Ancestor, protocol::Role};
+    let path =
+        std::env::temp_dir().join(format!("memento-ingest-search-{}.db", std::process::id()));
+    let store = Arc::new(
+        Store::sqlite(path.clone(), Arc::new(BatchSlowEmbedder))
+            .await
+            .unwrap(),
+    );
+    store.ensure_schema().await.unwrap();
+    let segments: Vec<Segment> = (0..320)
+        .map(|index| Segment {
+            id: Uuid::new_v5(
+                &Uuid::NAMESPACE_OID,
+                format!("ingest-search-{index}").as_bytes(),
+            ),
+            harness: "h".into(),
+            project: "p".into(),
+            session: "s".into(),
+            kind: Kind::UserRequest,
+            text: format!("request number {index} about topic{index} widget{index}"),
+            source_id: format!("m{index}"),
+            chunk_index: 0,
+            ts: "2026-11-18T10:00:00Z".parse().unwrap(),
+            tool: None,
+            path: None,
+            paths: Vec::new(),
+        })
+        .collect();
+    let roles = segments
+        .iter()
+        .map(|segment| (segment.source_id.clone(), Role::User))
+        .collect();
+    let lineage = vec![Ancestor {
+        key: SessionKey {
+            harness: "h".into(),
+            session: "s".into(),
+        },
+        cutoff: None,
+    }];
+    let ingesting = {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move {
+            store
+                .ingest_segments(&segments, &roles, &lineage, 0.95, 0.9)
+                .await
+                .unwrap()
+        })
+    };
+    let filter = ScopeFilter {
+        harness: Some("h".into()),
+        project: Some("p".into()),
+        ..Default::default()
+    };
+    let mut latencies = Vec::new();
+    while !ingesting.is_finished() {
+        let started = std::time::Instant::now();
+        store
+            .hybrid_candidates("topic7 widget7", &filter, 10)
+            .await
+            .unwrap();
+        latencies.push(started.elapsed());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let (written, _) = ingesting.await.unwrap();
+    assert_eq!(written, 320);
+    assert!(
+        latencies.len() >= 4,
+        "only {} searches ran",
+        latencies.len()
+    );
+    let slowest = latencies.iter().max().unwrap();
+    assert!(
+        *slowest < std::time::Duration::from_millis(300),
+        "search blocked for {slowest:?} during ingest"
+    );
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}

@@ -336,6 +336,7 @@ impl SqliteStore {
                 .run(move |connection| {
                     connection.invalidate_dense_cache();
                     let mut counts = (0, 0);
+                    let mut loaded: Option<Vec<StoredSegment>> = None;
                     for (segment, vector) in batch.iter().zip(vectors) {
                         ensure!(
                             vector.len() == 384,
@@ -343,22 +344,33 @@ impl SqliteStore {
                         );
                         let role = roles.get(&segment.source_id).copied();
                         let duplicate = if prose_kind(segment.kind) {
-                            let mut candidates = load_segments(connection, &filter)?;
-                            candidates.retain(|candidate| {
-                                candidate.segment.project == segment.project
-                                    && candidate.segment.kind == segment.kind
-                                    && candidate.source_role.as_deref() == Some(role_name(role))
-                                    && candidate.provenance.as_deref()
-                                        == Some(segment.tool.as_deref().unwrap_or_default())
-                                    && candidate.segment.source_id != segment.source_id
+                            if loaded.is_none() {
+                                loaded = Some(load_segments(connection, &filter)?);
+                            }
+                            let candidates = loaded
+                                .as_ref()
+                                .expect("candidates loaded above")
+                                .iter()
+                                .filter(|candidate| {
+                                    candidate.segment.project == segment.project
+                                        && candidate.segment.kind == segment.kind
+                                        && candidate.source_role.as_deref() == Some(role_name(role))
+                                        && candidate.provenance.as_deref()
+                                            == Some(segment.tool.as_deref().unwrap_or_default())
+                                        && candidate.segment.source_id != segment.source_id
+                                })
+                                .collect::<Vec<_>>();
+                            let mut scored = candidates
+                                .iter()
+                                .map(|candidate| (cosine(&vector, &candidate.vector), *candidate))
+                                .collect::<Vec<_>>();
+                            scored.sort_by(|(left_score, left), (right_score, right)| {
+                                right_score
+                                    .total_cmp(left_score)
+                                    .then(left.segment.id.cmp(&right.segment.id))
                             });
-                            candidates.sort_by(|a, b| {
-                                cosine(&vector, &b.vector)
-                                    .total_cmp(&cosine(&vector, &a.vector))
-                                    .then(a.segment.id.cmp(&b.segment.id))
-                            });
-                            candidates.iter().take(3).any(|candidate| {
-                                cosine(&vector, &candidate.vector) >= cosine_threshold
+                            scored.iter().take(3).any(|(score, candidate)| {
+                                *score >= cosine_threshold
                                     && shingle_jaccard(&segment.text, &candidate.segment.text)
                                         >= jaccard_threshold
                             })
@@ -370,9 +382,21 @@ impl SqliteStore {
                                 "DELETE FROM segments WHERE id = ?1",
                                 [segment.id.to_string()],
                             )?;
+                            if let Some(candidates) = loaded.as_mut() {
+                                candidates.retain(|candidate| candidate.segment.id != segment.id);
+                            }
                             counts.1 += 1;
                         } else {
                             write_segment(connection, segment, &vector, Some(role_name(role)))?;
+                            if let Some(candidates) = loaded.as_mut() {
+                                candidates.retain(|candidate| candidate.segment.id != segment.id);
+                                candidates.push(StoredSegment {
+                                    segment: segment.clone(),
+                                    vector: vector.clone(),
+                                    source_role: Some(role_name(role).to_owned()),
+                                    provenance: Some(segment.tool.clone().unwrap_or_default()),
+                                });
+                            }
                             counts.0 += 1;
                         }
                     }
