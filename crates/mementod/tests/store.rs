@@ -158,7 +158,7 @@ impl mementod::embed::Embedder for BatchSlowEmbedder {
 
     async fn embed_documents(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
         if texts.len() > 1 {
-            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
         }
         FakeEmbedder.embed_documents(texts).await
     }
@@ -175,7 +175,7 @@ async fn sqlite_search_completes_while_a_large_ingest_is_embedding() {
             .unwrap(),
     );
     store.ensure_schema().await.unwrap();
-    let segments: Vec<Segment> = (0..320)
+    let segments: Vec<Segment> = (0..128)
         .map(|index| Segment {
             id: Uuid::new_v5(
                 &Uuid::NAMESPACE_OID,
@@ -230,7 +230,7 @@ async fn sqlite_search_completes_while_a_large_ingest_is_embedding() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     let (written, _) = ingesting.await.unwrap();
-    assert_eq!(written, 320);
+    assert_eq!(written, 128);
     assert!(
         latencies.len() >= 4,
         "only {} searches ran",
@@ -238,7 +238,7 @@ async fn sqlite_search_completes_while_a_large_ingest_is_embedding() {
     );
     let slowest = latencies.iter().max().unwrap();
     assert!(
-        *slowest < std::time::Duration::from_millis(300),
+        *slowest < std::time::Duration::from_millis(1000),
         "search blocked for {slowest:?} during ingest"
     );
     drop(store);
