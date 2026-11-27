@@ -133,13 +133,102 @@ test("failure starts cooldown, expiry retries, and success permits a new cooldow
     expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "a")).toBeNull();
     expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "b")).toBeNull();
     expect(calls).toBe(1);
-    expect(logs).toEqual(["Jev cooldown started: Insufficient balance token=[redacted]"]);
+    expect(logs).toEqual(["Jev cooldown started: Insufficient balance redacted=redacted"]);
     now = 100;
     expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "c")).toBe("decision");
     expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "d")).toBeNull();
     expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "e")).toBeNull();
     expect(calls).toBe(3);
-    expect(logs).toEqual(["Jev cooldown started: Insufficient balance token=[redacted]", "Jev cooldown started: offline"]);
+    expect(logs).toEqual(["Jev cooldown started: Insufficient balance redacted=redacted", "Jev cooldown started: offline"]);
+});
+
+test("provider rate limits extend cooldown and produce safe structured logs", async () => {
+    let now = 0;
+    let calls = 0;
+    const logs: string[] = [];
+    const decide = createJevGate({
+        cooldownMs: 600_000,
+        now: () => now,
+        scheduleTimeout: noTimer,
+        log: (message) => logs.push(message),
+        async decide() {
+            calls++;
+            throw { _tag: "ProviderRequestError", reason: "rate_limit", status: 429, retryAfterMs: 48_535_000 };
+        },
+    });
+    expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "a")).toBeNull();
+    expect(logs).toEqual(["Jev cooldown started: rate_limit status=429 retry in 13h28m55s"]);
+    now = 48_534_999;
+    expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "b")).toBeNull();
+    expect(calls).toBe(1);
+    now = 48_535_000;
+    expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "c")).toBeNull();
+    expect(calls).toBe(2);
+});
+
+test("parses JSON error messages and caps provider retry at one day", async () => {
+    let now = 0;
+    let calls = 0;
+    const logs: string[] = [];
+    const decide = createJevGate({
+        cooldownMs: 600_000,
+        now: () => now,
+        scheduleTimeout: noTimer,
+        log: (message) => logs.push(message),
+        async decide() {
+            calls++;
+            throw new Error(JSON.stringify({ _tag: "ProviderRequestError", reason: "rate_limit", status: 429, retryAfterMs: 100_000_000 }));
+        },
+    });
+    expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "a")).toBeNull();
+    expect(logs).toEqual(["Jev cooldown started: rate_limit status=429 retry in 24h"]);
+    now = 86_399_999;
+    expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "b")).toBeNull();
+    expect(calls).toBe(1);
+    now = 86_400_000;
+    expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "c")).toBeNull();
+    expect(calls).toBe(2);
+});
+
+test("short provider retry preserves configured cooldown and finds nested errors", async () => {
+    let now = 0;
+    let calls = 0;
+    const logs: string[] = [];
+    const decide = createJevGate({
+        cooldownMs: 600_000,
+        now: () => now,
+        scheduleTimeout: noTimer,
+        log: (message) => logs.push(message),
+        async decide() {
+            calls++;
+            throw { cause: { data: { error: { _tag: "ProviderRequestError", status: 429, retryAfterMs: 1000 } } } };
+        },
+    });
+    expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "a")).toBeNull();
+    expect(logs).toEqual(["Jev cooldown started: ProviderRequestError status=429 retry in 10m"]);
+    now = 599_999;
+    expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "b")).toBeNull();
+    expect(calls).toBe(1);
+    now = 600_000;
+    expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "c")).toBeNull();
+    expect(calls).toBe(2);
+});
+
+test("plain error fallback removes activity-log redaction triggers and credentials", async () => {
+    const logs: string[] = [];
+    const decide = createJevGate({
+        cooldownMs: 100,
+        now: () => 0,
+        scheduleTimeout: noTimer,
+        log: (message) => logs.push(message),
+        async decide() {
+            throw new Error(`Failed "request" at https://example.invalid/path token=private-value`);
+        },
+    });
+    expect(await classifyKind(decide, DEFAULT_JEV_MODEL, "a")).toBeNull();
+    expect(logs).toEqual(["Jev cooldown started: Failed request at redacted=redacted"]);
+    expect(logs[0]).not.toMatch(/\b(?:bearer|token|authorization|api[_-]?key|password|secret)\b|[a-z][a-z\d+.-]*:\/\/|[{}[\]"'`]/i);
+    expect(logs[0]).not.toContain("private-value");
 });
 
 test("timeout starts cooldown without real timers", async () => {

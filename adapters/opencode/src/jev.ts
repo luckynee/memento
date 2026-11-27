@@ -101,6 +101,80 @@ export async function forEachJevItem<T>(items: readonly T[], process: (item: T, 
     }));
 }
 
+type JevErrorDetails = {
+    reason?: string;
+    status?: number;
+    retryAfterMs?: number;
+    errorClass?: string;
+    message?: string;
+};
+
+function jevErrorDetails(error: unknown): JevErrorDetails {
+    const details: JevErrorDetails = {};
+    const pending: unknown[] = [error];
+    const seen = new Set<unknown>();
+    let fallbackClass: string | undefined;
+    while (pending.length && seen.size < 32) {
+        const value = pending.shift();
+        if ((typeof value !== "object" && typeof value !== "function") || value === null || seen.has(value)) {
+            continue;
+        }
+        seen.add(value);
+        try {
+            const record = value as Record<string, unknown>;
+            if (details.reason === undefined && typeof record.reason === "string" && record.reason.trim()) {
+                details.reason = record.reason;
+            }
+            if (details.status === undefined && typeof record.status === "number" && Number.isFinite(record.status)) {
+                details.status = record.status;
+            }
+            if (details.retryAfterMs === undefined && typeof record.retryAfterMs === "number"
+                && Number.isFinite(record.retryAfterMs) && record.retryAfterMs >= 0) {
+                details.retryAfterMs = record.retryAfterMs;
+            }
+            if (details.errorClass === undefined && typeof record._tag === "string" && record._tag.trim()) {
+                details.errorClass = record._tag;
+            }
+            if (value instanceof Error && !fallbackClass && value.name !== "Error") {
+                fallbackClass = value.name;
+            }
+            pending.push(record.cause, record.data, record.error);
+            if (typeof record.message === "string") {
+                details.message ??= record.message;
+                const message = record.message.trimStart();
+                if (message.startsWith("{")) {
+                    try {
+                        pending.push(JSON.parse(message));
+                    } catch {}
+                }
+            }
+        } catch {}
+    }
+    details.errorClass ??= fallbackClass;
+    return details;
+}
+
+function safeJevMessage(message: string): string {
+    return message
+        .replace(/\bBearer\s+\S+/gi, "Bearer [redacted]")
+        .replace(/\b(api[_-]?key|token|secret|password|authorization)\b\s*[:=]\s*["']?[^\s,"']+/gi, "$1=[redacted]")
+        .replace(/\b(sk|pk|key|token)[-_][a-z0-9_-]{8,}\b/gi, "[redacted]")
+        .replace(/[a-z][a-z\d+.-]*:\/\/[^\s"'`<>{}[\]]*/gi, "")
+        .replace(/\b(?:bearer|token|authorization|api[_-]?key|password|secret)\b/gi, "redacted")
+        .replace(/[{}[\]"'`]/g, "")
+        .replace(/[\r\n\t]+/g, " ")
+        .replace(/ {2,}/g, " ")
+        .trim();
+}
+
+function formatJevCooldown(delayMs: number): string {
+    const seconds = Math.ceil(delayMs / 1000);
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor(seconds % 3600 / 60);
+    const remainder = seconds % 60;
+    return `${hours ? `${hours}h` : ""}${minutes ? `${minutes}m` : ""}${remainder || (!hours && !minutes) ? `${remainder}s` : ""}`;
+}
+
 export function createJevGate(deps: {
     decide: DecisionsFn;
     cooldownMs: number;
@@ -141,14 +215,27 @@ export function createJevGate(deps: {
             return result;
         } catch (error) {
             if (callGeneration === generation) {
-                retryAt = now() + deps.cooldownMs;
+                const details = jevErrorDetails(error);
+                const cooldownMs = details.retryAfterMs === undefined
+                    ? deps.cooldownMs
+                    : Math.max(deps.cooldownMs, Math.min(details.retryAfterMs, 24 * 60 * 60 * 1000));
+                retryAt = now() + cooldownMs;
                 generation++;
-                const message = error instanceof Error ? error.message : String(error);
-                const safeMessage = message
-                    .replace(/\bBearer\s+\S+/gi, "Bearer [redacted]")
-                    .replace(/\b(api[_-]?key|token|secret|password|authorization)\b\s*[:=]\s*["']?[^\s,"']+/gi, "$1=[redacted]")
-                    .replace(/\b(sk|pk|key|token)[-_][a-z0-9_-]{8,}\b/gi, "[redacted]");
-                deps.log(`Jev cooldown started: ${safeMessage}`);
+                const structured = [
+                    details.reason ?? details.errorClass,
+                    details.status === undefined ? undefined : `status=${details.status}`,
+                    details.retryAfterMs === undefined ? undefined : `retry in ${formatJevCooldown(cooldownMs)}`,
+                ].filter((part): part is string => part !== undefined).join(" ");
+                let fallback = details.message;
+                if (fallback === undefined) {
+                    try {
+                        fallback = String(error);
+                    } catch {
+                        fallback = "unknown error";
+                    }
+                }
+                const message = safeJevMessage(structured || fallback) || "unknown error";
+                deps.log(Array.from(`Jev cooldown started: ${message}`).slice(0, 300).join(""));
             }
             throw error;
         } finally {
