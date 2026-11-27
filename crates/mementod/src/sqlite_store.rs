@@ -335,6 +335,9 @@ impl SqliteStore {
             let result = self
                 .run(move |connection| {
                     connection.invalidate_dense_cache();
+                    let transaction = connection
+                        .transaction()
+                        .context("starting SQLite ingest batch")?;
                     let mut counts = (0, 0);
                     let mut loaded: Option<Vec<StoredSegment>> = None;
                     for (segment, vector) in batch.iter().zip(vectors) {
@@ -345,7 +348,7 @@ impl SqliteStore {
                         let role = roles.get(&segment.source_id).copied();
                         let duplicate = if prose_kind(segment.kind) {
                             if loaded.is_none() {
-                                loaded = Some(load_segments(connection, &filter)?);
+                                loaded = Some(load_segments(&transaction, &filter)?);
                             }
                             let candidates = loaded
                                 .as_ref()
@@ -378,7 +381,7 @@ impl SqliteStore {
                             false
                         };
                         if duplicate {
-                            connection.execute(
+                            transaction.execute(
                                 "DELETE FROM segments WHERE id = ?1",
                                 [segment.id.to_string()],
                             )?;
@@ -387,7 +390,7 @@ impl SqliteStore {
                             }
                             counts.1 += 1;
                         } else {
-                            write_segment(connection, segment, &vector, Some(role_name(role)))?;
+                            write_segment(&transaction, segment, &vector, Some(role_name(role)))?;
                             if let Some(candidates) = loaded.as_mut() {
                                 candidates.retain(|candidate| candidate.segment.id != segment.id);
                                 candidates.push(StoredSegment {
@@ -400,6 +403,9 @@ impl SqliteStore {
                             counts.0 += 1;
                         }
                     }
+                    transaction
+                        .commit()
+                        .context("committing SQLite ingest batch")?;
                     Ok(counts)
                 })
                 .await?;
